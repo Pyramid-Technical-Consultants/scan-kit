@@ -454,6 +454,17 @@ impl Camera {
         self.xmax = x + (self.xmax - x) / factor;
         self.ymin = y - (y - self.ymin) / factor;
         self.ymax = y + (self.ymax - y) / factor;
+        // Sub-ulp spans round to a point and can never zoom back out.
+        for (lo, hi, anchor) in [
+            (&mut self.xmin, &mut self.xmax, x),
+            (&mut self.ymin, &mut self.ymax, y),
+        ] {
+            let floor = anchor.abs().max(1.0) * f32::EPSILON;
+            if *hi - *lo < floor {
+                *lo = anchor - floor * 0.5;
+                *hi = anchor + floor * 0.5;
+            }
+        }
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32) {
@@ -590,19 +601,34 @@ pub fn ticks(lo: f32, hi: f32) -> Vec<f32> {
     if step <= 0.0 || !step.is_finite() {
         return vec![lo, hi];
     }
-    let mut value = (lo / step).ceil() * step;
-    if value < lo {
-        value += step;
-    }
+    // Index iteration, not accumulation — `value += step` stalls when step
+    // is below half the ulp of value and the same tick repeats 24 times.
+    let mut k = (lo / step).ceil();
     let mut out = Vec::new();
-    let mut guard = 0;
-    while value <= hi + step * 1.0e-3 && guard < 24 {
+    // Hard iteration bound: k + 1.0 also stalls once the ulp of k
+    // exceeds 1, and dedup means out.len() may never grow.
+    for _ in 0..64 {
+        if out.len() >= 24 {
+            break;
+        }
+        let value = k * step;
+        if value > hi + step * 1.0e-3 {
+            break;
+        }
         let snapped = (value / step).round() * step;
-        if snapped >= lo - step * 1.0e-3 && snapped <= hi + step * 1.0e-3 {
+        if snapped >= lo - step * 1.0e-3
+            && snapped <= hi + step * 1.0e-3
+            // Snapping collapses sub-ulp steps onto one float — dedup like
+            // locator_ticks does.
+            && out.last().is_none_or(|prev: &f32| (snapped - *prev).abs() > step * 0.25)
+        {
             out.push(snapped);
         }
-        value += step;
-        guard += 1;
+        let next = k + 1.0;
+        if next == k || !next.is_finite() {
+            break;
+        }
+        k = next;
     }
     if out.is_empty() {
         vec![lo]
@@ -683,5 +709,27 @@ mod tests {
         );
         assert!((origin[0]).abs() < 1.0e-3);
         assert!((origin[1] - 80.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn a_wedged_axis_still_zooms_back_out() {
+        // Epoch-ms span: zoom until the sub-ulp span collapses — the floor
+        // must keep a nonzero window so the next zoom can grow it again.
+        let mut camera = Camera::new(1.7e12, 1.7e12 + 1.0e9, 0.0, 10.0);
+        for _ in 0..60 {
+            camera.zoom_at(1.7e12, 0.0, 1000.0);
+        }
+        assert!(camera.xmax - camera.xmin > 0.0);
+        camera.zoom_at(1.7e12, 0.0, 0.5);
+        assert!(camera.xmax - camera.xmin > 0.0);
+    }
+
+    #[test]
+    fn a_sub_ulp_step_does_not_emit_duplicate_ticks() {
+        // step=50 on a 1.7e9 axis is below half the ulp — index iteration
+        // must not repeat one snapped tick 24 times.
+        let out = ticks(1.7e9, 1.7e9 + 200.0);
+        let unique: std::collections::HashSet<u32> = out.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(unique.len(), out.len(), "duplicate ticks: {out:?}");
     }
 }
