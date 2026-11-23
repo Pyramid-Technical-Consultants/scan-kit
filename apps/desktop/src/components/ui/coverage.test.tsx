@@ -141,7 +141,7 @@ it("renders the stock controls the shell does not open on its own", async () => 
   });
   // Generic "Title"/"One" text passes even when a family renders
   // nothing — pin one unique marker per family.
-  for (const marker of ["Title", "Help", "Or", "Two", "Ctrl+O", "More", "Pick"]) {
+  for (const marker of ["Title", "Help", "Or", "Two", "Ctrl+O", "More", "Pick", "Explain", "Done"]) {
     expect(document.body.textContent).toContain(marker);
   }
 });

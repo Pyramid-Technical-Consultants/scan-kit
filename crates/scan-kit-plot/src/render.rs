@@ -8667,6 +8667,11 @@ fn upload_dose_f16(
     padded: &[u8],
     shape: [usize; 3],
 ) -> Result<wgpu::Texture, GpuError> {
+    if padded.is_empty() {
+        // A zero-dim source yields an empty lattice — the write below would
+        // fail wgpu size validation.
+        return Err(GpuError::Message("empty dose lattice".into()));
+    }
     let nx = shape[0].max(1);
     let ny = shape[1].max(1);
     let nz = shape[2].max(1);

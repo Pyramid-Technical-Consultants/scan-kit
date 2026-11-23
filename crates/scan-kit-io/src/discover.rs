@@ -393,7 +393,13 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     // serve a sibling session's file under this id.
     let roots: std::collections::BTreeSet<String> = members
         .iter()
-        .filter_map(|(name, _)| normalize_member(name).split('/').next().map(str::to_owned))
+        .filter_map(|(name, _)| {
+            normalize_member(name)
+                .split('/')
+                .next()
+                .filter(|root| !root.is_empty())
+                .map(str::to_owned)
+        })
         .collect();
     if roots.len() != 1 {
         return None;

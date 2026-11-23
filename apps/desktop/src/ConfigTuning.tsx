@@ -566,6 +566,9 @@ export function ConfigTuning({
         const loaded = await invoke<Loaded>("scan_kit_config_form", {
           path: joinPath(selected, file),
         });
+        if (seq !== openSeq.current) {
+          return;
+        }
         setIntegrity(loaded.integrity);
       }
       notifySaved(selected, {

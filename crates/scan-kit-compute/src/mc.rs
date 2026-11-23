@@ -415,7 +415,10 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
 }
 
 fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
-    let [nx, ny, nz] = request.shape;
+    // The shader clamps each axis to >=1 — the material/density check must
+    // read the same shape or a zero axis validates 0-length buffers the GPU
+    // then indexes out of bounds.
+    let [nx, ny, nz] = request.shape.map(|dim| dim.max(1));
     let nvox = nx.saturating_mul(ny).saturating_mul(nz);
     if request.material.len() != nvox || request.density.len() != nvox {
         return Err(ComputeError::Message("material and density differ".into()));
