@@ -1006,7 +1006,7 @@ fn hang_ticks(best: vec4<f32>, cam: RayCam, origin: vec3<f32>, extent: vec3<f32>
     }
     let k0 = ceil(lo / 10.0 - 0.000001);
     let k1 = floor(hi / 10.0 + 0.000001);
-    let every = label_every(max(k1 - k0 + 1.0, 0.0));
+    let every = label_every(min(max(k1 - k0 + 1.0, 0.0), 96.0));
     var k = k0;
     var n = 0;
     loop {
@@ -1926,7 +1926,11 @@ impl Plot {
             let lattice = if shown_n == full_n || shown_n == 0 {
                 full as f32
             } else {
-                (full as f32 * shown_n as f32 / full_n.max(1) as f32).floor()
+                // Source voxel  lives in pooled cell full/factor - a
+                // proportional scale lands off by one when factor does not
+                // divide full_n.
+                let factor = full_n.div_ceil(shown_n);
+                (full / factor).min(shown_n - 1) as f32
             };
             let atlas_slice = if full_n == atlas_n {
                 full as f32
@@ -3608,12 +3612,20 @@ impl Plot {
             let mut glyphs = if cell_plane(self, cell) == Some(3) {
                 Vec::new()
             } else {
+                let panel = &self.panels[cell.panel];
+                let slice = cell_plane(self, cell).map(|_| {
+                    (
+                        [panel.xmin, panel.xmax, panel.ymin, panel.ymax],
+                        self.turns.get(cell.panel).copied().unwrap_or(0),
+                    )
+                });
                 labels_for(
-                    &self.panels[cell.panel],
+                    panel,
                     &camera,
                     cell,
                     self.foreground,
                     self.names_the_panel(),
+                    slice,
                 )
             };
             glyphs.extend(dose_chrome(self, cell));
@@ -3745,12 +3757,20 @@ impl Plot {
                 let mut glyphs = if cell_plane(self, cell) == Some(3) {
                     Vec::new()
                 } else {
+                    let panel = &self.panels[cell.panel];
+                    let slice = cell_plane(self, cell).map(|_| {
+                        (
+                            [panel.xmin, panel.xmax, panel.ymin, panel.ymax],
+                            self.turns.get(cell.panel).copied().unwrap_or(0),
+                        )
+                    });
                     labels_for(
-                        &self.panels[cell.panel],
+                        panel,
                         &self.view_camera(cell.panel, &cell.plot),
                         cell,
                         self.foreground,
                         self.names_the_panel(),
+                        slice,
                     )
                 };
                 glyphs.extend(dose_chrome(self, cell));
@@ -6815,6 +6835,7 @@ fn labels_for(
     cell: &Cell,
     color: [f32; 4],
     title: bool,
+    slice: Option<([f32; 4], u8)>,
 ) -> Vec<GlyphRec> {
     let mut out = Vec::new();
     let font = atlas();
@@ -6829,10 +6850,34 @@ fn labels_for(
             color,
         );
     }
-    if !panel.y_label.is_empty() {
+    // A rotated dose slice shows source-Y on the x edge (and vice versa)
+    // for odd turns; for turns=2 the x edge runs mirrored. Tick the SOURCE
+    // millimetre range and map each value to its display position, or the
+    // numbers and axis names describe the wrong axis.
+    let swapped = slice.is_some_and(|(_, turns)| turns % 2 == 1);
+    let (x_label, y_label) = if swapped {
+        (&panel.y_label, &panel.x_label)
+    } else {
+        (&panel.x_label, &panel.y_label)
+    };
+    let (x_range, y_range) = match slice {
+        Some((b, _)) if swapped => ([b[2], b[3]], [b[0], b[1]]),
+        _ => ([camera.xmin, camera.xmax], [camera.ymin, camera.ymax]),
+    };
+    let x_at = |v: f32| match slice {
+        Some((b, t)) if swapped => crate::dose::display_mm(0.0, v, b, t)[0],
+        Some((b, t)) => crate::dose::display_mm(v, 0.0, b, t)[0],
+        None => v,
+    };
+    let y_at = |v: f32| match slice {
+        Some((b, t)) if swapped => crate::dose::display_mm(v, 0.0, b, t)[1],
+        Some((b, t)) => crate::dose::display_mm(0.0, v, b, t)[1],
+        None => v,
+    };
+    if !y_label.is_empty() {
         push_up_text(
             &mut out,
-            &panel.y_label,
+            y_label,
             [
                 cell.cell.x + axis_name_width(&panel.y_label) * 0.5,
                 cell.plot.y + cell.plot.h * 0.5,
@@ -6840,12 +6885,16 @@ fn labels_for(
             color,
         );
     }
-    for tick in ticks(camera.ymin, camera.ymax) {
+    for tick in ticks(y_range[0], y_range[1]) {
+        let at = y_at(tick);
+        if at < camera.ymin || at > camera.ymax {
+            continue;
+        }
         let label = format_tick(tick);
         push_text(
             &mut out,
             &label,
-            [camera.xmin, tick, 0.0],
+            [camera.xmin, at, 0.0],
             1.0,
             1.0,
             [-4.0, ink_center_shift(&label)],
@@ -6853,11 +6902,15 @@ fn labels_for(
         );
     }
     if panel.x_labels.is_empty() {
-        for tick in ticks(camera.xmin, camera.xmax) {
+        for tick in ticks(x_range[0], x_range[1]) {
+            let at = x_at(tick);
+            if at < camera.xmin || at > camera.xmax {
+                continue;
+            }
             push_text(
                 &mut out,
                 &format_tick(tick),
-                [tick, camera.ymin, 0.0],
+                [at, camera.ymin, 0.0],
                 1.0,
                 0.5,
                 [0.0, 4.0 + font.ascent],
@@ -6886,10 +6939,10 @@ fn labels_for(
             );
         }
     }
-    if !panel.x_label.is_empty() {
+    if !x_label.is_empty() {
         push_text(
             &mut out,
-            &panel.x_label,
+            x_label,
             [
                 cell.plot.x + cell.plot.w * 0.5,
                 x_axis_name_y(&cell.plot),
@@ -10926,8 +10979,8 @@ mod tests {
             panel: 0,
         };
         let ink = [1.0, 1.0, 1.0, 1.0];
-        let shown = labels_for(&panel, &camera, &cell, ink, true);
-        let hidden = labels_for(&panel, &camera, &cell, ink, false);
+        let shown = labels_for(&panel, &camera, &cell, ink, true, None);
+        let hidden = labels_for(&panel, &camera, &cell, ink, false, None);
         let title_y = cell.cell.y + atlas().ascent;
         let on_title = |glyphs: &[GlyphRec]| {
             glyphs
@@ -12495,7 +12548,7 @@ mod tests {
             },
             panel: 0,
         };
-        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0], true);
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0], true, None);
         let row: Vec<_> = glyphs
             .iter()
             .filter(|glyph| (glyph.anchor[1]).abs() < 1e-3 && glyph.anchor[3] > 0.5)
@@ -12554,7 +12607,7 @@ mod tests {
             },
             panel: 0,
         };
-        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0], true);
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0], true, None);
         let center = cell.plot.x + cell.plot.w * 0.5;
         let named: Vec<_> = glyphs
             .iter()
@@ -13331,5 +13384,61 @@ mod tests {
         let layout = plot.layout(320, 240);
         let frame = plot.paint_cpu(320, 240, &layout);
         assert_eq!(frame.len(), 320 * 240 * 4);
+    }
+
+    #[test]
+    fn a_rotated_slice_labels_the_source_millimetres() {
+        // Axial bounds [0,10]x[0,20], turns=1: the x edge shows source-Y
+        // (range 0..20), each value v mapped to display x = v * w / h = v/2.
+        let panel = Panel {
+            title: "Axial".into(),
+            y_label: "X (mm)".into(),
+            x_label: "Y (mm)".into(),
+            xmin: 0.0,
+            xmax: 10.0,
+            ymin: 0.0,
+            ymax: 20.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+            equal: false,
+        };
+        let camera = Camera::new(0.0, 10.0, 0.0, 20.0);
+        let cell = Cell {
+            cell: PlotRect {
+                x: 8.0,
+                y: 4.0,
+                w: 180.0,
+                h: 220.0,
+            },
+            plot: PlotRect {
+                x: 70.0,
+                y: 16.0,
+                w: 100.0,
+                h: 200.0,
+            },
+            panel: 0,
+        };
+        let bounds = [0.0, 10.0, 0.0, 20.0];
+        let glyphs = labels_for(
+            &panel,
+            &camera,
+            &cell,
+            [1.0, 1.0, 1.0, 1.0],
+            true,
+            Some((bounds, 1)),
+        );
+        // X-edge labels: data-x positions (anchor z==0 path uses anchor[0])
+        let xs: Vec<f32> = glyphs
+            .iter()
+            .filter(|g| (g.anchor[1] - 0.0).abs() < 1e-3 && g.anchor[3] > 0.5)
+            .map(|g| g.anchor[0])
+            .collect();
+        // Source-y ticks over 0..20 (step 5), displayed at v/2.
+        for (v, at) in [(0.0f32, 0.0f32), (10.0, 5.0), (20.0, 10.0)] {
+            assert!(
+                xs.iter().any(|x| (*x - at).abs() < 1e-3),
+                "source-y {v} should label at display x {at}: {xs:?}"
+            );
+        }
     }
 }
