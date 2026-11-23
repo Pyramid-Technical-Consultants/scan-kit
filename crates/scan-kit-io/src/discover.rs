@@ -120,11 +120,20 @@ fn walk_local(
         skipped.push(relative(library, dir));
         return;
     };
-    let mut children: Vec<_> = read.filter_map(|entry| entry.ok()).collect();
+    // An errored entry or failed file_type() must not look like a deleted
+    // session — delete_missing prunes rows for ids absent from the walk.
+    let mut children = Vec::new();
+    for entry in read {
+        match entry {
+            Ok(entry) => children.push(entry),
+            Err(_) => *walk_failed = true,
+        }
+    }
     children.sort_by_key(|entry| entry.file_name());
     let mut sessions = Vec::new();
     for child in &children {
         let Ok(kind) = child.file_type() else {
+            *walk_failed = true;
             continue;
         };
         if kind.is_symlink() || !kind.is_dir() {
