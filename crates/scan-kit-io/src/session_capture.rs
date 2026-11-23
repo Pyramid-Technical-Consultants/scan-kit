@@ -312,10 +312,10 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
             .get(row)
             .and_then(|cells| cells.get(column))
             .map(String::as_str);
-        let id = if row < sheet.rows.len() && cell.is_none_or(|id| id.is_empty()) {
+        let id = if row < sheet.rows.len() && cell.is_none_or(|id| clean(id).is_empty()) {
             prev_eff.clone()
         } else {
-            cell.map(join_key)
+            cell.map(|id| join_key(clean(id)))
         };
         if row > 0 && (row == sheet.rows.len() || id != prev_eff) {
             // A leading ragged run has no previous id — it belongs to the
@@ -360,6 +360,11 @@ fn csv_text(sheet: &Sheet) -> String {
 /// row across differently-formatted device tables. Numeric keys normalize;
 /// anything else joins on its text.
 fn join_key(text: &str) -> String {
+    // Integer ids normalize exactly - f64 rounds past 2^53 and would
+    // collapse two distinct ids into one key.
+    if let Ok(value) = text.parse::<i64>() {
+        return value.to_string();
+    }
     match text.parse::<f64>() {
         // "-0" and "0"/"0.0" must join; a non-finite cell keeps its raw
         // text rather than collapsing every NaN into one key.
@@ -667,7 +672,11 @@ fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
             order: Vec::new(),
         };
         for row in &sheet.rows {
-            let Some(key) = row.get(ts_i) else { continue };
+            let Some(raw) = row.get(ts_i) else { continue };
+            let key = clean(raw);
+            if key.is_empty() {
+                continue;
+            }
             let key = join_key(key);
             // Keyed on the timeslice number alone: unlike spot keys, a
             // timeslice number is a per-delivery counter, so re-delivery
@@ -809,9 +818,18 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
         // occurrence keeps deliveries distinct instead of the last row
         // silently overwriting the first while its state survives.
         let mut occurrences: HashMap<(String, String), usize> = HashMap::new();
+        let mut eff_layer = String::new();
         for row in &sheet.rows {
-            let layer = join_key(&row.get(layer_i).cloned().unwrap_or_default());
-            let spot = join_key(&row.get(spot_i).cloned().unwrap_or_default());
+            // A ragged layer cell inherits the running layer like blocks()
+            // does - foldering and joining must agree on the same layer.
+            let raw_layer = clean(row.get(layer_i).map(String::as_str).unwrap_or_default());
+            if !raw_layer.is_empty() {
+                eff_layer = raw_layer.to_owned();
+            }
+            let layer = join_key(&eff_layer);
+            let spot = join_key(clean(
+                row.get(spot_i).map(String::as_str).unwrap_or_default(),
+            ));
             if spot.is_empty() {
                 continue;
             }
@@ -826,9 +844,12 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
             }
             if let Some(state) = state_i
                 .and_then(|i| row.get(i))
+                .map(|text| clean(text))
                 .filter(|text| !text.is_empty())
             {
-                states.entry(key.clone()).or_insert_with(|| state.clone());
+                states
+                    .entry(key.clone())
+                    .or_insert_with(|| state.to_owned());
             }
             part.rows.insert(
                 key,
@@ -1211,7 +1232,7 @@ fn write_termination(
                     ms += t - p;
                 }
             }
-            if t.is_some() {
+            if t.is_some_and(|t| t.is_finite()) {
                 prev = t;
             }
         }
@@ -1269,6 +1290,7 @@ fn write_termination(
     let planned_spots = status
         .get(CONTROL_POINT_COUNT)
         .and_then(io_number)
+        .filter(|count| count.is_finite() && *count >= 0.0 && count.fract() == 0.0)
         .map(|count| count as usize)
         .or_else(|| input_map.as_ref().map(|sheet| sheet.rows.len()))
         .filter(|count| *count > 0);
@@ -1438,11 +1460,14 @@ fn fetch_aux(
                             .filter(|name| *name != "." && *name != "..")
                             .unwrap_or(&device.name)
                             .to_owned();
-                        let name = if dcs_names.insert(base.clone()) {
+                        // The target filesystem is case-insensitive - key the
+                        // dedup on the lowercase form or MAP.XML replaces
+                        // map.xml while count still credits both writes.
+                        let name = if dcs_names.insert(base.to_lowercase()) {
                             base
                         } else {
                             let name = format!("{}_{base}", device.name);
-                            dcs_names.insert(name.clone());
+                            dcs_names.insert(name.to_lowercase());
                             name
                         };
                         write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
@@ -1912,6 +1937,8 @@ mod tests {
         assert_eq!(join_key("1.0"), "1");
         assert_eq!(join_key("03"), "3");
         assert_eq!(join_key("run-2"), "run-2");
+        // Past 2^53 two distinct integer ids must not collapse into one key.
+        assert_ne!(join_key("9007199254740992"), join_key("9007199254740993"));
     }
     #[test]
     fn embedded_newlines_flatten_instead_of_writing_multiline_cells() {

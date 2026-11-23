@@ -243,12 +243,18 @@ pub fn runner_plan_path(conn: &Connection) -> Result<Option<String>, String> {
         .map(str::to_owned))
 }
 
-pub fn set_runner_plan_path(conn: &Connection, path: &str) -> Result<(), String> {
-    set_runner_pref(conn, "last_plan_runner_plan_path", path)
-}
-
 fn set_runner_pref(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
     prefs_patch(conn, PREF_APP_SETTINGS, &json!({ key: value }))
+}
+
+/// Both upload prefs in one statement - two autocommits could commit the
+/// new dir while keeping a previous upload's plan CSV.
+pub fn set_runner_upload(conn: &Connection, dir: &str, plan: &str) -> Result<(), String> {
+    prefs_patch(
+        conn,
+        PREF_APP_SETTINGS,
+        &json!({"last_plan_runner_file_dir": dir, "last_plan_runner_plan_path": plan}),
+    )
 }
 
 /// User-registered MCsquare scanner folders, `[{label, folder}]`.
@@ -276,6 +282,9 @@ pub fn set_scanners(conn: &Connection, scanners: &[(String, String)]) -> Result<
 }
 
 pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> Result<(), String> {
+    if !scan_kit_core::valid_session_id(session_id) {
+        return Err("invalid session id".to_owned());
+    }
     let lib_id = ensure_library(conn, root)?;
     import_legacy(conn, lib_id, Path::new(root))?;
     // Store the trimmed text — the command response already reports the
@@ -290,7 +299,11 @@ pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> 
     Ok(())
 }
 
-pub fn set_selected(conn: &Connection, root: &str, session_ids: &[String]) -> Result<(), String> {
+pub fn set_selected(
+    conn: &Connection,
+    root: &str,
+    session_ids: &[String],
+) -> Result<Vec<String>, String> {
     let mut unique = Vec::new();
     for session_id in session_ids {
         if !unique.contains(session_id) {
@@ -308,7 +321,7 @@ pub fn set_selected(conn: &Connection, root: &str, session_ids: &[String]) -> Re
         params![encoded, lib_id],
     )
     .map_err(|err| err.to_string())?;
-    Ok(())
+    Ok(unique)
 }
 
 pub enum Cache {
@@ -576,7 +589,14 @@ pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     };
     let dirs = vec![last];
-    prefs_set(conn, PREF_DATA_DIRS, &json!(dirs))?;
+    // Fill only while the pref is still absent - an unconditional write
+    // could resurrect a directory a peer just forgot mid-scan.
+    let raw = serde_json::to_string(&json!(dirs)).map_err(|err| err.to_string())?;
+    conn.execute(
+        "INSERT INTO prefs(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+        params![PREF_DATA_DIRS, raw],
+    )
+    .map_err(|err| err.to_string())?;
     Ok(dirs)
 }
 
@@ -912,7 +932,10 @@ pub(crate) fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Resu
     let settings_raw = read_json(settings_path.clone());
     // A corrupt legacy file is not an empty one — retry the import on the
     // next open instead of stamping the flag and losing the data forever.
-    let settings_ok = settings_raw.is_some() || !settings_path.exists();
+    let settings_ok = settings_raw
+        .as_ref()
+        .map(|value| value.is_object())
+        .unwrap_or(!settings_path.exists());
     let notes_path = base.join("session_notes.json");
     let notes_raw = read_json(notes_path.clone());
     // A parsed-but-wrong-shape file (an array, or non-string values) is a
@@ -928,14 +951,15 @@ pub(crate) fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Resu
                 let Some(text) = text.as_str() else {
                     continue;
                 };
-                if text.trim().is_empty() {
+                let text = text.trim();
+                if text.is_empty() || !scan_kit_core::valid_session_id(&session_id) {
                     continue;
                 }
+                // Update only - an absent session keeps no row, so a stale
+                // legacy key cannot resurrect a ghost catalog entry.
                 conn.execute(
-                    "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(library_id, session_id) DO UPDATE
-                        SET note = CASE WHEN sessions.note = '' THEN excluded.note
-                                   ELSE sessions.note END",
+                    "UPDATE sessions SET note = ?3
+                     WHERE library_id = ?1 AND session_id = ?2 AND note = ''",
                     params![lib_id, session_id, text],
                 )
                 .map_err(|err| err.to_string())?;

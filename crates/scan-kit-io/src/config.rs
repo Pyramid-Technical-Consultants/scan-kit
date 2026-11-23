@@ -338,40 +338,41 @@ pub fn diff(input: &Value) -> Result<Value, String> {
     let mut edited = String::new();
     let file_rel = text(input, "file").unwrap_or("").trim();
     if !file_rel.is_empty() {
-        if let Some(xml) = input
+        let Some(xml) = input
             .get("xml")
             .and_then(Value::as_str)
             .filter(|xml| !xml.is_empty())
-        {
-            let mut text = xml.to_owned();
-            if let Some(form) = input.get("form") {
-                text = apply_form(&text, form)?;
-            }
-            // file_rel must normalize like the walked keys — a
-            // backslash/dot-dot spelling would land as a phantom "added"
-            // rel while the real file diffs stale bytes unflagged.
-            let mut parts = Vec::new();
-            for component in std::path::Path::new(file_rel).components() {
-                let std::path::Component::Normal(part) = component else {
-                    return Err(format!("file {file_rel:?} is not inside the config tree"));
-                };
-                parts.push(part.to_string_lossy().into_owned());
-            }
-            if parts.is_empty() {
-                return Err("file must name a config file".to_owned());
-            }
-            let file_rel = parts.join("/");
-            let rel = match loaded_dir.strip_prefix(&base_root) {
-                Ok(sub) if !sub.as_os_str().is_empty() => {
-                    format!("{}/{file_rel}", relative(&base_root, loaded_dir))
-                }
-                _ => file_rel.to_owned(),
+        else {
+            return Err("a file diff needs the open file's pending text".into());
+        };
+        let mut text = xml.to_owned();
+        if let Some(form) = input.get("form") {
+            text = apply_form(&text, form)?;
+        }
+        // file_rel must normalize like the walked keys — a
+        // backslash/dot-dot spelling would land as a phantom "added"
+        // rel while the real file diffs stale bytes unflagged.
+        let mut parts = Vec::new();
+        for component in std::path::Path::new(file_rel).components() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(format!("file {file_rel:?} is not inside the config tree"));
             };
-            let bytes = text.into_bytes();
-            if base_files.get(&rel) != Some(&bytes) {
-                base_files.insert(rel.clone(), bytes);
-                edited = rel;
+            parts.push(part.to_string_lossy().into_owned());
+        }
+        if parts.is_empty() {
+            return Err("file must name a config file".to_owned());
+        }
+        let file_rel = parts.join("/");
+        let rel = match loaded_dir.strip_prefix(&base_root) {
+            Ok(sub) if !sub.as_os_str().is_empty() => {
+                format!("{}/{file_rel}", relative(&base_root, loaded_dir))
             }
+            _ => file_rel.to_owned(),
+        };
+        let bytes = text.into_bytes();
+        if base_files.get(&rel) != Some(&bytes) {
+            base_files.insert(rel.clone(), bytes);
+            edited = rel;
         }
     }
     let base_key = folder_key(&base_root);
