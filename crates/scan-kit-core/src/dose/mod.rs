@@ -301,7 +301,7 @@ impl Volume {
 
     pub fn axial(&self, z: usize) -> Vec<f32> {
         let [nx, ny, _] = self.shape;
-        let Some(len) = nx.checked_mul(ny) else {
+        let Some(len) = nx.checked_mul(ny).filter(|&len| len <= self.values.len()) else {
             return Vec::new();
         };
         let mut image = vec![0.0; len];
@@ -315,7 +315,7 @@ impl Volume {
 
     pub fn coronal(&self, y: usize) -> Vec<f32> {
         let [nx, _, nz] = self.shape;
-        let Some(len) = nx.checked_mul(nz) else {
+        let Some(len) = nx.checked_mul(nz).filter(|&len| len <= self.values.len()) else {
             return Vec::new();
         };
         let mut image = vec![0.0; len];
@@ -329,7 +329,7 @@ impl Volume {
 
     pub fn sagittal(&self, x: usize) -> Vec<f32> {
         let [_, ny, nz] = self.shape;
-        let Some(len) = ny.checked_mul(nz) else {
+        let Some(len) = ny.checked_mul(nz).filter(|&len| len <= self.values.len()) else {
             return Vec::new();
         };
         let mut image = vec![0.0; len];
@@ -492,7 +492,7 @@ impl Volume {
         let axis = axis.min(2);
         let n = self.shape[axis].max(1);
         let t = ((mm - self.origin[axis]) / self.axis(axis)).floor();
-        (t as isize).clamp(0, n as isize - 1) as usize
+        (t as isize).clamp(0, (n as isize).saturating_sub(1).max(0)) as usize
     }
 
     pub fn mm_of(&self, axis: usize, index: usize) -> f32 {
