@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   DataEditor,
   emptyGridSelection,
@@ -50,9 +50,13 @@ export function ExamTable({
     direction: "asc",
   });
   const [gridSelection, setGridSelection] = useState(emptyGridSelection);
-  useEffect(() => {
+  // Positional selection is meaningless across a rows replacement — adjust
+  // state during render rather than cascading an extra pass from an effect.
+  const [prevRows, setPrevRows] = useState(rows);
+  if (prevRows !== rows) {
+    setPrevRows(rows);
     setGridSelection(emptyGridSelection);
-  }, [rows]);
+  }
   const order = useMemo(() => {
     const indexes = rows.map((_, index) => index);
     indexes.sort((left, right) => {
