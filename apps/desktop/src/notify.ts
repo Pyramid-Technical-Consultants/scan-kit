@@ -27,7 +27,7 @@ export function notify(message: string, id?: string): void {
 }
 
 /** Failure toast. A repeated notice with the same id is logged once. */
-export function notifyError(error: unknown, id?: string): void {
+export function notifyError(error: unknown, id?: string, popup = true): void {
   const text = textOf(error);
   const key = id == null ? null : `${id}\0${text}`;
   if (key == null || !logged.has(key)) {
@@ -37,6 +37,9 @@ export function notifyError(error: unknown, id?: string): void {
       setTimeout(() => logged.delete(key), 8000);
     }
     appendLog("ERROR", "app", text);
+  }
+  if (!popup) {
+    return;
   }
   toast.add({
     id,

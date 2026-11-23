@@ -1186,7 +1186,7 @@ fn write_input_map(
             return Ok(1);
         }
     }
-    Err("no plan source for input_map.csv".into())
+    Err("No plan data on the device or locally - upload a plan to the device and retry.".into())
 }
 
 /// `session_meta.json` + `termination_summary.txt`(+`.md5`), best effort.

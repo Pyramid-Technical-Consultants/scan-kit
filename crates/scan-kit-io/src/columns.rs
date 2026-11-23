@@ -59,7 +59,7 @@ pub fn load_columns(
     } else if let Some(bytes) = spots.as_ref() {
         project_files(std::slice::from_ref(bytes), requested)
     } else {
-        Err("no session csv contained the requested columns".to_owned())
+        Err(no_columns_message(requested))
     }
 }
 
@@ -174,9 +174,23 @@ fn score(bytes: &[u8], requested: &[String]) -> usize {
         .count()
 }
 
+fn no_columns_message(requested: &[String]) -> String {
+    let shown: Vec<&str> = requested.iter().take(8).map(String::as_str).collect();
+    let more = requested.len().saturating_sub(shown.len());
+    format!(
+        "no session csv contained the requested columns: {}{}",
+        shown.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        }
+    )
+}
+
 fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, String> {
     if files.is_empty() {
-        return Err("no session csv contained the requested columns".to_owned());
+        return Err(no_columns_message(requested));
     }
     // Headers differ between files — a column is missing only when every
     // file lacks it, not just the first.
@@ -221,7 +235,7 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
         }
     }
     if seen.iter().all(|present| !present) {
-        return Err("no session csv contained the requested columns".to_owned());
+        return Err(no_columns_message(requested));
     }
     let mut columns = Vec::new();
     let mut missing = Vec::new();

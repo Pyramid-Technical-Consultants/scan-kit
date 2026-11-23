@@ -170,8 +170,10 @@ export function PlanRunner() {
         dest: destRef.current,
       })
         .then((next) => {
+          // A completed invoke means the backend answered even when the
+          // result is stale — the failure streak still resets.
+          statusFailures.current = 0;
           if (!stop && seq === viewSeq.current) {
-            statusFailures.current = 0;
             setView(next);
           }
         })
@@ -183,7 +185,9 @@ export function PlanRunner() {
             if (statusFailures.current >= 3) {
               setView((current) => ({ ...current, connected: false }));
             }
-            notifyError(reason, "runner-status");
+            // Toast the transitions (lost contact, went offline) — a
+            // persistent failure logs without re-toasting every interval.
+            notifyError(reason, "runner-status", statusFailures.current <= 3);
           }
         })
         .finally(() => {
