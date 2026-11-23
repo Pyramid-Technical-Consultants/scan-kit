@@ -949,7 +949,15 @@ fn write_input_map(
 ) -> Result<usize, String> {
     let dest = dir.join("input_map.csv");
     if let Some(path) = plan_path.filter(|path| path.is_file()) {
-        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+        let bytes = std::fs::File::open(path)
+            .map_err(|err| err.to_string())
+            .and_then(|mut file| {
+                crate::discover::read_capped(
+                    &mut file,
+                    "plan file",
+                    crate::discover::MAX_MEMBER_BYTES,
+                )
+            })?;
         if let Some(mut sheet) = parse_sheet(&bytes) {
             if sheet.truncated {
                 return Err(format!("{}: plan table truncated mid-file", path.display()));

@@ -646,7 +646,13 @@ pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
 
 fn normalize_member(name: &str) -> String {
     let name = name.replace('\\', "/");
-    name.trim_start_matches("./").to_owned()
+    let name = name.trim_start_matches("./");
+    // A mid-path `..` escapes the tree — the member must not bind to a file
+    // it only reaches by traversal.
+    if name.split('/').any(|part| part == "..") {
+        return String::new();
+    }
+    name.to_owned()
 }
 
 fn walk_files(
@@ -968,6 +974,18 @@ pub fn write_zip(path: &Path, members: &[(&str, &[u8])]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_member_with_a_mid_path_traversal_binds_to_nothing() {
+        // "sess/../evil/input_map.csv" must not satisfy the single-tree
+        // suffix fallback — it escapes the session tree it claims.
+        assert_eq!(super::normalize_member("sess/../evil/input_map.csv"), "");
+        assert_eq!(super::normalize_member("a/b/../c"), "");
+        assert_eq!(
+            super::normalize_member("sess/input_map.csv"),
+            "sess/input_map.csv"
+        );
+    }
+
     use super::*;
 
     #[test]
