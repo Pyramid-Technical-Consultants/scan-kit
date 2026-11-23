@@ -262,7 +262,7 @@ fn write_struct(
     patient::ui(&mut bytes, 0x0020, 0x000D, study)?;
     patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
-    patient::lo(&mut bytes, 0x3006, 0x0002, "Synthetic")?;
+    patient::sh(&mut bytes, 0x3006, 0x0002, "Synthetic")?;
     let referenced = referenced_frame(frame, study, ct_series)?;
     patient::sq(&mut bytes, 0x3006, 0x0010, &[referenced])?;
     patient::sq(&mut bytes, 0x3006, 0x0020, &rois)?;
@@ -339,7 +339,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     patient::ui(&mut bytes, 0x0020, 0x000D, study)?;
     patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
-    patient::lo(&mut bytes, 0x300A, 0x0002, "SYNTH")?;
+    patient::sh(&mut bytes, 0x300A, 0x0002, "SYNTH")?;
     patient::cs(&mut bytes, 0x300A, 0x000C, "PATIENT")?;
     let dose_ref = {
         let mut item = Vec::new();
@@ -422,7 +422,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     }
     let beam = {
         let mut item = Vec::new();
-        patient::lo(&mut item, 0x300A, 0x00B2, "SYNTH")?;
+        patient::sh(&mut item, 0x300A, 0x00B2, "SYNTH")?;
         patient::is(&mut item, 0x300A, 0x00C0, 1)?;
         patient::lo(&mut item, 0x300A, 0x00C2, "B1")?;
         patient::cs(&mut item, 0x300A, 0x00C6, "PROTON")?;
@@ -430,7 +430,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
         patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
-        patient::fl(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
+        patient::fd(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
         if request.wet > 0.0 {
             patient::is(&mut item, 0x300A, 0x0312, 1)?;
             let mut shifter = Vec::new();
