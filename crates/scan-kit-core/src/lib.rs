@@ -173,18 +173,32 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
     let part = std::path::PathBuf::from(part);
     let write = std::fs::write(&part, bytes).and_then(|()| match std::fs::rename(&part, path) {
         Ok(()) => Ok(()),
-        // Windows refuses to rename over an existing destination. A locked
-        // destination fails the same way, but its remove then fails too —
-        // only an exists-but-removable file reaches the retry. If the retry
-        // fails, the .part stays behind with the payload instead of losing
-        // the artifact and the payload both.
+        // Windows refuses to rename over an existing destination. Moving the
+        // old file aside first keeps it recoverable at every point — a
+        // remove+rename gap used to leave neither artifact nor payload when
+        // the retry failed.
         Err(err)
             if err.kind() == std::io::ErrorKind::PermissionDenied
                 || err.kind() == std::io::ErrorKind::AlreadyExists =>
         {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&part, path))
+            let mut bak = path.as_os_str().to_os_string();
+            bak.push(format!(".{}.{}.bak", std::process::id(), seq));
+            let bak = std::path::PathBuf::from(bak);
+            std::fs::rename(path, &bak)
+                .and_then(|()| match std::fs::rename(&part, path) {
+                    Ok(()) => std::fs::remove_file(&bak),
+                    Err(err) => {
+                        let _ = std::fs::rename(&bak, path);
+                        Err(err)
+                    }
+                })
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&part);
+                })
         }
-        Err(err) => Err(err),
+        Err(err) => Err(err).inspect_err(|_| {
+            let _ = std::fs::remove_file(&part);
+        }),
     });
     write.map_err(|err| format!("{}: {err}", path.display()))
 }

@@ -1707,7 +1707,8 @@ impl Stage for LibraryStage {
         let finished = self.worker.as_ref().expect("library worker").is_finished();
         if !finished {
             let total = self.shared.total.load(Ordering::Relaxed);
-            let done = self.shared.done.load(Ordering::Relaxed).min(total);
+            let raw = self.shared.done.load(Ordering::Relaxed);
+            let done = if total == 0 { raw } else { raw.min(total) };
             self.report = Report {
                 task: 0,
                 generation: 0,
@@ -1822,7 +1823,8 @@ impl Stage for CopyStage {
         let finished = self.worker.as_ref().expect("copy worker").is_finished();
         if !finished {
             let total = self.shared.total.load(Ordering::Relaxed);
-            let done = self.shared.done.load(Ordering::Relaxed).min(total);
+            let raw = self.shared.done.load(Ordering::Relaxed);
+            let done = if total == 0 { raw } else { raw.min(total) };
             self.report = Report {
                 task: 0,
                 generation: 0,
@@ -2018,7 +2020,16 @@ impl Stage for ExportStage {
                     preview: None,
                 }
             }
-            Poll::Ready(result) => self.finish(result),
+            Poll::Ready(result) => {
+                // A cancel that landed inside the transport must win over
+                // the write - finish would otherwise publish a file the
+                // report calls cancelled.
+                if cancel.is_cancelled() {
+                    self.report.phase = Phase::Cancelled;
+                    return Poll::Cancelled;
+                }
+                self.finish(result)
+            }
             Poll::Cancelled => {
                 self.report.phase = Phase::Cancelled;
                 Poll::Cancelled
