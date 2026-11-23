@@ -299,7 +299,19 @@ pub(crate) fn dicom_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String
     const MAX_DEPTH: usize = 6;
     fn visit(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
         if depth == 0 {
-            return Ok(());
+            // A series nested past the cap must not lose tail slices
+            // silently - a geometrically consistent partial volume is worse
+            // than a loud error.
+            let deeper = fs::read_dir(dir)
+                .map(|mut items| {
+                    items.any(|item| item.map(|entry| entry.path().is_dir()).unwrap_or(false))
+                })
+                .unwrap_or(false);
+            return if deeper {
+                Err(format!("{} is nested too deep to scan", dir.display()))
+            } else {
+                Ok(())
+            };
         }
         // An unreadable directory entry must not silently drop slices from a
         // volume — load_study makes per-file read errors loud for the same
@@ -595,6 +607,17 @@ fn push_vr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_study_past_the_scan_depth_errors_instead_of_truncating() {
+        let root = std::env::temp_dir().join(format!("scan-kit-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a/b/c/d/e/f/g/h");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("ct.dcm"), [0u8; 4]).unwrap();
+        assert!(dicom_files(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn sk_req_032_study_index_goal_and_report() {
