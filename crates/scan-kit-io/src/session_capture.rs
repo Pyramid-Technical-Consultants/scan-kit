@@ -259,7 +259,9 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
         })
         .collect();
     let mut rows = Vec::new();
-    let mut truncated = false;
+    // A close-delimited reply has no length to check - a body that does not
+    // end in a newline was cut mid-record even though the parse is clean.
+    let mut truncated = !bytes.is_empty() && bytes.last() != Some(&10);
     for record in reader.records() {
         let Ok(record) = record else {
             truncated = true;
@@ -1940,5 +1942,25 @@ mod tests {
         // device timestamp must not write "-0 seconds" into the summary.
         assert_eq!(num_text(-1e-7), "0");
         assert_eq!(num_text(319.494), "319.494");
+    }
+
+    #[test]
+    fn an_unterminated_sheet_tail_is_flagged_truncated() {
+        // A close-delimited reply cut mid-record parses cleanly - the
+        // missing final newline is the only signal it was cut.
+        let clean = parse_sheet(
+            b"a,b
+1,2
+",
+        )
+        .unwrap();
+        assert!(!clean.truncated);
+        let cut = parse_sheet(
+            b"a,b
+1,2
+3,",
+        )
+        .unwrap();
+        assert!(cut.truncated);
     }
 }

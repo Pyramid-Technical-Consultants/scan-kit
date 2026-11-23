@@ -360,7 +360,11 @@ pub fn download_with(
         if !keep(report.files as u64, report.files as u64) {
             return Err("cancelled".into());
         }
-        package_zip(&session_dir, Path::new(&zip_path), &report.session_id)?;
+        package_zip(&session_dir, Path::new(&zip_path), &report.session_id, keep)?;
+        if !keep(report.files as u64, report.files as u64) {
+            let _ = std::fs::remove_file(&zip_path);
+            return Err("cancelled".into());
+        }
         Ok::<(String, session_capture::CaptureResult), String>((zip_path.clone(), report))
     })();
     let _ = std::fs::remove_dir_all(&staging);
@@ -1277,7 +1281,12 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), String> {
+fn package_zip(
+    dir: &Path,
+    zip_path: &Path,
+    session_id: &str,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<(), String> {
     // The id comes from the device's file_header_meta — a hostile or broken
     // table must not write `../` members into the archive.
     let session_id = if crate::discover::valid_session_id(session_id) {
@@ -1316,6 +1325,11 @@ fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), Stri
             std::io::Write::write_all(&mut zip, &bytes).map_err(|err| err.to_string())?;
         }
         zip.finish().map_err(|err| err.to_string())?;
+        // A cancel landing inside the write must not publish the archive a
+        // cancelled task already reported it skipped.
+        if !keep(0, 0) {
+            return Err("cancelled".into());
+        }
         Ok::<(), String>(())
     })();
     if result.is_err() {
@@ -1444,7 +1458,7 @@ mod tests {
         std::fs::write(dir.join("session_info.json"), "{}\n").unwrap();
         let zip_path =
             std::env::temp_dir().join(format!("scan-kit-spots-{}.zip", std::process::id()));
-        package_zip(&dir, &zip_path, "sess").unwrap();
+        package_zip(&dir, &zip_path, "sess", &mut |_, _| true).unwrap();
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         assert!(archive

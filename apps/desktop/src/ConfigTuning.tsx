@@ -175,6 +175,8 @@ export function ConfigTuning({
   const previewGen = useRef(0);
   const autoMu = useRef<number | null>(null);
   const dirtyRef = useRef(false);
+  const editSeq = useRef(0);
+  const hideSeq = useRef(0);
   const busyRef = useRef(false);
   const leftPane = useRef<HTMLDivElement>(null);
   const previewDrag = useRef(PREVIEW_RATIO);
@@ -474,6 +476,7 @@ export function ConfigTuning({
     if (busyRef.current) {
       return;
     }
+    editSeq.current += 1;
     setForm((current) => (current == null ? current : { ...current, nodes: editField(current.nodes, id, value) }));
     setDirty(true);
   }
@@ -482,6 +485,7 @@ export function ConfigTuning({
     if (busyRef.current) {
       return;
     }
+    editSeq.current += 1;
     setForm((current) =>
       current == null
         ? current
@@ -491,9 +495,13 @@ export function ConfigTuning({
   }
 
   async function toggleHide(next: boolean) {
+    const seq = ++hideSeq.current;
     try {
       await invoke("scan_kit_config_hide", { hideUnused: next });
-      setHideUnused(next);
+      // A slower earlier call must not overwrite the newest click.
+      if (seq === hideSeq.current) {
+        setHideUnused(next);
+      }
     } catch (caught) {
       notifyError(caught);
     }
@@ -522,6 +530,7 @@ export function ConfigTuning({
       return;
     }
     savingRef.current = true;
+    const edits = editSeq.current;
     const selected = await open({
       directory: true,
       multiple: false,
@@ -546,7 +555,7 @@ export function ConfigTuning({
       // An edit landing while the native folder dialog was open is not in
       // the captured form — saving would write stale xml and clear its
       // dirty flag.
-      if (dirtyRef.current !== dirty) {
+      if (editSeq.current !== edits) {
         notify("The file changed while the save dialog was open — review and save again.");
         return;
       }
@@ -566,7 +575,9 @@ export function ConfigTuning({
         files: [{ rel: file, xml: nextXml }],
         hideUnused,
       });
-      if (seq !== openSeq.current) {
+      // Same guard after the awaits — an edit landing during apply/save must
+      // not have its dirty flag cleared by the older snapshot.
+      if (seq !== openSeq.current || editSeq.current !== edits) {
         return;
       }
       setConfigDir(selected);

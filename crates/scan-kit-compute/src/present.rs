@@ -305,6 +305,10 @@ pub(crate) fn finish_patient_report(
             return Err(format!("{}: {err}", csv_path.display()));
         }
         out["dvh_csv"] = json!(csv_path.display().to_string());
+    } else {
+        // A curve-less export must not leave a stale sidecar pairing with
+        // the new PDF - the pair reads as one artifact.
+        let _ = std::fs::remove_file(&csv_path);
     }
     Ok(out)
 }

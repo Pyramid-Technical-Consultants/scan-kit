@@ -171,21 +171,47 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
     let mut part = path.as_os_str().to_os_string();
     part.push(format!(".{}.{}.part", std::process::id(), seq));
     let part = std::path::PathBuf::from(part);
-    let write = std::fs::write(&part, bytes).and_then(|()| match std::fs::rename(&part, path) {
-        Ok(()) => Ok(()),
-        // Windows refuses to rename over an existing destination. A locked
-        // destination fails the same way, but its remove then fails too —
-        // only an exists-but-removable file reaches the retry. If the retry
-        // fails, the .part stays behind with the payload instead of losing
-        // the artifact and the payload both.
-        Err(err)
-            if err.kind() == std::io::ErrorKind::PermissionDenied
-                || err.kind() == std::io::ErrorKind::AlreadyExists =>
-        {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&part, path))
-        }
-        Err(err) => Err(err),
-    });
+    // Flush the payload before the rename — a crash between write and rename
+    // must not leave an empty file wearing the real name.
+    let write = std::fs::write(&part, bytes)
+        .and_then(|()| std::fs::OpenOptions::new().write(true).open(&part))
+        .and_then(|file| file.sync_all())
+        .and_then(|()| match std::fs::rename(&part, path) {
+            Ok(()) => Ok(()),
+            // Windows refuses to rename over an existing destination. Moving the
+            // old file aside first keeps it recoverable at every point — a
+            // remove+rename gap used to leave neither artifact nor payload when
+            // the retry failed.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let mut bak = path.as_os_str().to_os_string();
+                bak.push(format!(".{}.{}.bak", std::process::id(), seq));
+                let bak = std::path::PathBuf::from(bak);
+                std::fs::rename(path, &bak)
+                    .and_then(|()| {
+                        match std::fs::rename(&part, path) {
+                            // A locked .bak must not fail a committed export — the
+                            // new file already landed; the stray backup is cosmetic.
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(&bak);
+                                Ok(())
+                            }
+                            Err(err) => {
+                                let _ = std::fs::rename(&bak, path);
+                                Err(err)
+                            }
+                        }
+                    })
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(&part);
+                    })
+            }
+            Err(err) => Err(err).inspect_err(|_| {
+                let _ = std::fs::remove_file(&part);
+            }),
+        });
     write.map_err(|err| format!("{}: {err}", path.display()))
 }
 
