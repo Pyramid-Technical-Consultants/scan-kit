@@ -815,11 +815,17 @@ export function AnalysisView({
     )
       .then(() => {
         setExportReport(null);
-        notifySaved(dest, { title: view === "write_dose" ? "Dose exported" : "Report exported" });
+        if (liveRef.current) {
+          notifySaved(dest, { title: view === "write_dose" ? "Dose exported" : "Report exported" });
+        }
       })
       .catch((reason: unknown) => {
         setExportReport(null);
-        notifyError(reason);
+        // A dead instance's export-cancelled toast is routine supersession,
+        // not an error the user needs.
+        if (liveRef.current) {
+          notifyError(reason);
+        }
       })
       .finally(() => {
         exportBusyRef.current = false;

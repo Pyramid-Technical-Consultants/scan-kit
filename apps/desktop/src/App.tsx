@@ -499,6 +499,10 @@ export default function App() {
         }
         if (catalogEpoch.current === epoch) {
           pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
+        } else {
+          // A superseded run must not leave stale pending roots — the next
+          // password submit would re-index removed locations.
+          pendingLocations.current = [];
           try {
             await pullCatalog(epoch);
             dismissNotice();
@@ -521,6 +525,10 @@ export default function App() {
 
   const removeLocation = useCallback(
     async (path: string) => {
+      // Bump first — a queued indexMany would re-register the forgotten
+      // root inside index_library's transaction and republish it.
+      ++catalogEpoch.current;
+      pendingLocations.current = [];
       try {
         applyCatalog(await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path }));
       } catch (error: unknown) {
@@ -936,8 +944,10 @@ export default function App() {
         setRows((items) =>
           items.map((item) => ({ ...item, selected: restore.has(item.session_id) })),
         );
+        // Only this generation's failure is news — a superseded write's
+        // error would toast after the newer commit already won.
+        notifyError(error);
       }
-      notifyError(error);
     });
   }, [locations, selectionOrder]);
 

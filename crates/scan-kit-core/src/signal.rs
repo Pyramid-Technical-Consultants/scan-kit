@@ -742,7 +742,11 @@ pub fn robust_limits_finite(values: &mut [f32]) -> Option<(f32, f32)> {
         crate::stats::select_ranks(values, rank(0.005).min(last), rank(0.995).min(last))
     };
     let scale = hi.abs().max(lo.abs());
-    let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
+    // An absolute 1e-6 floor swallows charge-integral columns that live at
+    // nC/pC scale (1e-9..1e-12) — the trace would pin to 0. Scale the floor.
+    let pad = ((hi - lo) * 0.02)
+        .max(scale * 0.02)
+        .max((scale * 1.0e-3).max(1.0e-12));
     Some(((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX)))
 }
 
