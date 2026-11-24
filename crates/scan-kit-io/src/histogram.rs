@@ -173,7 +173,10 @@ fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
     // otherwise overflow to +inf and NaN the first edge.
     let span = f64::from(hi) - f64::from(lo);
     let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || span.abs() < 1e-12 {
-        (lo - 0.5, (lo - 0.5) + 1.0)
+        // A fixed 0.5 pad is unrepresentable above |lo| ~= 2^23 (ulp > 1) —
+        // scale the pad to the magnitude so the edges stay distinct.
+        let pad = (lo.abs() * f32::EPSILON).max(0.5);
+        (lo - pad, lo + pad)
     } else {
         (lo, hi)
     };

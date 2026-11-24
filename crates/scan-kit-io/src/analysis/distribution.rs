@@ -370,7 +370,10 @@ fn padded_span(values: &[f32]) -> (f32, f32) {
     // A constant column has no span to pad — pad around the value like
     // density_range, or every density/contour sample falls off-grid.
     if hi == lo {
-        return ((lo - 0.5).max(-f32::MAX), (hi + 0.5).min(f32::MAX));
+        // Same representability ceiling as uniform_edges — a fixed 0.5 pad
+        // rounds away for |lo| above ~2^23 and collapses x0 == x1.
+        let pad = (lo.abs() * f32::EPSILON).max(0.5);
+        return ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX));
     }
     let pad = ((hi - lo) * 0.04).max(1e-4);
     ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX))

@@ -519,8 +519,36 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
         let rx = rx_fx.is_finite().then_some(rx_fx);
         let goals = goals_text
             .lines()
-            .filter_map(|line| Goal::parse(line).ok())
-            .filter(|goal| structure.name.eq_ignore_ascii_case(&goal.roi))
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                match Goal::parse(line) {
+                    Ok(goal) => structure
+                        .name
+                        .eq_ignore_ascii_case(&goal.roi)
+                        .then_some(goal),
+                    // A line that names this ROI but fails the grammar is a
+                    // goal attempt — keep it so it renders fail, not absent.
+                    Err(_) => line
+                        .split_once(':')
+                        .map(|(roi, _)| roi.trim())
+                        .filter(|roi| structure.name.eq_ignore_ascii_case(roi))
+                        .map(|_| Goal {
+                            roi: structure.name.clone(),
+                            metric: GoalMetric::Mean,
+                            metric_text: line
+                                .split_once(':')
+                                .map(|(_, rest)| rest.trim())
+                                .unwrap_or(line)
+                                .to_owned(),
+                            op: String::new(),
+                            value: f32::NAN,
+                            unit: String::new(),
+                        }),
+                }
+            })
             .map(|goal| {
                 let check = if structure_dvh.voxels() == 0.0 {
                     Err("no valid dose inside the structure".to_owned())
@@ -1470,7 +1498,13 @@ impl Dvh {
             .copied()
             .filter(|value| value.is_finite())
             .fold(0.0f32, f32::max);
-        let hi = if peak > 0.0 { peak * (1.0 + 1e-6) } else { 1.0 };
+        // A peak near f32::MAX overflows to +inf — that NaNs every edge
+        // and every goal check. Clamp so the top bin still holds it.
+        let hi = if peak > 0.0 {
+            (peak * (1.0 + 1e-6)).min(f32::MAX)
+        } else {
+            1.0
+        };
         let edges: Vec<f32> = (0..=DVH_BINS)
             .map(|i| hi * i as f32 / DVH_BINS as f32)
             .collect();

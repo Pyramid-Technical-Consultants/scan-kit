@@ -1497,7 +1497,13 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
             // A stale/corrupt recorded binding could point outside the opened
             // library — delete_storage sends every returned path to trash.
-            if local_under_root(root, &place) && Path::new(&place).exists() {
+            // The name probe below verifies a zip wraps this session id
+            // before trusting it — a repointed recorded binding must clear
+            // the same bar or trash could take a different session's file.
+            let proven = Path::new(&place).is_dir()
+                || discover::archive_identity(Path::new(&place))
+                    .is_some_and(|(id, _)| id == session_id);
+            if local_under_root(root, &place) && Path::new(&place).exists() && proven {
                 found.push(place);
             }
         }

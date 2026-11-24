@@ -104,7 +104,9 @@ pub fn canonical_local(path: &Path) -> String {
 }
 
 pub fn last_data_dir(conn: &Connection) -> Result<Option<String>, String> {
-    Ok(prefs_get(conn, PREF_LAST_DATA_DIR)?.and_then(|value| value.as_str().map(str::to_owned)))
+    Ok(prefs_get(conn, PREF_LAST_DATA_DIR)?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|dir| !dir.is_empty()))
 }
 
 pub fn window_geometry(conn: &Connection) -> Result<Value, String> {
@@ -439,8 +441,10 @@ pub fn record_meta(
     // The UPDATE below leaves size/mtime_ns alone: sync_entry stamps them
     // before hydrate reads any bytes, and restatting now would certify
     // content the row does not hold — a stored fingerprint newer than the
-    // hydrated bytes pins stale meta instead of re-reading it.
-    let _ = fingerprint;
+    // hydrated bytes pins stale meta instead of re-reading it. The WHERE
+    // clause binds the fingerprint hydrate certified: a peer that restamped
+    // the row to newer bytes takes 0 rows and stays retryable.
+    let (fp_mtime, fp_size) = fingerprint.unzip();
     let path = entry.storage_path.to_string_lossy().to_string();
     let date = meta.and_then(SessionMeta::date_iso);
     // A meta=None row only seals (checked=1) when hydrate found the storage
@@ -462,7 +466,8 @@ pub fn record_meta(
             map_extent_mm = ?10,
             layer_count = ?11,
             map_geom_checked = ?12
-         WHERE library_id = ?1 AND session_id = ?2",
+         WHERE library_id = ?1 AND session_id = ?2
+           AND size IS ?13 AND mtime_ns IS ?14",
         params![
             lib_id,
             entry.session_id,
@@ -476,6 +481,8 @@ pub fn record_meta(
             meta.and_then(|item| item.map_extent_mm),
             meta.and_then(|item| item.layer_count),
             checked,
+            fp_size,
+            fp_mtime,
         ],
     )
     .map_err(|err| err.to_string())?;
