@@ -1,5 +1,7 @@
 //! Phantom Synthesis: a synthetic CT, RTSTRUCT, and RT Ion plan.
 
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use chrono::Local;
@@ -60,13 +62,31 @@ pub fn write(parent: &Path, params: &Value, db: &Path) -> Result<Value, String> 
         ));
     }
     let stamp = Local::now().format("%Y%m%d_%H%M%S");
-    let folder = parent.join(format!("synthetic_{phantom}_{stamp}"));
-    if folder.exists() {
-        return Err(format!("{} already exists", folder.display()));
+    // Claim the folder atomically — two writers in the same second used to
+    // pass the exists() check together and interleave one study's files.
+    let mut folder = parent.join(format!("synthetic_{phantom}_{stamp}"));
+    for suffix in 0..10u32 {
+        match fs::create_dir(&folder) {
+            Ok(()) => break,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                folder = parent.join(format!("synthetic_{phantom}_{stamp}-{suffix}"));
+            }
+            Err(err) => return Err(err.to_string()),
+        }
     }
-    let note = write_phantom_study(&folder, params)?;
-    let text = folder.display().to_string();
-    let _ = with_store(db, |conn| store::set_last_dicom_dir(conn, &text));
+    let note = match write_phantom_study(&folder, params) {
+        Ok(note) => note,
+        Err(err) => {
+            // Claimed above, so this can only drop this call's partial
+            // study — a plausible-looking half-written one must not stay.
+            let _ = fs::remove_dir_all(&folder);
+            return Err(err);
+        }
+    };
+    let text = store::canonical_local(&folder);
+    if !text.is_empty() {
+        let _ = with_store(db, |conn| store::set_last_dicom_dir(conn, &text));
+    }
     Ok(json!({
         "folder": text,
         "note": note,
@@ -132,6 +152,38 @@ mod tests {
         assert_eq!(remembered, folder);
         let listed = catalog(&db);
         assert_eq!(listed["save_dir"].as_str(), Some(folder));
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_same_second_write_claims_a_suffixed_folder() {
+        // Two writers in one second must not interleave one folder — the
+        // atomic claim lands the second on a -0 name. Block both the
+        // current and next second's names so the suffix path is forced
+        // whichever tick the write lands in.
+        let parent =
+            std::env::temp_dir().join(format!("scan-kit-phantom-suffix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+        for offset in 0..=1 {
+            let stamp = (Local::now() + chrono::Duration::seconds(offset)).format("%Y%m%d_%H%M%S");
+            fs::create_dir(parent.join(format!("synthetic_water_{stamp}"))).unwrap();
+        }
+        let db = parent.join("scan-kit.sqlite");
+        let written = write(
+            &parent,
+            &json!({
+                "phantom": "water",
+                "pixel": 8.0,
+                "slice": 8.0,
+                "energies": [140.0],
+                "fractions": 1
+            }),
+            &db,
+        )
+        .unwrap();
+        let folder = written["folder"].as_str().unwrap();
+        assert!(folder.contains("-0"), "{folder}");
         let _ = fs::remove_dir_all(&parent);
     }
 }

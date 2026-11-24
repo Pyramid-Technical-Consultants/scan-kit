@@ -101,6 +101,9 @@ pub fn patient_inputs(
         },
         &[("plan", "Plan"), ("delivered", "Delivered")],
     );
+    if segment == "delivered" && groups.is_empty() {
+        return Err("no delivered sessions loaded - check the session data and retry".to_owned());
+    }
     let sent = options.get("fraction").and_then(Value::as_str);
     let fraction = if segment == "plan" || groups.is_empty() {
         "Plan"
@@ -400,7 +403,7 @@ pub fn provenance(
         "deliveries": sessions,
         "segment": inputs.segment,
         "fraction": inputs.fraction,
-        "beams": inputs.beam_filter.map(|index| index.to_string()),
+        "beams": inputs.beam_filter.map(|index| (index + 1).to_string()),
         "alpha_beta": inputs.alpha_beta,
         "dose": "dose-to-water, Gy per fraction",
         "rbe": inputs.rbe_key,
@@ -519,7 +522,11 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             .filter_map(|line| Goal::parse(line).ok())
             .filter(|goal| structure.name.eq_ignore_ascii_case(&goal.roi))
             .map(|goal| {
-                let check = goal.check(&structure_dvh, rx);
+                let check = if structure_dvh.voxels() == 0.0 {
+                    Err("no valid dose inside the structure".to_owned())
+                } else {
+                    goal.check(&structure_dvh, rx)
+                };
                 (goal, check)
             })
             .collect();
@@ -559,6 +566,11 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             return None;
         }
         let tps = study.tps.as_ref()?;
+        // A per-beam TPS export is one beam's dose — gamma'ing it against
+        // the whole-plan MC dose produces a plausible but wrong rate.
+        if tps.summation.eq_ignore_ascii_case("BEAM") {
+            return None;
+        }
         let (dd, dta, cutoff) = gamma_criteria(options);
         // The TPS dose for one fraction, searched in the MC dose resampled to
         // its grid and expressed in the TPS dose's DoseType.
@@ -943,8 +955,10 @@ pub(crate) fn scene(
                 AB_PAIRS
                     .iter()
                     .find(|(key, _)| key.parse::<f64>() == Ok(alpha_beta))
-                    .map(|(_, label)| *label)
-                    .unwrap_or("2 Gy"),
+                    .map(|(_, label)| (*label).to_owned())
+                    // Custom values are accepted by patient_inputs — echo
+                    // the value used, not the list default.
+                    .unwrap_or_else(|| format!("{alpha_beta} Gy")),
             )
             .grouped("Study"),
         );

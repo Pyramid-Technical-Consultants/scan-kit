@@ -72,9 +72,12 @@ pub fn open_connection(path: &Path) -> Result<Connection, String> {
         }
     }
     let conn = Connection::open(path).map_err(|err| err.to_string())?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|err| err.to_string())?;
+    // busy_timeout first: journal_mode needs an exclusive lock on a
+    // non-WAL file, and without the timeout armed a busy peer fails it
+    // instantly.
     conn.pragma_update(None, "busy_timeout", 5000)
+        .map_err(|err| err.to_string())?;
+    conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|err| err.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| err.to_string())?;
@@ -290,6 +293,8 @@ pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> 
     // Store the trimmed text — the command response already reports the
     // trimmed form, so the two must agree about what persisted.
     let note = text.trim();
+    // Upsert is deliberate — a user can note a session before a scan makes
+    // its row (tests pin the row surviving trash/re-import).
     conn.execute(
         "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, ?2, ?3)
          ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note",
@@ -308,10 +313,10 @@ pub fn set_selected(
     for session_id in session_ids {
         if !unique.contains(session_id) {
             unique.push(session_id.clone());
+            if unique.len() > 5 {
+                return Err("at most five sessions can be selected".to_owned());
+            }
         }
-    }
-    if unique.len() > 5 {
-        return Err("at most five sessions can be selected".to_owned());
     }
     let lib_id = ensure_library(conn, root)?;
     import_legacy(conn, lib_id, Path::new(root))?;
@@ -358,6 +363,11 @@ pub fn sync_entry(
         .optional()
         .map_err(|err| err.to_string())?;
 
+    // ponytail: the fingerprint was stat'ed before STORE_LOCK while the
+    // caller walked storage — a file replaced in that window gets the new
+    // path with the old stamp. The ceiling is one scan interval; the next
+    // scan's fingerprint mismatch rehydrates. Closing it would need the
+    // stat inside the lock, which puts remote connects under STORE_LOCK.
     let path = entry.storage_path.to_string_lossy().to_string();
     if let Some(existing) = existing {
         if fingerprint.is_none() {
@@ -430,10 +440,7 @@ pub fn record_meta(
     // before hydrate reads any bytes, and restatting now would certify
     // content the row does not hold — a stored fingerprint newer than the
     // hydrated bytes pins stale meta instead of re-reading it.
-    let (mtime_ns, size) = match fingerprint {
-        Some((mtime, size)) => (Some(mtime), Some(size)),
-        None => (None, None),
-    };
+    let _ = fingerprint;
     let path = entry.storage_path.to_string_lossy().to_string();
     let date = meta.and_then(SessionMeta::date_iso);
     // A meta=None row only seals (checked=1) when hydrate found the storage
@@ -447,24 +454,20 @@ pub fn record_meta(
         "UPDATE sessions SET
             storage_path = ?3,
             kind = ?4,
-            size = ?5,
-            mtime_ns = ?6,
-            date = ?7,
-            primary_mu = ?8,
-            treatment_time_s = ?9,
-            room_number = ?10,
-            config_name = ?11,
-            map_extent_mm = ?12,
-            layer_count = ?13,
-            map_geom_checked = ?14
+            date = ?5,
+            primary_mu = ?6,
+            treatment_time_s = ?7,
+            room_number = ?8,
+            config_name = ?9,
+            map_extent_mm = ?10,
+            layer_count = ?11,
+            map_geom_checked = ?12
          WHERE library_id = ?1 AND session_id = ?2",
         params![
             lib_id,
             entry.session_id,
             path,
             entry.kind,
-            size,
-            mtime_ns,
             date,
             meta.and_then(|item| item.primary_mu),
             meta.and_then(|item| item.treatment_time_s),
@@ -603,6 +606,11 @@ pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
         params![PREF_DATA_DIRS, raw],
     )
     .map_err(|err| err.to_string())?;
+    // A peer may have committed the real list between our read and the
+    // insert — return what is stored, not our one-item fallback.
+    if let Some(value) = prefs_get(conn, PREF_DATA_DIRS)?.filter(|value| value.is_array()) {
+        return Ok(string_list(&value));
+    }
     Ok(dirs)
 }
 

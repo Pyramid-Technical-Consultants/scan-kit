@@ -478,11 +478,38 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
         .map(|(_, bytes)| bytes)
 }
 
-pub fn read_timeslices(storage: &Path) -> Vec<Vec<u8>> {
-    read_timeslice_frames(storage)
-        .into_iter()
-        .map(|(_, bytes)| bytes)
-        .collect()
+/// Timeslice files scoped to `session_id`. A directory storage walks only
+/// `session_directory` (never the library root for a foreign id). In an
+/// archive, members must live under `{session_id}/`, or the archive must
+/// hold a single session tree — the same rule read_session_file uses for
+/// its suffix fallback, so a multi-session zip cannot merge a sibling
+/// session's rows under this id.
+pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
+    if storage.is_dir() {
+        let root = session_directory(storage, session_id);
+        let mut found = Vec::new();
+        walk_files(&root, &root, 0, &is_timeslice, &mut found);
+        found.sort_by_key(|member| timeslice_key(&member.0));
+        return found.into_iter().map(|(_, bytes)| bytes).collect();
+    }
+    let mut members =
+        archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default();
+    let roots: std::collections::BTreeSet<String> = members
+        .iter()
+        .filter_map(|(name, _)| {
+            normalize_member(name)
+                .split('/')
+                .next()
+                .filter(|root| !root.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+    if roots.len() != 1 {
+        let prefix = format!("{session_id}/");
+        members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
+    }
+    members.sort_by_key(|member| timeslice_key(&member.0));
+    members.into_iter().map(|(_, bytes)| bytes).collect()
 }
 
 /// Timeslice files in layer/run order. The index is the `layer-N` folder, or
@@ -1380,5 +1407,31 @@ mod tests {
         let err = discover(&root, &mut |_, _| false).err().unwrap();
         assert!(err.contains("cancelled"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslices_from_a_sibling_session_are_not_merged() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for session in ["sess-a", "sess-b"] {
+            let layer = root.join(session).join("layer-1");
+            fs::create_dir_all(&layer).unwrap();
+            fs::write(root.join(session).join("input_map.csv"), "spot_no\n1\n").unwrap();
+            fs::write(
+                layer.join("timeslice_data_device_units.csv"),
+                format!("session\n{session}\n"),
+            )
+            .unwrap();
+        }
+        let files = read_timeslices_for(&root, "sess-a");
+        assert_eq!(files.len(), 1);
+        assert!(String::from_utf8_lossy(&files[0]).contains("sess-a"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

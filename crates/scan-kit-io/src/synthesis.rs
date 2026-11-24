@@ -22,12 +22,25 @@ pub fn catalog(db: &Path) -> Value {
 }
 
 pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
-    let path = input
-        .get("path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned);
+    // A present-but-blank path is a caller error — silently degrading to
+    // preview means the caller thinks a file was written.
+    let path = match input.get("path") {
+        None => None,
+        Some(value) => match value.as_str().map(str::trim) {
+            Some("") | None => return Err("path must be a non-empty string".into()),
+            Some(text) => Some(text.to_owned()),
+        },
+    };
+    // Every write lands through write_csv — fail a bad extension before
+    // the parse, not after it.
+    if let Some(path) = &path {
+        if !Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+        {
+            return Err("the plan path must end in .csv".into());
+        }
+    }
     if let Some(csv_value) = input.get("csv") {
         let Some(csv) = csv_value.as_str() else {
             return Err("csv must be a string".into());

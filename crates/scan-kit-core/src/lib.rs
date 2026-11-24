@@ -73,8 +73,8 @@ pub use tune::{run_tune, tune_catalog, TuneSpots};
 pub use xml_dom::{parse_xml, write_xml, Elem};
 
 pub use schema::{
-    column_is_integer, column_scale_factor, concept_column_candidates, normalize_column_name,
-    resolve_column_name, resolve_concept_column, resolve_requested_column,
+    column_is_integer, column_scale_factor, concept_column_candidates, concept_of,
+    normalize_column_name, resolve_column_name, resolve_concept_column, resolve_requested_column,
     timeslice_amplifier_field_columns, ConceptAlias, DerivedSum, CONCEPT_ALIASES, DERIVED_SUMS,
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };

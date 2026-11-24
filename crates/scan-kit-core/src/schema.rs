@@ -411,11 +411,28 @@ pub fn resolve_requested_column<'a>(columns: &'a [String], requested: &str) -> O
     if let Some(found) = resolve_column_name(columns, requested) {
         return Some(found);
     }
-    if let Some(rest) = requested.strip_prefix("r_") {
+    // "r_" alone strips to an empty name — an empty header cell would
+    // otherwise serve an unnamed column under the request "r_".
+    if let Some(rest) = requested.strip_prefix("r_").filter(|rest| !rest.is_empty()) {
         resolve_column_name(columns, rest)
     } else {
         resolve_column_name(columns, &format!("r_{requested}"))
     }
+}
+
+/// The concept a requested column name aliases to, if any.
+pub fn concept_of(requested: &str) -> Option<&'static str> {
+    let want = normalize_column_name(requested);
+    CONCEPT_ALIASES
+        .iter()
+        .find(|alias| {
+            normalize_column_name(alias.concept) == want
+                || alias
+                    .names
+                    .iter()
+                    .any(|name| normalize_column_name(name) == want)
+        })
+        .map(|alias| alias.concept)
 }
 
 /// Header names to request for field and amplifier timeslice columns.
@@ -487,6 +504,9 @@ mod tests {
         );
         assert!(concept_column_candidates("ic1_x_pos_raw", None).is_empty());
         assert!(timeslice_amplifier_field_columns().contains(&"r_tx2_probe_x"));
+        assert!(concept_of("layer") == Some("layer_id"));
+        assert!(concept_of("spot_id") == Some("spot_no"));
+        assert!(concept_of("nonsense_column").is_none());
         assert!(column_is_integer("layer_id"));
         assert!(!column_is_integer("energy"));
     }

@@ -328,6 +328,11 @@ fn write_table(root: &mut Elem, node: &Value) -> Result<(), String> {
     if rows.len() != indices.len() {
         return Err("table row count does not match the XML".into());
     }
+    let row_tag = indices
+        .first()
+        .and_then(|index| parent.children.get(*index))
+        .map(|elem| elem.name.clone())
+        .ok_or_else(|| format!("missing table row in {id}"))?;
     for (index, row) in indices.iter().zip(rows) {
         let cells = row
             .as_array()
@@ -336,6 +341,12 @@ fn write_table(root: &mut Elem, node: &Value) -> Result<(), String> {
             .children
             .get_mut(*index)
             .ok_or_else(|| format!("missing table row {index}"))?;
+        if child.name != row_tag {
+            return Err(format!(
+                "table row {index} is a <{}>, expected <{row_tag}> — refusing to write",
+                child.name
+            ));
+        }
         for (column, cell) in columns.iter().zip(cells) {
             child.set_attr(column, &cell_text(cell));
         }
@@ -776,6 +787,26 @@ mod tests {
             ]}]})
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_table_write_refuses_a_row_index_that_is_not_a_row_element() {
+        // A drifted index would stamp row attributes onto a header element.
+        let xml = "<t><hdr/><row a=\"1\"/><row a=\"2\"/></t>";
+        let node = json!({
+            "id": "#", "indices": [0, 1],
+            "columns": [{"name": "a"}],
+            "rows": [["9"], ["8"]],
+        });
+        let mut root = crate::xml_dom::parse_xml(xml).unwrap();
+        assert!(write_table(&mut root, &node).is_err());
+        let ok = json!({
+            "id": "#", "indices": [1, 2],
+            "columns": [{"name": "a"}],
+            "rows": [["9"], ["8"]],
+        });
+        write_table(&mut root, &ok).unwrap();
+        assert_eq!(root.children[1].attr("a"), Some("9"));
     }
 
     #[test]

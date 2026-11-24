@@ -554,7 +554,12 @@ fn diff_trees(
                 None if ours.len() > DIFF_MAX_BYTES || other.len() > DIFF_MAX_BYTES => {
                     ("large", Vec::new())
                 }
-                None => ("binary", Vec::new()),
+                None if text_lines(ours).is_none() || text_lines(other).is_none() => {
+                    ("binary", Vec::new())
+                }
+                // Text that diverges past the edit-script cap is changed,
+                // not binary — the view just gets no hunks.
+                None => ("changed", Vec::new()),
             },
             (None, None) => continue,
         };

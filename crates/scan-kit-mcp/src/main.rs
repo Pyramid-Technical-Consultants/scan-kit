@@ -192,11 +192,15 @@ fn schema_for(name: &str) -> Value {
     }
 }
 
-fn dispatch(name: &str, input: &Value) -> Result<Value, String> {
+fn dispatch(
+    name: &str,
+    input: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Value, String> {
     if scan_kit_core::tools().iter().any(|tool| tool.name == name) {
         scan_kit_core::invoke(name, input).map_err(|err| err.to_string())
     } else if scan_kit_io::tools().iter().any(|tool| tool.name == name) {
-        scan_kit_io::invoke(name, input).map_err(|err| err.to_string())
+        scan_kit_io::invoke_flag(name, input, cancel).map_err(|err| err.to_string())
     } else if scan_kit_compute::tools()
         .iter()
         .any(|tool| tool.name == name)
@@ -249,7 +253,7 @@ impl ServerHandler for ScanKit {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let input = match request.arguments {
             None => Value::Null,
@@ -306,10 +310,33 @@ impl ServerHandler for ScanKit {
                 }
                 // dispatch blocks on file IO, remote connect timeouts, and GPU
                 // waits — pinning a tokio worker starves every other request.
-                match tokio::task::spawn_blocking(move || dispatch(&name, &input)).await {
-                    Ok(inner) => inner,
-                    Err(err) => Err(err.to_string()),
-                }
+                // The client's ct cancels on CancelledNotification: it frees
+                // this request immediately, and the flag makes cooperative
+                // tools (index scans) roll back instead of running to
+                // completion in a detached task.
+                let ct = context.ct;
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = cancel.clone();
+                let watch_ct = ct.clone();
+                let watcher = tokio::spawn(async move {
+                    watch_ct.cancelled().await;
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+                let tool = name.clone();
+                let joined =
+                    tokio::task::spawn_blocking(move || dispatch(&name, &input, &cancel));
+                // A blocking task cannot be aborted mid-run, but selecting
+                // frees this request now; cooperative tools also roll back
+                // via the flag instead of finishing in a detached task.
+                let result = tokio::select! {
+                    out = joined => match out {
+                        Ok(inner) => inner,
+                        Err(err) => Err(format!("{tool} failed: {err}")),
+                    },
+                    _ = ct.cancelled() => Err("cancelled".to_owned()),
+                };
+                watcher.abort();
+                result
             }
         };
         match result {
