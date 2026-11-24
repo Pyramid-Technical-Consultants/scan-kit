@@ -140,7 +140,9 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
         };
     }
     if auto {
-        let gain = level.unwrap_or(1.0).clamp(0.05, 8.0);
+        // The Gain slider spans 0.25..=4.0 — an out-of-range level must
+        // not apply a gain the control can't express.
+        let gain = level.unwrap_or(1.0).clamp(0.25, 4.0);
         return Wash {
             lo: base_lo,
             hi: base_hi,

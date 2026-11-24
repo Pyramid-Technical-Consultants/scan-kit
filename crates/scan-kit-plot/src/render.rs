@@ -696,9 +696,11 @@ fn axis_step(cell: f32, dir_mm: f32, voxel: f32, best: f32) -> f32 {
     let brick = floor(cell / 8.0) * 8.0;
     var bound = brick;
     if (dir_i > 0.0) { bound = brick + 8.0; }
+    // step >= 0 inside a brick — the nearest face IS the constraint, and
+    // skipping a ~0 distance hops the very face being crossed (the CPU
+    // march at dose/ray.rs carries this same comment).
     let step = (bound - cell) / dir_i;
-    if (step > 0.0001) { return min(best, step); }
-    return best;
+    return min(best, step);
 }
 
 fn steps_to_leave(cell: vec3<f32>, dir: vec3<f32>, spacing: vec3<f32>, step: f32) -> i32 {
@@ -7257,8 +7259,11 @@ fn profile_quantity(plot: &Plot, panel: usize) -> String {
         .find_map(|item| {
             let label = bare_quantity(&item.y_label);
             let name = label.to_ascii_lowercase();
-            (name.starts_with("gy") || name.starts_with("mu") || name.starts_with("proton"))
-                .then(|| label.to_string())
+            (name.starts_with("gy")
+                || name.starts_with("mu")
+                || name.starts_with("proton")
+                || name.starts_with("gamma"))
+            .then(|| label.to_string())
         })
         .unwrap_or_else(|| "Gy".to_string())
 }

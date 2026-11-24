@@ -184,8 +184,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                     if held != &position {
                         return Err(format!(
                             "CT series {uid} mixes patient positions {held}/{position}"
-                        )
-                        .into());
+                        ));
                     }
                 } else {
                     ct_positions.insert(uid.clone(), position);
@@ -232,7 +231,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             // A RELATIVE dose would read its scaled counts as absolute Gy.
             let units = text_tag(&elems, tag(0x3004, 0x0002));
             if !units.is_empty() && !units.eq_ignore_ascii_case("GY") {
-                return Err(format!("dose units {units} are not GY").into());
+                return Err(format!("dose units {units} are not GY"));
             }
             for slice in image_slices(&elems, scale)? {
                 dose_slices.push((frame.clone(), slice));
@@ -712,7 +711,9 @@ struct Slice {
 fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     let photometric = text_tag(elems, tag(0x0028, 0x0004));
     if !photometric.is_empty() && !photometric.eq_ignore_ascii_case("MONOCHROME2") {
-        return Err(format!("photometric interpretation {photometric} is not MONOCHROME2").into());
+        return Err(format!(
+            "photometric interpretation {photometric} is not MONOCHROME2"
+        ));
     }
     // int_tag can text-parse a 2-byte US payload whose bytes spell an ASCII
     // number (e.g. value 12589 = "-1") — reject non-positive results rather
@@ -1333,7 +1334,7 @@ fn read_structures(elems: &[Elem]) -> Result<Vec<Structure>, String> {
             if data.iter().any(|value| !value.is_finite()) {
                 return Err("ContourData holds a non-finite coordinate".into());
             }
-            if data.len() % 3 != 0 {
+            if !data.len().is_multiple_of(3) {
                 return Err("ContourData does not hold whole xyz triples".into());
             }
             let declared = int_tag(item, tag(0x3006, 0x0046));

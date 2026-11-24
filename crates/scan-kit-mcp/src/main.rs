@@ -339,8 +339,9 @@ impl ServerHandler for ScanKit {
                         // ponytail: the detached spawn_blocking still runs to
                         // completion — only tools that poll the flag (open_library,
                         // compute stages) actually stop. A cancelled write tool
-                        // reports "cancelled" while its effect lands; extending
-                        // the flag through io::invoke's write arms is the fix.
+                        // reports "cancelled" while its effect lands, and a slow
+                        // core/dicom read (index_study, load_study) keeps burning
+                        // IO; threading the flag into those invokes is the fix.
                         Err("cancelled".to_owned())
                     }
                 };

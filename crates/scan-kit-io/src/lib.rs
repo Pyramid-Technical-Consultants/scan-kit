@@ -362,7 +362,7 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "xml": { "type": "string" },
                 "form": { "type": "object" }
             },
-            "required": ["xml", "form"],
+            "required": ["xml"],
             "additionalProperties": false
         }),
         "scan_kit_config_save" => json!({

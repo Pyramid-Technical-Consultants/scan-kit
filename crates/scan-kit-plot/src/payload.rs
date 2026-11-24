@@ -153,6 +153,33 @@ pub fn encode_plot_reusing(
         .shape
         .iter()
         .fold(1usize, |acc, axis| acc.saturating_mul(*axis as usize));
+    // The decoder bounds session cubes at 64 total sharing a 1<<30 voxel
+    // budget — a scene past the ceiling would emit a payload its own
+    // decoder refuses, so keep the cubes that fit (volume_shape treatment).
+    fn keep_cubes<'a>(
+        cubes: &'a [scan_kit_core::SessionDose],
+        count: &mut usize,
+        voxels: &mut usize,
+    ) -> Vec<&'a scan_kit_core::SessionDose> {
+        let mut kept = Vec::new();
+        for dose in cubes {
+            let size = dose
+                .shape
+                .iter()
+                .fold(1usize, |acc, axis| acc.saturating_mul(*axis as usize));
+            if *count > 0 && size <= *voxels {
+                *count -= 1;
+                *voxels -= size;
+                kept.push(dose);
+            }
+        }
+        kept
+    }
+    let mut cube_count = 64usize;
+    let mut cube_voxels = 1usize << 30;
+    let kept_sessions = keep_cubes(&scene.volume.sessions, &mut cube_count, &mut cube_voxels);
+    let kept_plans = keep_cubes(&scene.volume.plans, &mut cube_count, &mut cube_voxels);
+    let kept_companions = keep_cubes(&scene.volume.companions, &mut cube_count, &mut cube_voxels);
     let header = PlotHeader {
         title: scene.title.clone(),
         controls: scene.controls.clone(),
@@ -174,10 +201,11 @@ pub fn encode_plot_reusing(
         lines: line_count,
         points: marks.points.len() as u32,
         quads: marks.quads.len() as u32,
-        volume_shape: if scene.volume.values.len() >= voxels {
+        volume_shape: if scene.volume.values.len() >= voxels && voxels <= (1 << 28) {
             scene.volume.shape
         } else {
-            // A shape the values don't fill would desync the decoder.
+            // A shape the values don't fill — or one over the decoder's
+            // cube bound — would desync or be refused on decode.
             [0, 0, 0]
         },
         volume_origin: scene.volume.origin,
@@ -198,9 +226,9 @@ pub fn encode_plot_reusing(
         volume_field: scene.volume.field,
         volume_ct: scene.volume.ct.len() >= voxels,
         volume_labels: scene.volume.labels.len() >= voxels,
-        volume_sessions: scene.volume.sessions.len() as u32,
-        volume_plans: scene.volume.plans.len() as u32,
-        volume_companions: scene.volume.companions.len() as u32,
+        volume_sessions: kept_sessions.len() as u32,
+        volume_plans: kept_plans.len() as u32,
+        volume_companions: kept_companions.len() as u32,
         volume_session_focus: scene.volume.session_focus,
         volume_colors: scene.volume.session_colors.clone(),
     };
@@ -233,7 +261,11 @@ pub fn encode_plot_reusing(
     for pixels in &marks.heatmaps {
         out.extend_from_slice(pixels.as_slice());
     }
-    if voxels > 0 && voxels != usize::MAX && scene.volume.values.len() >= voxels {
+    if voxels > 0
+        && voxels != usize::MAX
+        && voxels <= (1 << 28)
+        && scene.volume.values.len() >= voxels
+    {
         write_cube(&mut out, &scene.volume.values[..voxels]);
         if scene.volume.ct.len() >= voxels {
             write_f32s(&mut out, &scene.volume.ct[..voxels]);
@@ -275,12 +307,11 @@ pub fn encode_plot_reusing(
         }
         write_scan(&mut out, &scan);
     }
-    for session in scene
-        .volume
-        .sessions
+    for session in kept_sessions
         .iter()
-        .chain(&scene.volume.plans)
-        .chain(&scene.volume.companions)
+        .copied()
+        .chain(kept_plans.iter().copied())
+        .chain(kept_companions.iter().copied())
     {
         write_session(&mut out, session);
     }
@@ -513,7 +544,17 @@ fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
 }
 
 pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
-    decode_plot(bytes).map(|(header, _, _, _, _)| header)
+    // The header is the leading JSON — decoding the whole payload would
+    // allocate every dose cube just to answer this.
+    if bytes.len() < 4 {
+        return Err("plot payload is truncated".into());
+    }
+    let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let end = 4usize
+        .checked_add(json_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or("plot payload is truncated")?;
+    serde_json::from_slice(&bytes[4..end]).map_err(|err| err.to_string())
 }
 
 impl PlotHeader {
