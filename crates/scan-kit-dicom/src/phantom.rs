@@ -397,11 +397,13 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     0x012C,
                     &[0.0, ((PTV.y0 + PTV.y1) / 2.0) as f32, 0.0],
                 )?;
-                patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
+                // Cumulative meterset counts this control point too —
+                // writing the pre-point total undercounts every layer.
+                patient::ds(&mut cp, 0x300A, 0x0134, &[weight + n as f32])?;
                 patient::fl(&mut cp, 0x300A, 0x030D, &[300.0])?;
                 if request.wet > 0.0 {
                     let mut setting = Vec::new();
-                    patient::lo(&mut setting, 0x300A, 0x0362, "IN")?;
+                    patient::cs(&mut setting, 0x300A, 0x0362, "IN")?;
                     patient::fl(&mut setting, 0x300A, 0x0364, &[300.0])?;
                     patient::fl(&mut setting, 0x300A, 0x0366, &[request.wet as f32])?;
                     patient::is(&mut setting, 0x300C, 0x0100, 1)?;

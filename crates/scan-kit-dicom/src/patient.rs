@@ -341,6 +341,11 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
         ));
     }
     let elems = parse_file(&bytes)?;
+    // Wrong file kind — a CT or RTDOSE must not read as an empty ion plan.
+    let sop = text_tag(&elems, tag(0x0008, 0x0016));
+    if !sop.contains("1.2.840.10008.5.1.4.1.1.481.8") {
+        return Err("not an RT Ion Plan storage object".into());
+    }
     let label = text_tag(&elems, tag(0x300A, 0x0002));
     let mut spots = Vec::new();
     let mut plan_index = 0i32;
@@ -367,6 +372,12 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
             let size = floats_tag(cp, tag(0x300A, 0x0398));
             let limit = n.min(xy.len() / 2);
+            // A declared layer whose map holds fewer than two values is the
+            // same corrupt-map failure read_plan rejects — skipping it
+            // would silently drop the energy layer.
+            if limit == 0 {
+                return Err("scan spot position map is missing or corrupt".into());
+            }
             // The weights tag must hold one entry per spot position — a
             // short array would silently drop the tail of the beam.
             if has_weights && weights.len() < limit {
@@ -2223,7 +2234,13 @@ pub fn write_rtdose(
     ui(&mut bytes, 0x0020, 0x0052, &ct.frame)?;
     // LT holds 10240 characters and forbids backslashes; the provenance
     // JSON carries UIDs and paths that can exceed both.
-    let comment: String = comment.chars().filter(|c| *c != '\\').take(10240).collect();
+    // LT forbids backslashes — swap rather than strip or JSON escapes and
+    // Windows paths lose their separators.
+    let comment: String = comment
+        .chars()
+        .take(10240)
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
     lt(&mut bytes, 0x0020, 0x4000, &comment)?;
     us(&mut bytes, 0x0028, 0x0002, 1)?;
     cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
