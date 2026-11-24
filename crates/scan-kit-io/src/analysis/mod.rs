@@ -1312,6 +1312,7 @@ mod tests {
                         values: vec![1.0; request.material.len()],
                     },
                     uncertainty: 0.0,
+                    histories: 0,
                     ledger: [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
                     let_d: Vec::new(),
                 })

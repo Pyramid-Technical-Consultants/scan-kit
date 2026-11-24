@@ -222,7 +222,12 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
     if palette.is_empty() {
         for panel in &mut scene.panels {
             for series in &mut panel.series {
-                if let Series::Polyline { color, .. } | Series::Points { color, .. } = series {
+                if let Series::Polyline { color, .. }
+                | Series::Points { color, .. }
+                | Series::Bars { color, .. }
+                | Series::Rects { color, .. }
+                | Series::Triangles { color, .. } = series
+                {
                     if color[3] == 0.0 {
                         color[3] = 1.0;
                     }
@@ -286,7 +291,10 @@ pub(crate) fn finish_patient_report(
     let Some(result) = &run.ran else {
         return Err("the Monte Carlo transport did not run".into());
     };
-    let provenance = scan_kit_io::patient_view::provenance(inputs, result, session_ids, gpu);
+    let mut provenance = scan_kit_io::patient_view::provenance(inputs, result, session_ids, gpu);
+    // A missing/short let_d falls back to physical dose — the artifact must
+    // say so, not claim the RBE model the run never applied.
+    provenance["rbe_effective"] = json!(run.effective);
     let metrics = scan_kit_io::patient_view::metrics(inputs, run, options);
     let title = format!("Patient QA — {}", inputs.study.plan_label);
     let rbe = scan_kit_io::patient_view::rbe_label(inputs.rbe_key);
@@ -294,13 +302,14 @@ pub(crate) fn finish_patient_report(
         &title,
         &metrics,
         rbe,
+        run.effective,
         dvh_figure(&metrics)?,
         provenance,
     );
     let dest = Path::new(dest);
     // Build the CSV before writing the PDF - a DVH error must not leave a
     // fresh PDF beside the report the task calls failed.
-    let csv = scan_kit_io::report::dvh_csv(&curves)?;
+    let csv = scan_kit_io::report::dvh_csv(&curves, run.effective)?;
     let pdf = scan_kit_io::report::write_pdf(&report, dest)?;
     let csv_path = dest.with_file_name(format!(
         "{}_dvh.csv",
@@ -331,7 +340,14 @@ pub(crate) fn finish_patient_report(
     } else {
         // A curve-less export must not leave a stale sidecar pairing with
         // the new PDF - the pair reads as one artifact.
-        let _ = std::fs::remove_file(&csv_path);
+        if let Err(err) = std::fs::remove_file(&csv_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "could not remove a stale {} ({err}) beside the new report",
+                    csv_path.display()
+                ));
+            }
+        }
     }
     Ok(out)
 }
@@ -431,8 +447,8 @@ fn dim(input: &Value, key: &str, fallback: u32) -> Result<u32, String> {
             )
             .map_err(|_| format!("{key} is out of range"))?;
             // The same bound Plot::apply clamps to — a huge dim would ask the
-            // renderer for an oversized frame buffer.
-            if dim > 8192 {
+            // renderer for an oversized frame buffer; 0 yields an empty view.
+            if dim == 0 || dim > 8192 {
                 return Err(format!("{key} is out of range"));
             }
             Ok(dim)
@@ -458,8 +474,13 @@ fn color4(value: Option<&Value>, key: &str, fallback: [f32; 4]) -> Result<[f32; 
     let items = value
         .as_array()
         .ok_or_else(|| format!("{key} must be an array"))?;
+    // A short array must not blend user channels with the fallback —
+    // [0.5] would silently produce [0.5, 0.11, 0.12, 1.0].
+    if items.len() != 4 {
+        return Err(format!("{key} must have 4 channels"));
+    }
     let mut out = fallback;
-    for (index, item) in items.iter().take(4).enumerate() {
+    for (index, item) in items.iter().enumerate() {
         // Every sibling arg parser errors on a mistyped element — a bad
         // channel must not silently keep the fallback color.
         out[index] = item
@@ -527,6 +548,7 @@ mod tests {
         // conflated with it.
         let metrics = scan_kit_io::patient_view::PatientMetrics {
             matches: Vec::new(),
+            dropped: Vec::new(),
             structures: Vec::new(),
             gamma: None,
         };

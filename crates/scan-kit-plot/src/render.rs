@@ -5627,10 +5627,17 @@ fn write_polyline(
         }
         let point = [*x, *y];
         if let Some(start) = previous {
+            // fill_solid NaN's a duplicated segment — the sparse path must
+            // too or it would paint a dot and pick the invisible mark.
+            let a = if start == point {
+                [f32::NAN, f32::NAN, 0.0]
+            } else {
+                [start[0], start[1], 0.0]
+            };
             push_line_word(
                 out,
                 &LineRec {
-                    a: [start[0], start[1], 0.0],
+                    a,
                     b: [point[0], point[1], 0.0],
                     color,
                     thickness: thick,
@@ -5728,11 +5735,14 @@ fn push_polyline(
             continue;
         }
         let point = [*x, *y, 0.0];
-        // A duplicated vertex carries no direction — the GPU pass draws
-        // nothing for it while the CPU path would invent a dot.
-        if let Some(start) = prev.filter(|start| *start != point) {
+        // A duplicated vertex still takes a record — write_strokes emits
+        // one per consecutive finite pair, and header.lines counting fewer
+        // than the byte section writes would misalign every section after.
+        if let Some(start) = prev {
+            // NaN'd like fill_solid: invisible and unpickable either way.
+            let a = if start == point { [f32::NAN; 3] } else { start };
             lines.push(LineRec {
-                a: start,
+                a,
                 b: point,
                 color,
                 thickness: thickness.max(1.0),

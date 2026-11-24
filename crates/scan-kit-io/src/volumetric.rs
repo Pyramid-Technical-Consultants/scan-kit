@@ -2208,6 +2208,7 @@ mod tests {
                         values: vec![1.0; request.shape.iter().product()],
                     },
                     uncertainty: 0.01,
+                    histories: 0,
                     ledger: [0.0; 6],
                     let_d: Vec::new(),
                 })
@@ -2520,6 +2521,7 @@ mod tests {
                         values: vec![7.0; n],
                     },
                     uncertainty: 0.0,
+                    histories: 0,
                     ledger: [0.0; 6],
                     let_d: Vec::new(),
                 })

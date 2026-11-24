@@ -26,6 +26,9 @@ pub struct PatientInputs {
     pub segment: &'static str,
     pub fraction: String,
     pub deliveries: Vec<Delivery>,
+    /// Session ids that produced no usable delivery — disclosed so the
+    /// report can name them instead of silently renumbering.
+    pub dropped: Vec<String>,
     pub groups: Vec<Vec<usize>>,
     pub names: Vec<String>,
     pub beam_filter: Option<usize>,
@@ -80,7 +83,7 @@ pub fn patient_inputs(
     )
     .parse::<u32>()
     .unwrap_or(10_000_000);
-    let deliveries = deliveries(root, session_ids, &study);
+    let (deliveries, dropped) = deliveries(root, session_ids, &study);
     let groups = group_fractions(
         &deliveries
             .iter()
@@ -198,6 +201,7 @@ pub fn patient_inputs(
         segment,
         fraction,
         deliveries,
+        dropped,
         groups,
         names,
         beam_filter,
@@ -397,10 +401,11 @@ pub fn provenance(
             "name": super::beam::bdl_name(inputs.bdl),
             "digest": digest16(super::beam::bdl_text(inputs.bdl).as_bytes()),
         },
-        "histories": inputs.histories,
+        "histories": result.histories,
         "seed": SEED,
         "uncertainty": result.uncertainty,
         "deliveries": sessions,
+        "deliveries_dropped": inputs.dropped,
         "segment": inputs.segment,
         "fraction": inputs.fraction,
         "beams": inputs.beam_filter.map(|index| (index + 1).to_string()),
@@ -436,6 +441,8 @@ pub fn rbe_label(key: &str) -> &'static str {
 pub struct PatientMetrics {
     /// Delivery index and its match for the chosen fraction's group.
     pub matches: Vec<(usize, DeliveryMatch)>,
+    /// Sessions that produced no usable delivery.
+    pub dropped: Vec<String>,
     pub structures: Vec<StructureMetric>,
     pub gamma: Option<GammaMetric>,
 }
@@ -485,6 +492,7 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             }
         }
     }
+    let dropped = inputs.dropped.clone();
     let goals_text = goal_text(options, study);
     let voxel_cc = study.ct.spacing.iter().product::<f32>() / 1000.0;
     let let_d = run
@@ -695,6 +703,7 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
     });
     PatientMetrics {
         matches,
+        dropped,
         structures,
         gamma,
     }
@@ -1079,10 +1088,17 @@ fn energy_layers(beam: &scan_kit_dicom::Beam) -> Vec<(f32, Vec<usize>)> {
     layers
 }
 
-fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Delivery> {
-    sessions
-        .iter()
-        .filter_map(|session| {
+fn deliveries(
+    root: &Path,
+    sessions: &[String],
+    study: &PatientStudy,
+) -> (Vec<Delivery>, Vec<String>) {
+    let mut out = Vec::new();
+    // Sessions that can't match the plan still get disclosed — the report's
+    // fraction numbering and provenance must agree about who was measured.
+    let mut dropped = Vec::new();
+    for session in sessions {
+        let delivery = (|| {
             let table = spot_table(root, session);
             let energy = table.get("energy").cloned().unwrap_or_default();
             if energy.is_empty() {
@@ -1111,8 +1127,13 @@ fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Del
                 matched.position_rms = f32::NAN;
             }
             Some(Delivery { matched })
-        })
-        .collect()
+        })();
+        match delivery {
+            Some(delivery) => out.push(delivery),
+            None => dropped.push(session.clone()),
+        }
+    }
+    (out, dropped)
 }
 
 /// The beam whose layers explain the most delivered spots (then the closest

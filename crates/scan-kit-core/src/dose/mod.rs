@@ -225,6 +225,10 @@ pub enum McJob {
 pub struct McResult {
     pub volume: Volume,
     pub uncertainty: f32,
+    /// Histories this run actually transported — a kept-and-reused cube can
+    /// carry more than the requesting job, and provenance must report the
+    /// real count.
+    pub histories: u32,
     pub ledger: [f32; 6],
     pub let_d: Vec<f32>,
 }

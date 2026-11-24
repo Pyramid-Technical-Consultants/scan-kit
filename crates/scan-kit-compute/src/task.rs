@@ -1602,6 +1602,8 @@ fn blank_result(job: &McJob) -> McResult {
             values,
         },
         uncertainty: 0.0,
+        // The placeholder never transported — 0 is the honest count.
+        histories: 0,
         ledger: [0.0; 6],
         let_d: Vec::new(),
     }
@@ -1926,7 +1928,6 @@ struct ExportStage {
     job: Option<McJob>,
     inputs: Option<Box<scan_kit_io::patient_view::PatientInputs>>,
     run: Option<McRun>,
-    cancel: Cancel,
 }
 
 impl ExportStage {
@@ -1957,7 +1958,6 @@ impl ExportStage {
             job: None,
             inputs: None,
             run: None,
-            cancel: Cancel::new(),
         }
     }
 
@@ -1969,11 +1969,11 @@ impl ExportStage {
 
     /// The transport finished: weight the dose, write the file, and keep the
     /// cube so a following view or export opens instantly.
-    fn finish(&mut self, result: McResult) -> Poll<Vec<u8>> {
+    fn finish(&mut self, result: McResult, cancel: &Cancel) -> Poll<Vec<u8>> {
         let Some(inputs) = self.inputs.as_ref() else {
             return self.fail("the export has no patient inputs".into());
         };
-        if self.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
@@ -1988,7 +1988,7 @@ impl ExportStage {
         let gpu = crate::mc::adapter_info();
         // A cancel landing while the dose was prepared must still win over
         // the destination write.
-        if self.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
@@ -2026,10 +2026,6 @@ impl Stage for ExportStage {
         self.report.clone()
     }
 
-    fn bind_cancel(&mut self, cancel: Cancel) {
-        self.cancel = cancel;
-    }
-
     fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
         if cancel.is_cancelled() {
             self.report.phase = Phase::Cancelled;
@@ -2061,7 +2057,7 @@ impl Stage for ExportStage {
             if let Some(mut results) = kept_results(std::slice::from_ref(&job)) {
                 self.report.total = u64::from(inputs.histories);
                 self.job = Some(job);
-                return self.finish(results.swap_remove(0));
+                return self.finish(results.swap_remove(0), cancel);
             }
             self.job = Some(job.clone());
             self.run = match McRun::open(&job) {
@@ -2085,7 +2081,7 @@ impl Stage for ExportStage {
                     self.report.phase = Phase::Cancelled;
                     return Poll::Cancelled;
                 }
-                self.finish(result)
+                self.finish(result, cancel)
             }
             Poll::Cancelled => {
                 self.report.phase = Phase::Cancelled;

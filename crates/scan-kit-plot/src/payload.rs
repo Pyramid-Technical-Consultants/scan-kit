@@ -869,6 +869,70 @@ mod tests {
     }
 
     #[test]
+    fn a_guide_with_duplicate_vertices_round_trips_aligned() {
+        // The marks writer used to drop consecutive duplicates while the
+        // byte writer emitted them — header.lines under-counted and every
+        // section after the lines decoded at the wrong offset.
+        let scene = PlotScene {
+            title: "dup".into(),
+            panels: vec![Panel {
+                title: "a".into(),
+                y_label: String::new(),
+                x_label: String::new(),
+                xmin: 0.0,
+                xmax: 4.0,
+                ymin: 0.0,
+                ymax: 4.0,
+                series: vec![
+                    Series::Guide {
+                        xs: vec![0.0, 0.0, 1.0],
+                        ys: vec![0.0, 0.0, 1.0],
+                        color: [0.5, 0.5, 0.5, 1.0],
+                        thickness: 1.0,
+                    },
+                    Series::Points {
+                        xs: vec![1.0],
+                        ys: vec![2.0],
+                        color: [0.0, 1.0, 0.0, 1.0],
+                        radius: 3.0,
+                        times: Vec::new(),
+                    },
+                ],
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: vec![1.0],
+            row_weights: vec![1.0],
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
+        };
+        let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
+        let (header, marks, _, _, _) = decode_plot(&bytes).unwrap();
+        let built = build_marks(&scene.panels);
+        // NaN break records never `==`, so compare counts and placement.
+        assert_eq!(marks.lines.len(), built.lines.len());
+        assert_eq!(header.lines as usize, marks.lines.len());
+        assert_eq!(
+            marks
+                .lines
+                .iter()
+                .map(|l| l.a[0].is_nan())
+                .collect::<Vec<_>>(),
+            built
+                .lines
+                .iter()
+                .map(|l| l.a[0].is_nan())
+                .collect::<Vec<_>>()
+        );
+        assert!(marks.lines.iter().any(|l| l.a[0].is_nan()));
+        assert_eq!(marks.points, built.points);
+    }
+
+    #[test]
     fn a_payload_with_an_out_of_range_batch_is_rejected() {
         let scene = PlotScene {
             title: "t".into(),

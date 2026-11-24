@@ -613,6 +613,7 @@ fn empty_result(launch: &Launch) -> McResult {
             values: vec![0.0; nvox],
         },
         uncertainty: 0.0,
+        histories: 0,
         ledger: [0.0; 6],
         let_d: Vec::new(),
     }
@@ -735,10 +736,14 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     // Storage buffers bind under min(binding, max_buffer_size) — an adapter
     // may report either one smaller, and the LET buffer is nvox*16.
     let buffer_cap = binding_cap.min(limits.max_buffer_size as usize);
-    // The LET buffer binds nvox*16 but readback stages nvox*20+80 — both
-    // caps bind the run, and max_buffer_size can sit near the binding limit.
-    let staging = nvox.saturating_mul(20).saturating_add(80);
-    if nvox > buffer_cap / 16 || staging > limits.max_buffer_size as usize {
+    // With LET on, the LET buffer binds nvox*16 and readback stages
+    // nvox*20+80; off, the largest binding is tally at nvox*8 and staging is
+    // nvox*4+80. Both caps bind the run, and max_buffer_size can sit near
+    // the binding limit.
+    let score_let = launch.flags & 2 != 0;
+    let (bind_mul, stage_mul) = if score_let { (16, 20) } else { (8, 4) };
+    let staging = nvox.saturating_mul(stage_mul).saturating_add(80);
+    if nvox > buffer_cap / bind_mul || staging > limits.max_buffer_size as usize {
         return Err(ComputeError::Message(format!(
             "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
         )));
@@ -771,17 +776,16 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         * f64::from(launch.spacing_cm[2]);
     let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
 
-    let spots = storage_init(&device, &f32_bytes(&launch.spots));
-    let floats = storage_init(&device, &f32_bytes(&tables.floats));
-    let ints = storage_init(&device, &i32_bytes(&tables.ints));
+    let spots = storage_init(&device, &f32_bytes(&launch.spots))?;
+    let floats = storage_init(&device, &f32_bytes(&tables.floats))?;
+    let ints = storage_init(&device, &i32_bytes(&tables.ints))?;
     let tally = storage_zero(&device, (nvox * 8) as u64);
     let ledger = storage_zero(&device, 64);
     let params = uniform_buf(&device, 80);
-    let material = storage_init(&device, &u32_bytes(&launch.material));
-    let density = storage_init(&device, &f32_bytes(&launch.density));
-    let score_let = launch.flags & 2 != 0;
+    let material = storage_init(&device, &u32_bytes(&launch.material))?;
+    let density = storage_init(&device, &f32_bytes(&launch.density))?;
     let let_buf = storage_zero(&device, if score_let { (nvox * 16) as u64 } else { 4 });
-    let beams = storage_init(&device, &f32_bytes(&launch.beams));
+    let beams = storage_init(&device, &f32_bytes(&launch.beams))?;
     let sum = storage_zero(&device, (nvox * 4) as u64);
     let sq = storage_zero(&device, (nvox * 4) as u64);
     let out = storage_zero(&device, (nvox * 4) as u64);
@@ -1285,6 +1289,7 @@ impl Live {
                 spacing: self.spacing,
                 values: dose,
             },
+            histories: ticket.histories,
             uncertainty: if rel_count == 0 {
                 0.0
             } else {
@@ -1465,7 +1470,7 @@ fn pipeline(
     })
 }
 
-fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
+fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> Result<wgpu::Buffer, ComputeError> {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: bytes.len().max(4) as u64,
@@ -1475,14 +1480,13 @@ fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("storage buffer mapped at creation");
+        let mut mapped = buffer.slice(..).get_mapped_range_mut().map_err(|_| {
+            ComputeError::Message("the GPU device was lost mapping a buffer".into())
+        })?;
         mapped.slice(..bytes.len()).copy_from_slice(bytes);
     }
     buffer.unmap();
-    buffer
+    Ok(buffer)
 }
 
 fn storage_zero(device: &wgpu::Device, size: u64) -> wgpu::Buffer {

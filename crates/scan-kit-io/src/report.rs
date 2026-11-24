@@ -95,7 +95,7 @@ pub fn sig6(value: f64) -> String {
 }
 
 /// `name_dvh.csv`: dose in Gy(RBE), one volume-% column per structure.
-pub fn dvh_csv(curves: &[DvhCurve]) -> Result<String, String> {
+pub fn dvh_csv(curves: &[DvhCurve], effective: bool) -> Result<String, String> {
     let Some(first) = curves.first() else {
         return Ok(String::new());
     };
@@ -109,7 +109,7 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> Result<String, String> {
     }
     // Row i is indexed positionally against first.edges; shorter curves fill
     // the remaining cells empty rather than fabricating zeros.
-    let mut out = String::from("dose_gy_rbe");
+    let mut out = String::from(if effective { "dose_gy_rbe" } else { "dose_gy" });
     for curve in curves {
         out.push(',');
         // A stray quote would open a quoted field on re-parse and swallow the
@@ -355,10 +355,10 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
                 width,
                 height,
             } => {
-                if *width == 0
-                    || *height == 0
-                    || rgba.len() != *width as usize * *height as usize * 4
-                {
+                let expected = (*width as usize)
+                    .checked_mul(*height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4));
+                if *width == 0 || *height == 0 || expected != Some(rgba.len()) {
                     return Err("a report figure has invalid dimensions".into());
                 }
                 let scale = TEXT_W / *width as f32;
@@ -512,6 +512,7 @@ pub fn patient_report(
     title: &str,
     metrics: &crate::patient_view::PatientMetrics,
     rbe_label: &str,
+    effective: bool,
     figure: Option<Figure>,
     provenance: Value,
 ) -> (Report, Vec<DvhCurve>) {
@@ -525,6 +526,12 @@ pub fn patient_report(
         if !figure.caption.is_empty() {
             sections.push(Section::Paragraph(figure.caption));
         }
+    }
+    if !metrics.dropped.is_empty() {
+        sections.push(Section::Paragraph(format!(
+            "Sessions with no usable plan match — excluded from the metrics: {}",
+            metrics.dropped.join(", ")
+        )));
     }
     if !metrics.matches.is_empty() {
         sections.push(Section::Heading("Delivery".into()));
@@ -572,13 +579,18 @@ pub fn patient_report(
     }
     if let Some(gamma) = &metrics.gamma {
         sections.push(Section::Heading("Gamma vs TPS".into()));
+        let outcome = if gamma.rate.is_finite() {
+            format!("{:.2} % of {} voxels pass", gamma.rate, gamma.scored)
+        } else {
+            // scored == 0 — the comparison never ran; "0% fail" would be a
+            // verdict on an unevaluated dose pair.
+            "no voxels scored above the cutoff".to_owned()
+        };
         sections.push(Section::Paragraph(format!(
-            "{} % / {} mm, {} % cutoff: {:.2} % of {} voxels pass",
+            "{} % / {} mm, {} % cutoff: {outcome}",
             sig6(f64::from(gamma.dose_pct)),
             sig6(f64::from(gamma.dta_mm)),
             sig6(f64::from(gamma.cutoff_pct)),
-            gamma.rate,
-            gamma.scored,
         )));
     }
     let goal_rows: Vec<Vec<String>> = metrics
@@ -586,14 +598,20 @@ pub fn patient_report(
         .iter()
         .flat_map(|structure| {
             structure.goals.iter().map(|(goal, check)| {
-                let text = format!(
-                    "{}: {} {} {} {}",
-                    goal.roi,
-                    goal.metric_text,
-                    goal.op,
-                    sig6(f64::from(goal.value)),
-                    goal.unit
-                );
+                let text = if goal.value.is_finite() {
+                    format!(
+                        "{}: {} {} {} {}",
+                        goal.roi,
+                        goal.metric_text,
+                        goal.op,
+                        sig6(f64::from(goal.value)),
+                        goal.unit
+                    )
+                } else {
+                    // A goal the grammar rejected carries NaN — render the
+                    // raw line, not a leaked "NaN" literal.
+                    format!("{}: {}", goal.roi, goal.metric_text)
+                };
                 match check {
                     Ok((measured, pass)) => vec![
                         text,
@@ -625,9 +643,11 @@ pub fn patient_report(
         })
         .collect();
     if !curves.is_empty() {
-        sections.push(Section::Heading(format!(
-            "Dose statistics (Gy(RBE), {rbe_label})"
-        )));
+        sections.push(Section::Heading(if effective {
+            format!("Dose statistics (Gy(RBE), {rbe_label})")
+        } else {
+            "Dose statistics (Gy, physical — LET scoring unavailable)".to_owned()
+        }));
         sections.push(dose_stats(
             &metrics
                 .structures
@@ -752,18 +772,21 @@ mod tests {
         let bytes = std::fs::read(&out).unwrap();
         assert!(bytes.starts_with(b"%PDF"));
         assert!(bytes.len() > 2000);
-        let csv = dvh_csv(&[
-            DvhCurve {
-                name: "PTV".into(),
-                edges: vec![0.0, 1.0, 2.0],
-                cumulative: vec![1.0, 0.5, 0.0],
-            },
-            DvhCurve {
-                name: "a, b".into(),
-                edges: vec![0.0, 1.0, 2.0],
-                cumulative: vec![1.0, 1.0, 0.25],
-            },
-        ])
+        let csv = dvh_csv(
+            &[
+                DvhCurve {
+                    name: "PTV".into(),
+                    edges: vec![0.0, 1.0, 2.0],
+                    cumulative: vec![1.0, 0.5, 0.0],
+                },
+                DvhCurve {
+                    name: "a, b".into(),
+                    edges: vec![0.0, 1.0, 2.0],
+                    cumulative: vec![1.0, 1.0, 0.25],
+                },
+            ],
+            true,
+        )
         .unwrap();
         assert!(csv.starts_with("dose_gy_rbe,PTV volume %,a  b volume %"));
         assert!(csv.contains("\n2,0,25\n"));
@@ -777,6 +800,7 @@ mod tests {
         let goal = crate::patient_view::Goal::parse("PTV: Dmean >= 1.9 Gy").unwrap();
         let metrics = crate::patient_view::PatientMetrics {
             matches: Vec::new(),
+            dropped: Vec::new(),
             structures: vec![crate::patient_view::StructureMetric {
                 id: 0,
                 name: "PTV".into(),
@@ -804,6 +828,7 @@ mod tests {
             "Patient QA",
             &metrics,
             "McNamara 2015",
+            true,
             None,
             serde_json::json!({"histories": 1000}),
         );
@@ -865,7 +890,7 @@ mod tests {
             edges: vec![0.0],
             cumulative: vec![100.0],
         }];
-        let csv = dvh_csv(&curves).unwrap();
+        let csv = dvh_csv(&curves, true).unwrap();
         // An interior newline would add a bogus column row.
         assert_eq!(csv.lines().count(), 2, "{csv}");
         assert!(csv.starts_with("dose_gy_rbe,PTV Cord volume %"));
@@ -896,7 +921,7 @@ mod tests {
                 cumulative: vec![1.0],
             },
         ];
-        let csv = dvh_csv(&curves).unwrap();
+        let csv = dvh_csv(&curves, true).unwrap();
         // Rows past the short curve's bins stay empty — a fabricated "0"
         // would report the structure as fully missed at every dose.
         assert!(
@@ -924,7 +949,7 @@ mod tests {
             edges: vec![0.0, 1.0],
             cumulative: vec![100.0, 50.0],
         }];
-        let csv = dvh_csv(&curves).unwrap();
+        let csv = dvh_csv(&curves, true).unwrap();
         // A stray quote would open a quoted field on re-parse and swallow the
         // rest of the header line.
         assert_eq!(csv.lines().next().unwrap().split(',').count(), 2, "{csv}");
