@@ -505,6 +505,9 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["action"],
             "additionalProperties": false
         }),
+        // session_storage_paths/trash_session are dispatched but not in
+        // TOOLS — desktop-only via forward!, so the restrictive fallback
+        // schema (which forbids their required args) never validates them.
         _ => json!({ "type": "object", "additionalProperties": false }),
     }
 }
@@ -684,9 +687,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_config_open" => {
             let db = database_path(input)?;
-            let path = input.get("path").and_then(Value::as_str);
-            let data_dir = input.get("data_dir").and_then(Value::as_str);
-            let session_id = input.get("session_id").and_then(Value::as_str);
+            let path = optional_str(input, "path")?;
+            let data_dir = optional_str(input, "data_dir")?;
+            let session_id = optional_str(input, "session_id")?;
             config::open_folder(&db, path, data_dir, session_id).map_err(InvokeError::Message)
         }
         "scan_kit_config_form" => {
@@ -706,7 +709,13 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                 .get("files")
                 .cloned()
                 .ok_or_else(|| InvokeError::Message("files is required".into()))?;
-            let hide = input.get("hide_unused").and_then(Value::as_bool);
+            let hide =
+                match input.get("hide_unused") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(value.as_bool().ok_or_else(|| {
+                        InvokeError::Message("hide_unused must be a bool".into())
+                    })?),
+                };
             config::save_folder(&db, Path::new(source), Path::new(dest), &files, hide)
                 .map_err(InvokeError::Message)
         }
@@ -732,13 +741,13 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             Ok(phantom::catalog(&db))
         }
         "scan_kit_phantom_preview" => {
-            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+            let params = object_arg(input, "params")?;
             phantom::preview(&params).map_err(InvokeError::Message)
         }
         "scan_kit_write_phantom" => {
             let db = database_path(input)?;
             let parent = required_str(input, "parent")?;
-            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+            let params = object_arg(input, "params")?;
             phantom::write(Path::new(parent), &params, &db).map_err(InvokeError::Message)
         }
         "scan_kit_runner_catalog" => {
@@ -809,7 +818,11 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
                     .map_err(|err| err.to_string())?;
                 let result = (|| {
                     let mut list = store::scanners(conn)?;
-                    if !list.iter().any(|(_, existing)| existing == folder) {
+                    let key = folder.trim_end_matches(['/', '\\']);
+                    if !list
+                        .iter()
+                        .any(|(_, existing)| existing.trim_end_matches(['/', '\\']) == key)
+                    {
                         list.push((calibration.name.clone(), folder.to_owned()));
                         store::set_scanners(conn, &list)?;
                     }
@@ -860,9 +873,11 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
     let mut entries = Vec::new();
     for (label, folder) in stored {
         // Digest reads files — outside the lock.
+        // An unresolvable folder must not masquerade as a real digest —
+        // the empty string is indistinguishable from one downstream.
         let digest = calibration::CtCalibration::resolve(&folder)
-            .map(|calibration| calibration.digest())
-            .unwrap_or_default();
+            .map(|calibration| Value::String(calibration.digest()))
+            .unwrap_or(Value::Null);
         entries.push(json!({ "label": label, "folder": folder, "digest": digest }));
     }
     Ok(json!({ "scanners": entries }))
@@ -1248,6 +1263,28 @@ fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, InvokeError>
         Some(value) => value
             .as_str()
             .ok_or_else(|| InvokeError::Message(format!("{key} must be a string"))),
+    }
+}
+
+/// A present-but-non-string optional arg is a caller error, not "absent" —
+/// as_str() tolerance would silently fall back to defaults elsewhere.
+fn optional_str<'a>(input: &'a Value, key: &str) -> Result<Option<&'a str>, InvokeError> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| InvokeError::Message(format!("{key} must be a string"))),
+    }
+}
+
+/// params/options objects: absent or null defaults, anything else must be
+/// an object or the parse defaults a real write silently.
+fn object_arg(input: &Value, key: &str) -> Result<Value, InvokeError> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(json!({})),
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(_) => Err(InvokeError::Message(format!("{key} must be an object"))),
     }
 }
 
