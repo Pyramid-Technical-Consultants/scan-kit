@@ -2914,16 +2914,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("options"), "{error}");
-        assert!(start_task(
+        let started = start_task(
             "distribution",
             &root,
             &[],
             &json!(null),
             [0.0; 4],
             [0.0; 4],
-            &[]
+            &[],
         )
-        .is_ok());
+        .unwrap();
+        // A plot view claims the plot slot — release it or the next test
+        // sees a parked task.
+        cancel_task(started["task"].as_u64().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

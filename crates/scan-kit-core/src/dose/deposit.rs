@@ -353,9 +353,14 @@ pub fn analytic_on(
         } else {
             [0, 0, 0]
         };
-        // Same NaN rule as dose_grid: clamp() passes NaN through.
+        // Same NaN rule as dose_grid: clamp() passes NaN through, and an
+        // unrepresentable origin maps every query through index 0.
         (
-            origin,
+            if origin.iter().all(|v| v.is_finite()) {
+                origin
+            } else {
+                [0.0; 3]
+            },
             shape,
             if voxel.is_finite() {
                 voxel.clamp(0.25, 10.0)
@@ -778,7 +783,7 @@ fn write_group_rows(
         if let Some(slot) = fz.as_deref_mut() {
             slot[index] = mass;
         }
-        if mass == 0.0 {
+        if mass <= 0.0 {
             continue;
         }
         fill_normal(
@@ -852,7 +857,7 @@ fn paint_band(
                 continue;
             }
             let fz = x_fz[column.x_group];
-            if fz == 0.0 || column.ix0 >= column.ix1 {
+            if fz <= 0.0 || column.ix0 >= column.ix1 {
                 continue;
             }
             let acc = &mut col_y[c * ny..(c + 1) * ny];
@@ -1369,7 +1374,7 @@ pub(super) fn paint_planes(
             }
             let z_lo = origin[2] + iz as f32 * voxel;
             let (mass, sx, sy) = depth_lateral(kernel, spot, z_lo, voxel, dose_mode);
-            if mass == 0.0 {
+            if mass <= 0.0 {
                 continue;
             }
             if on_z || hit_y {

@@ -462,7 +462,7 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             .zip(request.shape.iter())
             .any(|(mm, n)| {
                 let extent = f64::from(*mm) * (*n as f64);
-                extent.is_nan() || extent > 1e5
+                *mm <= 0.0 || extent.is_nan() || extent > 1e5
             })
     {
         return Err(ComputeError::Message(
