@@ -1499,9 +1499,14 @@ impl Stage for McPlotStage {
         }
         if budget >= DRAIN {
             self.shutdown();
-            // worker_cancel is bound to `cancel`; drain with a fresh token or a
-            // bound stage reports Cancelled instead of draining.
-            return self.drain(&Cancel::new());
+            // A bound stage shares `cancel` with worker_cancel — shutdown just
+            // set it, so hand the drain a fresh token. drain_plot/drain_task
+            // stages are unbound, so the caller's flag still reaches Live and
+            // invoke_flag's "cancelled MCP request stops the drain" holds.
+            if cancel.is_cancelled() {
+                return self.drain(&Cancel::new());
+            }
+            return self.drain(cancel);
         }
         self.follow()
     }

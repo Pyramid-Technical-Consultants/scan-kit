@@ -266,6 +266,7 @@ fn produce_signals(root: &Path, session: &str) -> Table {
     cached_timeslice(root, session, "signals", false, Family::Signals, |frames| {
         let mut out = current_from(
             &frames.sheets,
+            &frames.map,
             &frames.energies,
             &frames.layers,
             frames.prior,
@@ -276,19 +277,25 @@ fn produce_signals(root: &Path, session: &str) -> Table {
             "amplifier_error",
             "probe_field",
         ] {
-            for (key, values) in signal_from(
-                &frames.sheets,
-                &frames.energies,
-                &frames.layers,
-                metric,
-                frames.prior,
-            ) {
-                out.entry(key).or_insert(values);
-            }
+            absorb(
+                &mut out,
+                &signal_from(
+                    &frames.sheets,
+                    &frames.map,
+                    &frames.energies,
+                    &frames.layers,
+                    metric,
+                    frames.prior,
+                ),
+            );
         }
         out
     })
 }
+
+/// The beam-gate column, in every reader's order. A file carrying several
+/// of these reports the same beam state on the spot and timeslice tables.
+const GATE_NAMES: &[&str] = &["rci_in_trigger", "r_beamOk", "beam_on"];
 
 /// Which row clock a column belongs to.
 ///
@@ -450,11 +457,21 @@ fn absorb(map: &mut BTreeMap<String, Vec<f32>>, part: &BTreeMap<String, Vec<f32>
     let width = map.get("energy").map(Vec::len);
     for (key, values) in part {
         if let Some(width) = width {
-            if values.len() != width {
+            // A part that counted rows differently - a trigger-less file with
+            // geometry but no currents - pads its short tail like
+            // extend_columns instead of vanishing column by column. A part
+            // longer than the lead clock still cannot join.
+            if values.len() > width {
                 continue;
             }
+            map.entry(key.clone()).or_insert_with(|| {
+                let mut padded = values.clone();
+                padded.resize(width, f32::NAN);
+                padded
+            });
+        } else {
+            map.entry(key.clone()).or_insert_with(|| values.clone());
         }
-        map.entry(key.clone()).or_insert_with(|| values.clone());
     }
 }
 
@@ -1301,7 +1318,7 @@ fn build_spot(
         ("ic2", "x", "ic2_sig_x"),
         ("ic2", "y", "ic2_sig_y"),
     ] {
-        let Some(values) = column_suffix(&spot, ic, axis, &["spot_sigma_raw"]) else {
+        let Some((_, values)) = column_suffix(&spot, ic, axis, &["spot_sigma_raw"]) else {
             continue;
         };
         if values.len() < n {
@@ -1327,9 +1344,15 @@ fn build_spot(
         table.insert("spot_time".to_string(), ms);
         let point = ["point_time(ms)", "point_time_ms", "point_time"]
             .iter()
-            .find_map(|name| num_named(&spot, name).and_then(|key| spot.num.get(key)))
-            .filter(|values| values.len() >= n)
-            .map(|values| take_kept(values, &keep))
+            .find_map(|name| num_clock(&spot, name, "ms"))
+            .filter(|(values, _)| values.len() >= n)
+            .map(|(values, scale)| {
+                values
+                    .iter()
+                    .map(|value| value * scale)
+                    .collect::<Vec<f32>>()
+            })
+            .map(|values| take_kept(&values, &keep))
             .or_else(|| {
                 if !points {
                     return None;
@@ -1363,7 +1386,7 @@ fn build_spot(
             add_dose_rate(&mut table, &take_kept(&time, &keep));
         }
     }
-    if let Some(beam) = column_any(&spot, &["beam_on", "rci_in_trigger", "r_beamOk"]) {
+    if let Some(beam) = column_any(&spot, GATE_NAMES) {
         if beam.len() >= n {
             table.insert("beam_on".to_string(), take_kept(beam, &keep));
         }
@@ -1401,16 +1424,16 @@ fn stamp_spot_clock(table: &mut BTreeMap<String, Vec<f32>>, spot: &Sheet, n: usi
 
 fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
     // A sentinel epoch like an unset RTC's 1970-01-01 parses to a finite 0.0 —
-    // it cannot be the origin or every stamp lands ~5e10 seconds out.
-    let origin = stamps
-        .iter()
-        .copied()
-        .find(|value| value.is_finite() && *value > 0.0)?;
+    // reject it only on epoch-scale clocks. A relative clock legitimately
+    // starts at 0.0; filtering it NaNs the first delivered spot.
+    let epoch_scale = stamps.iter().copied().fold(f64::NEG_INFINITY, f64::max) > 1e9;
+    let ok = |value: f64| value.is_finite() && (!epoch_scale || value > 0.0);
+    let origin = stamps.iter().copied().find(|value| ok(*value))?;
     Some(
         stamps
             .iter()
             .map(|value| {
-                if value.is_finite() && *value > 0.0 {
+                if ok(*value) {
                     (*value - origin) as f32
                 } else {
                     f32::NAN
@@ -1421,13 +1444,25 @@ fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
 }
 
 fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
-    if let Some(time) = wide_named(spot, "timestamp").and_then(|key| spot.wide.get(key)) {
+    // Same fallback chain as wall_time so spot_time and time_s share a clock:
+    // datetime (epoch seconds) covers files that log no ms timestamp at all.
+    if let Some((time, scale)) = wide_clock(spot, "datetime", "s") {
         if time.len() >= n && time.iter().take(n).any(|value| value.is_finite()) {
-            return Some(time[..n].to_vec());
+            return Some(
+                time[..n]
+                    .iter()
+                    .map(|value| value * scale * 1000.0)
+                    .collect(),
+            );
         }
     }
-    let seconds = wide_named(spot, "time_s").and_then(|key| spot.wide.get(key))?;
-    let nanos = wide_named(spot, "time_ns").and_then(|key| spot.wide.get(key))?;
+    if let Some((time, scale)) = wide_clock(spot, "timestamp", "ms") {
+        if time.len() >= n && time.iter().take(n).any(|value| value.is_finite()) {
+            return Some(time[..n].iter().map(|value| value * scale).collect());
+        }
+    }
+    let (seconds, s_scale) = wide_clock(spot, "time_s", "s")?;
+    let (nanos, n_scale) = wide_clock(spot, "time_ns", "ns")?;
     if seconds.len() < n || nanos.len() < n {
         return None;
     }
@@ -1435,9 +1470,45 @@ fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
         .iter()
         .zip(nanos)
         .take(n)
-        .map(|(seconds, nanos)| seconds * 1000.0 + nanos / 1e6)
+        .map(|(seconds, nanos)| seconds * s_scale * 1000.0 + nanos * n_scale / 1e6)
         .collect();
     time.iter().any(|value| value.is_finite()).then_some(time)
+}
+
+/// Parenthesized unit a header carried before normalization dropped it:
+/// `timestamp(s)`. None means the header had no unit suffix.
+fn header_unit(key: &str) -> Option<&str> {
+    let inner = key.trim_end().strip_suffix(')')?;
+    inner.rfind('(').map(|index| &inner[index + 1..])
+}
+
+/// Seconds per unit for the clock units sheets write.
+fn unit_seconds(unit: &str) -> Option<f64> {
+    Some(match unit.to_ascii_lowercase().as_str() {
+        "ns" => 1e-9,
+        "us" | "µs" => 1e-6,
+        "ms" => 1e-3,
+        "s" => 1.0,
+        "min" => 60.0,
+        "h" => 3600.0,
+        _ => return None,
+    })
+}
+
+/// A wide clock column plus the factor that scales it into `unit`. A header
+/// carrying a different `(unit)` - `time_s(min)` - still resolves; one with a
+/// unit we cannot convert does not, instead of reading minutes as seconds.
+fn wide_clock<'a>(sheet: &'a Sheet, name: &str, unit: &str) -> Option<(&'a [f64], f64)> {
+    let key = wide_named(sheet, name)?;
+    let factor = unit_seconds(header_unit(key).unwrap_or(unit))? / unit_seconds(unit)?;
+    Some((sheet.wide.get(key)?.as_slice(), factor))
+}
+
+/// `wide_clock` for the f32 sheets.
+fn num_clock<'a>(sheet: &'a Sheet, name: &str, unit: &str) -> Option<(&'a [f32], f32)> {
+    let key = num_named(sheet, name)?;
+    let factor = unit_seconds(header_unit(key).unwrap_or(unit))? / unit_seconds(unit)?;
+    Some((sheet.num.get(key)?.as_slice(), factor as f32))
 }
 
 fn row_ok(value: f32) -> bool {
@@ -1542,13 +1613,16 @@ fn spot_plan<'a>(map: &'a Sheet, x: &'a [f32], y: &'a [f32]) -> Option<SpotPlan<
 /// error gate — only a plausible slope and enough pairs.
 fn plan_fit_axis(
     raw: &[f32],
+    clock: &str,
     sheet: &Sheet,
     plan: &SpotPlan<'_>,
     x_axis: bool,
     n: usize,
 ) -> Option<(f32, f32)> {
-    let spots = sheet.num.get("spot_no")?;
-    let layers = sheet.num.get("layer_id")?;
+    // The raw column's own controller block owns its clock — block 0's
+    // spot_no pairs IC2 strips with the wrong plan rows.
+    let (spots, layers) = clock_columns(sheet, Some(clock));
+    let (spots, layers) = (spots?, layers?);
     let mut strips = Vec::new();
     let mut isos = Vec::new();
     for row in 0..n.min(spots.len()).min(layers.len()) {
@@ -1730,6 +1804,9 @@ fn axis_in_mm(measured: &[f32], target: &[f32]) -> bool {
             }
         }
     }
+    // ponytail: with no plan/strip reference the channels-vs-mm call is a
+    // range guess, and positive-only mm (10..120) is indistinguishable from
+    // channels - the rack's reported frame wins ties the wrong way there.
     measured
         .iter()
         .any(|value| row_ok(*value) && (*value < 0.0 || *value > 129.0))
@@ -1788,7 +1865,7 @@ fn spot_positions<'a>(
         .into_iter()
         .enumerate()
     {
-        if let Some(values) = column_suffix(spot, ic, axis, &["spot_position", "spot"]) {
+        if let Some((_, values)) = column_suffix(spot, ic, axis, &["spot_position", "spot"]) {
             if values.len() < n {
                 continue;
             }
@@ -1801,7 +1878,7 @@ fn spot_positions<'a>(
         }
         // Raw-only sessions have strips, not millimetres: fit them against the
         // plan so the iso-frame quantities still resolve.
-        let Some(raw) = column_suffix(spot, ic, axis, &["spot_position_raw"]) else {
+        let Some((raw_name, raw)) = column_suffix(spot, ic, axis, &["spot_position_raw"]) else {
             continue;
         };
         if raw.len() < n {
@@ -1809,7 +1886,7 @@ fn spot_positions<'a>(
         }
         mask.push(&raw[..n]);
         if let Some((slope, intercept)) =
-            plan.and_then(|plan| plan_fit_axis(raw, spot, plan, axis == "x", n))
+            plan.and_then(|plan| plan_fit_axis(raw, raw_name, spot, plan, axis == "x", n))
         {
             mm[index] = Some(Measured::Owned(
                 raw[..n]
@@ -1872,7 +1949,7 @@ fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, &[
         ("ic2", "x", "ic2_sig_x"),
         ("ic2", "y", "ic2_sig_y"),
     ] {
-        let Some(values) = column_suffix(spot, ic, axis, order) else {
+        let Some((_, values)) = column_suffix(spot, ic, axis, order) else {
             continue;
         };
         if values.len() >= n {
@@ -1885,7 +1962,7 @@ fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, &[
 fn four_slices<'a>(spot: &'a Sheet, suffix: &str, n: usize) -> Option<[&'a [f32]; 4]> {
     let mut out = Vec::new();
     for (ic, axis) in [("ic1", "x"), ("ic1", "y"), ("ic2", "x"), ("ic2", "y")] {
-        let values = column_suffix(spot, ic, axis, &[suffix])?;
+        let (_, values) = column_suffix(spot, ic, axis, &[suffix])?;
         if values.len() < n {
             return None;
         }
@@ -1899,12 +1976,12 @@ fn column_suffix<'a>(
     ic: &str,
     axis: &str,
     suffixes: &[&str],
-) -> Option<&'a [f32]> {
+) -> Option<(&'a str, &'a [f32])> {
     for suffix in suffixes {
         let with_r = format!("r_{ic}_{axis}_{suffix}");
         let plain = format!("{ic}_{axis}_{suffix}");
         if let Some(name) = num_named(spot, &with_r).or_else(|| num_named(spot, &plain)) {
-            return spot.num.get(name).map(Vec::as_slice);
+            return spot.num.get(name).map(|values| (name, values.as_slice()));
         }
     }
     None
@@ -2060,15 +2137,15 @@ fn insert_point_times(found: &mut HashMap<(u32, u32), f32>, sheet: &Sheet) {
     let Some(layers) = column_any(sheet, &["layer_id"]) else {
         return;
     };
-    let Some(point) = ["point_time(ms)", "point_time_ms", "point_time"]
+    let Some((point, scale)) = ["point_time(ms)", "point_time_ms", "point_time"]
         .iter()
-        .find_map(|name| sheet.num.get(*name))
+        .find_map(|name| num_clock(sheet, name, "ms"))
     else {
         return;
     };
     for ((spot, layer), point) in spots.iter().zip(layers).zip(point) {
         if spot.is_finite() && layer.is_finite() && point.is_finite() {
-            found.insert((spot.to_bits(), layer.to_bits()), *point);
+            found.insert((spot.to_bits(), layer.to_bits()), *point * scale);
         }
     }
 }
@@ -2186,24 +2263,30 @@ fn add_dose_rate(table: &mut BTreeMap<String, Vec<f32>>, time: &[f64]) {
 }
 
 fn wall_time(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
-    if let Some(stamp) = wide_named(spot, "datetime").and_then(|key| spot.wide.get(key)) {
+    if let Some((stamp, scale)) = wide_clock(spot, "datetime", "s") {
         if stamp.iter().take(n).any(|value| value.is_finite()) {
-            return Some(stamp.iter().take(n).copied().collect());
+            return Some(stamp.iter().take(n).map(|value| value * scale).collect());
         }
     }
-    if let (Some(seconds), Some(nanos)) = (
-        wide_named(spot, "time_s").and_then(|key| spot.wide.get(key)),
-        wide_named(spot, "time_ns").and_then(|key| spot.wide.get(key)),
+    if let (Some((seconds, s_scale)), Some((nanos, n_scale))) = (
+        wide_clock(spot, "time_s", "s"),
+        wide_clock(spot, "time_ns", "ns"),
     ) {
         let n = n.min(seconds.len()).min(nanos.len());
         return Some(
             (0..n)
-                .map(|index| seconds[index] + nanos[index] * 1e-9)
+                .map(|index| seconds[index] * s_scale + nanos[index] * n_scale)
                 .collect(),
         );
     }
-    let stamp = wide_named(spot, "timestamp").and_then(|key| spot.wide.get(key))?;
-    Some(stamp.iter().take(n).map(|value| value / 1000.0).collect())
+    let (stamp, scale) = wide_clock(spot, "timestamp", "ms")?;
+    Some(
+        stamp
+            .iter()
+            .take(n)
+            .map(|value| value * scale / 1000.0)
+            .collect(),
+    )
 }
 
 pub(crate) fn load_slice_metric(root: &Path, session: &str, _metric: &str, chamber: bool) -> Table {
@@ -2328,6 +2411,8 @@ fn build_slice_metric(
                 continue;
             };
             let tagged = frame_energy(
+                sheet,
+                &frames.map,
                 &frames.energies,
                 frames.layers.get(file_index).copied().unwrap_or(-1),
                 file_index,
@@ -2651,9 +2736,7 @@ fn sheet_metric(
     gains: [f32; 4],
     start: usize,
 ) -> Option<SheetMetric> {
-    let trigger = num_col(sheet, "rci_in_trigger")
-        .or_else(|| num_col(sheet, "r_beamOk"))
-        .or_else(|| num_col(sheet, "beam_on"));
+    let trigger = column_any(sheet, GATE_NAMES);
     // Trigger-less files still emit geometry - align on the longest column
     // like sample_len rather than dropping the metric entirely.
     let n = trigger.map_or_else(
@@ -2968,10 +3051,10 @@ fn strip_axes(spot: &Sheet) -> [Option<(f32, f32)>; 4] {
         .into_iter()
         .enumerate()
     {
-        let Some(strip) = column_suffix(spot, ic, axis, &["spot_position_raw"]) else {
+        let Some((_, strip)) = column_suffix(spot, ic, axis, &["spot_position_raw"]) else {
             continue;
         };
-        let Some(iso) = column_suffix(spot, ic, axis, &["spot_position"]) else {
+        let Some((_, iso)) = column_suffix(spot, ic, axis, &["spot_position"]) else {
             continue;
         };
         axes[index] = fit_strip_iso(strip, iso);
@@ -3091,10 +3174,10 @@ fn sigma_gain(spot: Option<&Sheet>) -> [f32; 4] {
         .into_iter()
         .enumerate()
     {
-        let Some(raw) = column_suffix(spot, ic, axis, &["spot_sigma_raw"]) else {
+        let Some((_, raw)) = column_suffix(spot, ic, axis, &["spot_sigma_raw"]) else {
             continue;
         };
-        let Some(iso) = column_suffix(spot, ic, axis, &["spot_sigma"]) else {
+        let Some((_, iso)) = column_suffix(spot, ic, axis, &["spot_sigma"]) else {
             continue;
         };
         let mut ratios = Vec::new();
@@ -3133,7 +3216,12 @@ pub(crate) fn load_timeslice(root: &Path, session: &str, metric: &str) -> Table 
                 if frames.prior.is_some() {
                     mark_full_table();
                 }
-                return current_ratio_from(&frames.sheets, &frames.energies, &frames.layers);
+                return current_ratio_from(
+                    &frames.sheets,
+                    &frames.map,
+                    &frames.energies,
+                    &frames.layers,
+                );
             }
             if matches!(
                 metric,
@@ -3141,6 +3229,7 @@ pub(crate) fn load_timeslice(root: &Path, session: &str, metric: &str) -> Table 
             ) {
                 return signal_from(
                     &frames.sheets,
+                    &frames.map,
                     &frames.energies,
                     &frames.layers,
                     metric,
@@ -3149,6 +3238,7 @@ pub(crate) fn load_timeslice(root: &Path, session: &str, metric: &str) -> Table 
             }
             current_from(
                 &frames.sheets,
+                &frames.map,
                 &frames.energies,
                 &frames.layers,
                 frames.prior,
@@ -3281,16 +3371,27 @@ fn header_columns(path: &Path) -> Vec<String> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    let mut line = String::new();
-    // A header line is short — cap the read so a crafted unbounded first line
-    // cannot inflate memory.
+    // A header line is short — cap the read so a crafted unbounded first
+    // line cannot inflate memory. Banner lines skip like read_sheet's
+    // header_span or the picker reports the comment as the schema.
     let limited = std::io::Read::take(file, 1 << 20);
-    let Ok(read) = std::io::BufRead::read_line(&mut std::io::BufReader::new(limited), &mut line)
-    else {
-        return Vec::new();
-    };
-    if read == 0 {
-        return Vec::new();
+    let mut reader = std::io::BufReader::new(limited);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(read) = std::io::BufRead::read_line(&mut reader, &mut line) else {
+            return Vec::new();
+        };
+        if read == 0 {
+            return Vec::new();
+        }
+        if line
+            .bytes()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| byte != b'#')
+        {
+            break;
+        }
     }
     let line = line.trim_end_matches(['\r', '\n']);
     let mut names = Vec::new();
@@ -3398,15 +3499,53 @@ pub(crate) fn timeslice_energy_only(metric: &str) -> bool {
     )
 }
 
-/// Folder `layer-N` picks the Nth energy in input-map order. A path with no
-/// layer folder uses the file's order instead.
-fn frame_energy(energies: &[f32], layer_idx: i64, file_index: usize) -> f32 {
+/// The file's own layer_id tags its energy from the input map when every
+/// row agrees — a repainted energy in `layer-2` or 1-indexed folders then
+/// cannot borrow a sibling's energy. Only then does `layer-N` pick the Nth
+/// unique energy; a path with no layer folder uses the file's order.
+fn frame_energy(
+    sheet: &Sheet,
+    map: &Sheet,
+    energies: &[f32],
+    layer_idx: i64,
+    file_index: usize,
+) -> f32 {
+    if let Some(tag) = sheet_layer_energy(sheet, map) {
+        return tag;
+    }
     let index = if layer_idx >= 0 {
         layer_idx as usize
     } else {
         file_index
     };
     energies.get(index).copied().unwrap_or(f32::NAN)
+}
+
+/// Energy of the single layer a timeslice file reports, joined through the
+/// input map's own layer rows.
+fn sheet_layer_energy(sheet: &Sheet, map: &Sheet) -> Option<f32> {
+    let layers = column_any(sheet, &["layer_id"])?;
+    let layer = *layers.iter().find(|value| value.is_finite())?;
+    if !layers
+        .iter()
+        .all(|value| !value.is_finite() || *value == layer)
+    {
+        return None;
+    }
+    let map_layers = column_any(map, &["layer_id"])?;
+    let energies = column_any(map, &["energy"])?;
+    let mut found = None;
+    for (map_layer, energy) in map_layers.iter().zip(energies) {
+        if map_layer.is_finite() && energy.is_finite() && *map_layer == layer {
+            // Two map rows claiming this layer is ambiguous - the folder
+            // index is the tiebreak the callers have always used.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(*energy);
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -3418,6 +3557,7 @@ pub(crate) fn signal_table(
 ) -> BTreeMap<String, Vec<f32>> {
     signal_from(
         &read_sheets(files, signal_column),
+        &empty_sheet(),
         energies,
         layers,
         metric,
@@ -3427,6 +3567,7 @@ pub(crate) fn signal_table(
 
 fn signal_from(
     sheets: &[Arc<Sheet>],
+    map: &Sheet,
     energies: &[f32],
     layers: &[i64],
     metric: &str,
@@ -3456,7 +3597,13 @@ fn signal_from(
             let Some(start) = row_origin(index, prior) else {
                 continue;
             };
-            let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+            let tag = frame_energy(
+                sheet,
+                map,
+                energies,
+                layers.get(index).copied().unwrap_or(-1),
+                index,
+            );
             let cmd_x = concept_col(sheet, "amplifier_cmd_x");
             let read_x = concept_col(sheet, "amplifier_readback_x");
             let cmd_y = concept_col(sheet, "amplifier_cmd_y");
@@ -3499,7 +3646,13 @@ fn signal_from(
         let Some(start) = row_origin(index, prior) else {
             continue;
         };
-        let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+        let tag = frame_energy(
+            sheet,
+            map,
+            energies,
+            layers.get(index).copied().unwrap_or(-1),
+            index,
+        );
         let columns: Vec<&[f32]> = spec
             .iter()
             .map(|(_, concept)| concept_col(sheet, concept))
@@ -3549,7 +3702,7 @@ fn column_diff(command: &[f32], readback: &[f32]) -> Vec<f32> {
 
 /// Trigger length, or the longest requested column when the file has no trigger.
 fn sample_len(sheet: &Sheet, columns: &[&[f32]]) -> usize {
-    column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"])
+    column_any(sheet, GATE_NAMES)
         .map(|values| values.len())
         .filter(|n| *n > 0)
         .unwrap_or_else(|| columns.iter().map(|column| column.len()).max().unwrap_or(0))
@@ -3568,7 +3721,7 @@ fn append_samples(
     if n == 0 || start >= n {
         return;
     }
-    let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
+    let gate = column_any(sheet, GATE_NAMES);
     for sample in start..n {
         energy.push(tag);
         for (out, column) in series_out.iter_mut().zip(columns) {
@@ -3603,6 +3756,7 @@ fn signal_rows(
 
 fn current_from(
     sheets: &[Arc<Sheet>],
+    map: &Sheet,
     energies: &[f32],
     layers: &[i64],
     prior: Option<(usize, usize)>,
@@ -3617,11 +3771,17 @@ fn current_from(
         let Some(start) = row_origin(index, prior) else {
             continue;
         };
-        let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+        let tag = frame_energy(
+            sheet,
+            map,
+            energies,
+            layers.get(index).copied().unwrap_or(-1),
+            index,
+        );
         let a = scaled_current(sheet, "ic1");
         let b = scaled_current(sheet, "ic2");
         let c = ic3_current(sheet);
-        let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
+        let gate = column_any(sheet, GATE_NAMES);
         let n = sample_len(sheet, &[a.as_slice(), b.as_slice(), c.as_slice()]);
         for sample in start..n {
             out_energy.push(tag);
@@ -3746,6 +3906,7 @@ fn note_layer(marks: &mut Vec<f32>, previous: &mut Option<i64>, id: i64, at: f32
 
 fn current_ratio_from(
     sheets: &[Arc<Sheet>],
+    map: &Sheet,
     energies: &[f32],
     layers: &[i64],
 ) -> BTreeMap<String, Vec<f32>> {
@@ -3757,11 +3918,17 @@ fn current_ratio_from(
     let mut cursor = 0.0f32;
     let mut any_ic3 = false;
     for (index, sheet) in sheets.iter().enumerate() {
-        let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+        let tag = frame_energy(
+            sheet,
+            map,
+            energies,
+            layers.get(index).copied().unwrap_or(-1),
+            index,
+        );
         let a = scaled_current(sheet, "ic1");
         let b = scaled_current(sheet, "ic2");
         let c = ic3_current(sheet);
-        let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
+        let gate = column_any(sheet, GATE_NAMES);
         let plateau = |values: &[f32]| plateau_mean(values, gate);
         let left = plateau(&a);
         let right = plateau(&b);
@@ -6794,5 +6961,103 @@ b,2
         assert_eq!(parse_datetime("2024-03-01 junk"), None);
         assert_eq!(parse_datetime("2024-03-01 10:20:30 UTC"), None);
         assert!(parse_datetime("2024-03-01 10:20").is_some());
+    }
+
+    #[test]
+    fn a_unit_suffixed_clock_scales_to_the_canonical_unit() {
+        // `point_time(s)` used to bind through normalized-name lookup and read
+        // seconds as milliseconds — a 1000x quiet scale error.
+        let file = b"spot_no,layer_id,point_time(s)
+1,0,0.5
+"
+        .to_vec();
+        let sheets = read_sheets(&[file], |_| true);
+        let (values, scale) = num_clock(&sheets[0], "point_time(ms)", "ms").unwrap();
+        assert!((values[0] * scale - 500.0).abs() < 1e-3);
+        // A unit we cannot convert is refused instead of misread.
+        let file = b"spot_no,layer_id,point_time(furlongs)
+1,0,0.5
+"
+        .to_vec();
+        let sheets = read_sheets(&[file], |_| true);
+        assert!(num_clock(&sheets[0], "point_time(ms)", "ms").is_none());
+    }
+
+    #[test]
+    fn a_relative_clock_keeps_its_zero_origin() {
+        // A session clock legitimately starts at 0.0 — only an epoch-scale
+        // series may treat 0.0 as the unset-RTC sentinel.
+        let elapsed = elapsed_seconds(&[0.0, 1500.0, 3000.0]).unwrap();
+        assert_eq!(elapsed, vec![0.0, 1500.0, 3000.0]);
+        let epoch = elapsed_seconds(&[0.0, 1.7e9, 1.7e9 + 1.5]).unwrap();
+        assert!(epoch[0].is_nan());
+        assert!((epoch[2] - 1.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_short_fill_pads_to_the_clock_instead_of_vanishing() {
+        let mut map = BTreeMap::from([("energy".to_string(), vec![70.0, 90.0])]);
+        let part = BTreeMap::from([("ic1".to_string(), vec![1.0])]);
+        absorb(&mut map, &part);
+        assert_eq!(map["ic1"].len(), 2);
+        assert!(map["ic1"][1].is_nan());
+        // A part longer than the clock still cannot join.
+        let part = BTreeMap::from([("ic2".to_string(), vec![1.0, 2.0, 3.0])]);
+        absorb(&mut map, &part);
+        assert!(!map.contains_key("ic2"));
+    }
+
+    #[test]
+    fn a_repainted_layer_tags_from_the_files_own_layer_id() {
+        let map = Sheet {
+            num: BTreeMap::from([
+                ("energy".to_string(), vec![70.0, 90.0, 90.0]),
+                ("layer_id".to_string(), vec![0.0, 1.0, 2.0]),
+            ]),
+            wide: BTreeMap::new(),
+            block: BTreeMap::new(),
+        };
+        let sheet = Sheet {
+            num: BTreeMap::from([("layer_id".to_string(), vec![2.0, 2.0])]),
+            wide: BTreeMap::new(),
+            block: BTreeMap::new(),
+        };
+        let energies = unique_seen(&[70.0, 90.0, 90.0]);
+        // Folder layer-2 has no third unique energy - the file's own
+        // layer_id still finds its repainted 90.
+        assert_eq!(frame_energy(&sheet, &map, &energies, 2, 0), 90.0);
+        // An ambiguous map layer (two rows claim it) keeps the folder order.
+        let ambiguous = Sheet {
+            num: BTreeMap::from([
+                ("energy".to_string(), vec![180.0, 70.0]),
+                ("layer_id".to_string(), vec![9.0, 9.0]),
+            ]),
+            wide: BTreeMap::new(),
+            block: BTreeMap::new(),
+        };
+        let sheet = Sheet {
+            num: BTreeMap::from([("layer_id".to_string(), vec![9.0])]),
+            wide: BTreeMap::new(),
+            block: BTreeMap::new(),
+        };
+        assert_eq!(frame_energy(&sheet, &ambiguous, &[180.0, 70.0], 1, 0), 70.0);
+    }
+
+    #[test]
+    fn the_column_picker_skips_a_comment_banner() {
+        let dir = std::env::temp_dir().join(format!("sk-cols-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spot_data.csv");
+        std::fs::write(
+            &path,
+            b"# recorded on site A
+energy,dose
+70,1
+",
+        )
+        .unwrap();
+        assert_eq!(header_columns(&path), vec!["energy", "dose"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

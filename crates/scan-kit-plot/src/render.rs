@@ -8205,6 +8205,7 @@ fn heat_texel(px: &[u8], cols: u32, rows: u32, u: f32, v: f32) -> [f32; 4] {
     let y1 = (y0 + 1).min(rows.saturating_sub(1));
     let tx = fx - x0 as f32;
     let ty = fy - y0 as f32;
+    debug_assert_eq!(px.len(), (cols * rows * 4) as usize);
     let read = |x: u32, y: u32| {
         let i = (y * cols + x) as usize * 4;
         [
@@ -8425,7 +8426,16 @@ pub(crate) fn decode_lines(bytes: &[u8]) -> Vec<LineRec> {
             color: f32x4_at(chunk, 8),
             thickness: f32_at(chunk, 12),
             id: u32_at(chunk, 13),
-            pattern: f32_at(chunk, 3) as u8,
+            pattern: {
+                let pattern = f32_at(chunk, 3);
+                if pattern < 0.5 {
+                    LINE_SOLID
+                } else if pattern > 1.5 {
+                    LINE_DOT
+                } else {
+                    LINE_DASH
+                }
+            },
             phase: f32_at(chunk, 7),
         })
         .collect()

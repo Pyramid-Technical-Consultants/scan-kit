@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -115,6 +116,19 @@ fn meta_id(meta: &str) -> String {
 
 /// Read the current session id from the RCI's timeslice table metadata.
 /// `None` when the device has never run a session.
+/// `live_session_id` on a bounded deadline — for the status poll, where an
+/// unresponsive file server must not freeze the health check behind it.
+pub fn live_session_id_timed(host: &str, timeout: Duration) -> Option<String> {
+    runner::http_json_timed(
+        host,
+        "rci/control_point_table/timeslice_table/file_header_meta",
+        timeout,
+    )
+    .and_then(|value| value.as_str().map(str::to_owned))
+    .map(|meta| meta_id(&meta))
+    .filter(|id| !id.is_empty())
+}
+
 pub fn live_session_id(host: &str) -> Option<String> {
     table_io(host, "rci", "timeslice_table", "file_header_meta")
         .and_then(|value| value.as_str().map(str::to_owned))

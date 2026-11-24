@@ -1519,68 +1519,6 @@ mod tests {
             128,
         );
         assert!(many.contains("E5L_250-210"));
-        #[test]
-        fn non_catalog_energies_are_rejected_not_dropped() {
-            // A [good, bogus] selection used to silently generate only good —
-            // the plan would ship fewer layers than the filename suggests.
-            assert!(!validate_plan(
-                "zero_field",
-                &serde_json::json!({"selected_energies": [100.0, 999.0]})
-            )
-            .is_empty());
-            // A non-numeric entry is also a reject, not a silent skip.
-            assert!(!validate_plan(
-                "zero_field",
-                &serde_json::json!({"selected_energies": [100.0, "100"]})
-            )
-            .is_empty());
-        }
-
-        #[test]
-        fn a_null_variance_uses_the_default_like_the_consumer() {
-            // The consumer defaults null to 10% — validation must not call it
-            // "not a number" while the generator proceeds.
-            let errors = validate_plan(
-                "zero_field",
-                &serde_json::json!({
-                    "selected_energies": [100.0],
-                    "spot_weight_method": "random_total_variance",
-                    "spot_weight_total_mu": 1.0,
-                    "spot_weight_variance_pct": null,
-                }),
-            );
-            assert!(errors.is_empty(), "{errors:?}");
-        }
-
-        #[test]
-        fn a_wrong_type_enum_param_errors_instead_of_coercing() {
-            // spot_weight_method: 7 used to coerce to "fixed" everywhere.
-            let errors = validate_plan(
-                "zero_field",
-                &serde_json::json!({
-                    "selected_energies": [100.0],
-                    "spot_weight_method": 7,
-                }),
-            );
-            assert!(!errors.is_empty());
-        }
-
-        #[test]
-        fn the_filename_echoes_the_generators_defaults() {
-            // Null params generate the catalog defaults — the name must say them.
-            let name = suggest_filename("zero_field", &serde_json::json!({}), None, 128);
-            assert!(name.contains("Sp100"), "{name}");
-            let name = suggest_filename(
-                "rectangular_field",
-                &serde_json::json!({"spot_weight_method": "fixed"}),
-                None,
-                128,
-            );
-            assert!(name.contains("Wfix0.02"), "{name}");
-            assert!(name.contains("100x100mm"), "{name}");
-            assert!(name.contains("G33x33"), "{name}");
-        }
-
         let short = suggest_filename(
             "zero_field",
             &json!({"selected_energies": STANDARD_ENERGIES_MEV.to_vec(), "spots_per_layer": 100000, "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
@@ -1589,6 +1527,69 @@ mod tests {
         );
         assert!(short.len() <= 40);
         assert!(short.ends_with(".csv"));
+    }
+
+    #[test]
+    fn non_catalog_energies_are_rejected_not_dropped() {
+        // A [good, bogus] selection used to silently generate only good —
+        // the plan would ship fewer layers than the filename suggests.
+        assert!(!validate_plan(
+            "zero_field",
+            &serde_json::json!({"selected_energies": [100.0, 999.0]})
+        )
+        .is_empty());
+        // A non-numeric entry is also a reject, not a silent skip.
+        assert!(!validate_plan(
+            "zero_field",
+            &serde_json::json!({"selected_energies": [100.0, "100"]})
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_null_variance_uses_the_default_like_the_consumer() {
+        // The consumer defaults null to 10% — validation must not call it
+        // "not a number" while the generator proceeds.
+        let errors = validate_plan(
+            "zero_field",
+            &serde_json::json!({
+                "selected_energies": [100.0],
+                "spots_per_layer": 100,
+                "spot_weight_method": "random_total_variance",
+                "spot_weight_total_mu": 1.0,
+                "spot_weight_variance_pct": null,
+            }),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_wrong_type_enum_param_errors_instead_of_coercing() {
+        // spot_weight_method: 7 used to coerce to "fixed" everywhere.
+        let errors = validate_plan(
+            "zero_field",
+            &serde_json::json!({
+                "selected_energies": [100.0],
+                "spot_weight_method": 7,
+            }),
+        );
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn the_filename_echoes_the_generators_defaults() {
+        // Null params generate the catalog defaults — the name must say them.
+        let name = suggest_filename("zero_field", &serde_json::json!({}), None, 128);
+        assert!(name.contains("Sp100"), "{name}");
+        let name = suggest_filename(
+            "rectangular_field",
+            &serde_json::json!({"spot_weight_method": "fixed"}),
+            None,
+            128,
+        );
+        assert!(name.contains("Wfix0.02"), "{name}");
+        assert!(name.contains("100x100mm"), "{name}");
+        assert!(name.contains("G33x33"), "{name}");
     }
 
     #[test]

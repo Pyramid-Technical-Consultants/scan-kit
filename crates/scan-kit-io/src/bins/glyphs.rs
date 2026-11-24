@@ -624,11 +624,9 @@ pub(super) fn corr_panel(
             });
         }
     }
-    // Each key can exist in a different table — no co-occurring pair means
-    // the panel would hold nothing but the diagonal guide.
-    if all_x.is_empty() {
-        return None;
-    }
+    // Each key can exist in a different table. Even then the slot is real -
+    // a skipped panel shifts every later panel one grid column, so a pair
+    // with no shared table still returns its diagonal guide.
     let (xmin, xmax) = span(&all_x);
     let (ymin, ymax) = span(&all_y);
     let lo = xmin.min(ymin);
@@ -700,11 +698,10 @@ pub(super) fn interlock_guides(
             "expected_sigma_{}",
             series_key.strip_suffix("_err").unwrap_or(series_key)
         );
-        if let Some(expected) = tables
-            .iter()
-            .find_map(|table| table.get(&band_key).cloned())
-        {
-            guides.extend(sigma_bands(&expected, categories, metric == "sigma"));
+        if tables.len() == 1 {
+            if let Some(expected) = tables[0].get(&band_key) {
+                guides.extend(sigma_bands(expected, categories, metric == "sigma"));
+            }
         }
     }
     guides
@@ -1006,9 +1003,11 @@ mod tests {
     }
 
     #[test]
-    fn a_correlation_pair_with_no_shared_table_draws_no_panel() {
-        // Either key can exist in a different session's table — the pair
-        // would otherwise emit a diagonal guide over an empty plot.
+    fn a_correlation_pair_with_no_shared_table_keeps_its_grid_slot() {
+        // Either key can exist in a different session's table. The slot is
+        // still fixed in the scene grid — a missing panel would shift every
+        // later panel a column left, so the pair draws its diagonal guide
+        // alone rather than dropping out.
         let a = YSeries {
             key: "ic1_x_err",
             label: "IC1",
@@ -1019,6 +1018,10 @@ mod tests {
         };
         let mut table = std::collections::BTreeMap::new();
         table.insert("ic1_x_err".to_string(), vec![1.0, 2.0]);
-        assert!(corr_panel(&a, &b, &[table], "Position").is_none());
+        let panel = corr_panel(&a, &b, &[table], "Position").unwrap();
+        assert!(panel
+            .series
+            .iter()
+            .all(|item| matches!(item, Series::Guide { .. })));
     }
 }

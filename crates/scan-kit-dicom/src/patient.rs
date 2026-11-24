@@ -3127,7 +3127,7 @@ mod tests {
         is(&mut beam, 0x300C, 0x006A, 1).unwrap();
         sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
         let mut plan = Vec::new();
-        sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x0070, std::slice::from_ref(&group)).unwrap();
         sq(&mut plan, 0x300A, 0x03A2, &[beam.clone()]).unwrap();
         sq(&mut plan, 0x300A, 0x0010, &[item, other.clone()]).unwrap();
         let elems = parse_dataset(&plan).unwrap();
@@ -3170,7 +3170,7 @@ mod tests {
         is(&mut beam, 0x300C, 0x006A, 1).unwrap();
         sq(&mut beam, 0x300A, 0x03A8, &[cp_with(0.0), cp_with(45.0)]).unwrap();
         let mut plan = Vec::new();
-        sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x0070, std::slice::from_ref(&group)).unwrap();
         sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
         assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").is_err());
         // Identical geometry across control points stays legal.
@@ -3772,7 +3772,7 @@ mod tests {
             is(&mut beam, 0x300C, 0x006A, 1).unwrap();
             sq(&mut beam, 0x300A, 0x03A8, &[cp.clone()]).unwrap();
             let mut plan = Vec::new();
-            sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+            sq(&mut plan, 0x300A, 0x0070, std::slice::from_ref(&group)).unwrap();
             sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
             let message = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS")
                 .err()

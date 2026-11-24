@@ -1170,7 +1170,8 @@ impl Live {
                 submission_index: Some(ticket.index.clone()),
                 timeout: Some(Duration::from_millis(50)),
             }) {
-                Ok(_) | Err(wgpu::PollError::Timeout) => {}
+                Ok(_) => {}
+                Err(wgpu::PollError::Timeout) => {}
                 Err(err) => {
                     gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
@@ -1187,7 +1188,13 @@ impl Live {
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                // The retired index makes Wait return instantly — the map
+                // callback can lag a poll behind it, so pace the retry or an
+                // instant-Ok/Empty loop spins a core until the 30 s bound.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 Err(err) => {
                     gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));

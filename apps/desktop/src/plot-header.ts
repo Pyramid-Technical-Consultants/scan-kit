@@ -94,7 +94,16 @@ export function sameChrome(current: PlotHeader | null, next: PlotHeader): boolea
   for (let index = 0; index < current.controls.length; index += 1) {
     const left = current.controls[index];
     const right = next.controls[index];
-    if (left == null || right == null || left.id !== right.id || left.value !== right.value) {
+    if (
+      left == null ||
+      right == null ||
+      left.id !== right.id ||
+      left.value !== right.value ||
+      left.label !== right.label ||
+      // Option lists change with the study (energies, sessions) - a kept
+      // chrome would otherwise show the stale choices.
+      JSON.stringify(left.options) !== JSON.stringify(right.options)
+    ) {
       return false;
     }
   }

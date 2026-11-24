@@ -756,8 +756,11 @@ export function AnalysisView({
   }, [shown, viewId]);
 
   const orderKey = sessions.map((session) => session.id).join("\0");
-  const hiddenKey = hidden.join("\0");
+  const hiddenKey = [...hidden].sort().join("\0");
   const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options, studyPath != null)) : options;
+  // The scanner list is only sent with a study — outside the volumetric
+  // view a registry load must not restart the task or shift the request key.
+  const scannerKey = studyPath != null ? JSON.stringify(scanners) : "";
   const pictureKey = JSON.stringify([
     viewId,
     folder,
@@ -765,7 +768,7 @@ export function AnalysisView({
     hiddenKey,
     sceneKey,
     studyPath ?? "",
-    scanners,
+    scannerKey,
     plotHost,
   ]);
   const requestKey = JSON.stringify([pictureKey, lineEpoch]);
@@ -854,7 +857,7 @@ export function AnalysisView({
       }
       if (viewId === "volumetric" && studyPath != null) {
         plotOptions.study = studyPath;
-        plotOptions.scanners = JSON.stringify(scanners);
+        plotOptions.scanners = scannerKey;
       }
       if (lineToken.current !== "") {
         plotOptions._lines = lineToken.current;
@@ -1046,7 +1049,7 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scanners, lineEpoch, plotHost, requestKey]);
+  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scannerKey, lineEpoch, plotHost, requestKey]);
 
   useEffect(() => {
     if (viewId === "volumetric") {

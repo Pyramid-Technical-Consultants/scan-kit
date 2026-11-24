@@ -131,8 +131,9 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
         concept: "ic1_total_dose",
         names: &[
             "ic1_total_dose_spot",
-            "ic1_total_dose_spot_raw",
             "ic1_total_dose",
+            "ic1_dose",
+            "ic1_total_dose_spot_raw",
             "ic1_dose_spot_raw",
         ],
     },
@@ -140,8 +141,9 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
         concept: "ic2_total_dose",
         names: &[
             "ic2_total_dose_spot",
-            "ic2_total_dose_spot_raw",
             "ic2_total_dose",
+            "ic2_dose",
+            "ic2_total_dose_spot_raw",
             "ic2_dose_spot_raw",
         ],
     },
@@ -149,10 +151,11 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
         concept: "ic3_total_dose",
         names: &[
             "r_ic3_total_dose_spot",
-            "r_ic3_total_dose_spot_raw",
-            "ic3_total_dose_spot_raw",
             "ic3_total_dose",
             "r_ic3_total_dose",
+            "ic3_dose",
+            "r_ic3_total_dose_spot_raw",
+            "ic3_total_dose_spot_raw",
         ],
     },
     ConceptAlias {

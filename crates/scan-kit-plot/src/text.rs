@@ -105,6 +105,13 @@ fn build() -> Atlas {
                 pixels[dest..dest + w as usize].copy_from_slice(&bitmap[src..src + w as usize]);
             }
         }
+        // A glyph the atlas ran out of rows for carries no pixels - zero the
+        // size so layout skips it instead of blitting out-of-bounds reads.
+        let (w, h) = if w > 0 && h > 0 && cursor_y + h >= ATLAS {
+            (0, 0)
+        } else {
+            (w, h)
+        };
         let top = -(metrics.ymin + metrics.height as i32) as f32;
         let glyph = Glyph {
             advance: metrics.advance_width,

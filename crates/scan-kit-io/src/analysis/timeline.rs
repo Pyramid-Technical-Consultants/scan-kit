@@ -561,7 +561,9 @@ fn time_panel(series: Vec<Series>, ymin: f32, ymax: f32, y_label: &str) -> Panel
     let mut panel = panel(String::new(), 0.0, 1.0, ymin, ymax, series);
     // `panel` turns a tiny span into +1. A flat trace should stay near its value.
     panel.ymin = ymin;
-    panel.ymax = if ymax > ymin { ymax } else { ymin + 1.0e-6 };
+    // A constant extreme trace still needs ymin < ymax - 1e-6 is a no-op
+    // past ~1e26 where the f32 ulp dwarfs it.
+    panel.ymax = if ymax > ymin { ymax } else { ymin.next_up() };
     panel.y_label = y_label.to_owned();
     panel
 }

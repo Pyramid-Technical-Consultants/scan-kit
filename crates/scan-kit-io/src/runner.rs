@@ -77,19 +77,19 @@ pub fn catalog(db: &Path) -> Value {
                 body["connected"] = json!(view["connected"].as_bool().unwrap_or(false));
                 body["view"] = view;
             }
-            Err(_) => body["connected"] = json!(false),
+            // A strike is not a verdict — the entry survives until the
+            // eviction threshold, so report what LIVE actually holds.
+            Err(_) => body["connected"] = json!(live()),
         }
     }
     // read_status refreshes live.session_id on a roll - the zip name must
-    // name the session the view reports, not the pre-read one.
-    let session_id = lock()
-        .as_ref()
-        .map(|live| live.session_id.clone())
-        .unwrap_or_default();
+    // name the session the view reports. Read it from the view itself: a
+    // second lock() here could see a different generation's connection.
+    let session_id = body["view"]["session_id"].as_str().unwrap_or_default();
     body["dest"] = json!(scan_kit_core::default_session_zip_path(
         "",
         file_dir.as_deref().unwrap_or(""),
-        &session_id,
+        session_id,
     ));
     body
 }
@@ -124,7 +124,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     // Each phase can stall on a trickling peer for a full read deadline —
     // a disconnect between phases must still be able to abort the connect.
     if DISCONNECTS.load(Ordering::Acquire) != generation {
-        return Err("The device reconnected during the action - please retry.".into());
+        return Err(connection_gone());
     }
     let version = http_json(&host, "admin/version").unwrap_or(Value::Null);
     let device_type = http_json(&host, "admin/device_type").unwrap_or(Value::Null);
@@ -133,7 +133,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         .unwrap_or_else(|| DEFAULT_SESSION_ROOT.into());
     let session_id = session_capture::live_session_id(&host).unwrap_or_default();
     if DISCONNECTS.load(Ordering::Acquire) != generation {
-        return Err("The device reconnected during the action - please retry.".into());
+        return Err(connection_gone());
     }
     let plan_path = with_store(db, |conn| store::runner_plan_path(conn))
         .ok()
@@ -145,7 +145,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         // A disconnect (or a queued connect's own disconnect) ran during the
         // open phase — it must not be overwritten by this install.
         if DISCONNECTS.load(Ordering::Acquire) != generation {
-            return Err("The device reconnected during the action - please retry.".into());
+            return Err(connection_gone());
         }
         *guard = Some(Live {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
@@ -194,7 +194,9 @@ pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
             None => return Ok(runner_view(&json!({}), false, has_plan)),
         }
     };
-    let session_id = session_capture::live_session_id(&host);
+    // The probe is advisory — the health check must not wait out a wedged
+    // file server for its full HTTP deadline.
+    let session_id = session_capture::live_session_id_timed(&host, Duration::from_secs(2));
     let mut guard = lock();
     // Same answer as the first-lock arm — a disconnect that lands mid-probe
     // is still just the offline state, not an error.
@@ -263,7 +265,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         let live = guard
             .as_mut()
             .filter(|live| live.epoch == epoch)
-            .ok_or("The device reconnected during the action - please retry.")?;
+            .ok_or_else(connection_gone)?;
         let read = read_one(
             &mut live.socket,
             POINTS_UPLOAD_TARGET,
@@ -285,7 +287,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         let live = guard
             .as_mut()
             .filter(|live| live.epoch == epoch)
-            .ok_or("The device reconnected during the action - please retry.")?;
+            .ok_or_else(connection_gone)?;
         set_field(&mut live.socket, POINTS_UPLOAD, &json!(true))?;
     }
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -295,7 +297,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
             let live = guard
                 .as_mut()
                 .filter(|live| live.epoch == epoch)
-                .ok_or("The device reconnected during the action - please retry.")?;
+                .ok_or_else(connection_gone)?;
             let state = read_one(&mut live.socket, POINTS_LOAD_STATE, Duration::from_secs(2))?;
             io_number(&state).map(|value| value as i64)
         };
@@ -317,7 +319,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         let live = guard
             .as_mut()
             .filter(|live| live.epoch == epoch)
-            .ok_or("The device reconnected during the action - please retry.")?;
+            .ok_or_else(connection_gone)?;
         let valid = read_one(&mut live.socket, POINTS_VALID, Duration::from_secs(8))?;
         subscribe_status(&mut live.socket)?;
         if !io_bool(&valid) {
@@ -339,7 +341,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     // A reconnect during read_status would attach "Plan uploaded" to the new
     // device's view — the epoch check must run after the final HTTP window.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err("The device reconnected during the action - please retry.".into());
+        return Err(connection_gone());
     }
     body["target"] = json!(target);
     body["message"] = json!(format!("Plan uploaded to {target}."));
@@ -360,13 +362,13 @@ pub fn control(action: &str) -> Result<Value, String> {
     // and the status read would report a different connection's state as the
     // actuation's result.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err("The device reconnected during the action - please retry.".into());
+        return Err(connection_gone());
     }
     let view = read_status(true, "")?;
     // read_status re-locks across its HTTP call - a reconnect inside that
     // window would report the new device's state as the actuation's result.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err("The device reconnected during the action - please retry.".into());
+        return Err(connection_gone());
     }
     Ok(view)
 }
@@ -506,6 +508,11 @@ fn refresh(live: &mut Live, timeout: Duration) -> Result<(), String> {
             .collect::<Vec<_>>(),
         timeout,
     )?;
+    // get is sent for every status path — zero updates in the whole
+    // window means the peer is dead at the app level even if TCP is alive.
+    if updates.is_empty() {
+        return Err("no status update within the poll deadline".into());
+    }
     for path in STATUS_PATHS {
         let key = field_subscribe_key(path);
         if let Some(value) = updates.get(&key) {
@@ -1436,6 +1443,16 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Live>> {
     LIVE.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+/// Why an epoch check failed: the entry is gone (evicted/disconnected) or
+/// a different connection took its place.
+fn connection_gone() -> String {
+    if live() {
+        "The device reconnected during the action - please retry.".into()
+    } else {
+        "Lost contact with the device.".into()
+    }
+}
+
 fn live() -> bool {
     lock().is_some()
 }
@@ -1495,6 +1512,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("scan-kit.sqlite");
+        *lock() = None;
         with_store(&db, |conn| store::set_runner_host(conn, "192.168.100.184")).unwrap();
         let listed = catalog(&db);
         assert_eq!(listed["host"], "192.168.100.184");
@@ -1967,5 +1985,64 @@ mod tests {
         }
         assert!(!live());
         assert_eq!(read_status(false, "").unwrap()["connected"], json!(false));
+    }
+
+    #[test]
+    fn a_silent_socket_strikes_but_the_catalog_stays_connected_until_evicted() {
+        use std::net::TcpListener;
+        // Answer the upgrade then hold the socket without ever publishing —
+        // a zero-update poll is a strike, not a success.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let _socket = accept_mpack(stream);
+            // Hold the ws open and drop the HTTP probe connections.
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(_) => break,
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let host = format!("127.0.0.1:{port}");
+        let socket = dial(&host).unwrap();
+        *lock() = Some(Live {
+            epoch: 1,
+            host,
+            socket,
+            status: Map::new(),
+            version: Value::Null,
+            device_type: Value::Null,
+            session_directory: String::new(),
+            session_id: String::new(),
+            plan_path: None,
+            poll_errors: 0,
+        });
+        let db = std::env::temp_dir().join(format!("sk-cat-{}.sqlite", std::process::id()));
+        // catalog's own read_status is strike 1 here — the socket survives,
+        // and a single failed poll must not flip the catalog to offline.
+        // A parallel disconnect() can interleave — then every arm is already
+        // offline and the assertions below would hold vacuously, so only
+        // assert while a Live actually exists.
+        if live() {
+            let report = catalog(&db);
+            if live() {
+                assert_eq!(report["connected"], json!(true));
+            }
+        }
+        // Two consecutive failures evict — keep polling until it happens.
+        for _ in 0..4 {
+            match read_status(false, "") {
+                Err(_) if live() => continue,
+                _ => break,
+            }
+        }
+        assert!(!live());
+        assert_eq!(catalog(&db)["connected"], json!(false));
+        let _ = std::fs::remove_file(&db);
     }
 }

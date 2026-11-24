@@ -154,8 +154,13 @@ fn span(values: &[f32]) -> (f32, f32) {
     let Some((lo, hi)) = finite_minmax(values) else {
         return (0.0, 1.0);
     };
-    if (hi - lo).abs() < 1e-4 {
-        (lo - 0.5, hi + 0.5)
+    // Near-constant data needs a window sized to the data - an absolute
+    // 1e-4 would collapse a real narrow column (µs clocks, ratios) into a
+    // point on a ~1-unit axis, and ±0.5 overflows away at huge magnitudes.
+    let scale = lo.abs().max(hi.abs());
+    if hi - lo < 1e-4 * scale.max(1e-30) {
+        let pad = (0.5 * scale).max(0.5);
+        (lo - pad, hi + pad)
     } else {
         (lo, hi)
     }
