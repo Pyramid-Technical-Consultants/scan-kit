@@ -1060,7 +1060,7 @@ pub(crate) const MAX_MEMBER_BYTES: u64 = 4 << 30;
 pub(crate) fn read_capped(member: &mut impl Read, name: &str, max: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     member
-        .take(max + 1)
+        .take(max.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|err| err.to_string())?;
     if bytes.len() as u64 > max {

@@ -1286,6 +1286,9 @@ pub(crate) fn under_root(canonical: &str, key: &str) -> bool {
 }
 
 pub(crate) fn password_of(remote: &Remote) -> String {
+    if let Some(password) = &remote.password {
+        return password.clone();
+    }
     let map = passwords().lock().unwrap_or_else(|err| err.into_inner());
     if let Some(password) = map.get(&remote.canonical) {
         return password.clone();
@@ -1462,9 +1465,10 @@ fn add_windows_connection(share: &str, username: &str, password: &str) -> Result
         return Ok(());
     }
     if code == 1219 {
-        return Err(auth_error(
-            "a Windows session to that server already exists under different credentials",
-        ));
+        return Err(
+            "a Windows session to that server already exists under different credentials              - close it in Explorer or run 'net use /delete', no password can fix this"
+                .into(),
+        );
     }
     if matches!(code, 5 | 86 | 1323 | 1326 | 2202) {
         return Err(auth_error("the share refused the password"));

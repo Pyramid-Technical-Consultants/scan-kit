@@ -105,7 +105,7 @@ fn stats_rel(
     if (lid == 0u) {
         // An out-of-range float→u32 cast is a dynamic error — clamp first so a
         // huge accumulation can't wrap into a valid-looking dose sum.
-        let q = u32(min(red_s[0] * 1e6, 4294967295.0));
+        let q = u32(min(red_s[0] * 1e6, 4294967040.0));
         let old = atomicAdd(&stats[1u], q);
         if (old + q < old) { atomicAdd(&stats[2u], 1u); }
         atomicAdd(&stats[3u], red_c[0]);
@@ -366,6 +366,7 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         let y = request.y.get(i).copied().unwrap_or(f32::NAN);
         let sx = request.sx.get(i).copied().unwrap_or(0.0);
         let sy = request.sy.get(i).copied().unwrap_or(0.0);
+        let spread = f64::from(request.spread_pct).max(0.0) / 100.0 * f64::from(energy);
         if energy.is_finite()
             && weight.is_finite()
             && x.is_finite()
@@ -373,7 +374,10 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
             && sx.is_finite()
             && sy.is_finite()
             && energy > 0.0
+            && energy <= 400.0
             && weight > 0.0
+            && spread.is_finite()
+            && spread <= f64::from(f32::MAX)
         {
             spots.extend([
                 x / 10.0,
@@ -383,7 +387,7 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
                 sx.max(0.2) / 10.0,
                 sy.max(0.2) / 10.0,
                 energy,
-                request.spread_pct.max(0.0) / 100.0 * energy,
+                spread as f32,
                 0.0,
                 0.0,
             ]);
@@ -445,16 +449,33 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     if request.material.iter().any(|&m| m as usize >= media) {
         return Err(ComputeError::Message("material index out of range".into()));
     }
+    // LET-in-water is only meaningful when LET is scored — a bare flag
+    // silently returns an empty buffer.
+    if request.let_water && !request.score_let {
+        return Err(ComputeError::Message("let_water needs score_let".into()));
+    }
     if !request.spacing_mm.iter().all(|v| v.is_finite())
         || !request.origin_mm.iter().all(|v| v.is_finite())
+        || request
+            .spacing_mm
+            .iter()
+            .zip(request.shape.iter())
+            .any(|(mm, n)| {
+                let extent = f64::from(*mm) * (*n as f64);
+                extent.is_nan() || extent > 1e5
+            })
     {
         return Err(ComputeError::Message(
-            "grid origin and spacing must be finite".into(),
+            "grid origin and spacing must be finite and the extent physical".into(),
         ));
     }
-    if request.density.iter().any(|d| !d.is_finite() || *d <= 0.0) {
+    if request
+        .density
+        .iter()
+        .any(|d| !d.is_finite() || *d <= 0.0 || *d > 30.0)
+    {
         return Err(ComputeError::Message(
-            "density must be finite and positive".into(),
+            "density must be finite, positive, and within the material range".into(),
         ));
     }
     // smx/smy are divisors in the shader — zero produces a NaN particle
@@ -500,12 +521,24 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
                     "spot gaussian share outside 0..=1".into(),
                 ));
             }
+            // Past the table top the shader clamps the stopping power —
+            // error rather than transport with the wrong physics.
+            if record[2] > 400.0 {
+                return Err(ComputeError::Message(
+                    "spot energy outside the table range".into(),
+                ));
+            }
             let beam = record[6];
             if beam < 0.0 || beam.fract() != 0.0 || beam as usize >= request.beams.len() / 16 {
                 return Err(ComputeError::Message("spot beam index out of range".into()));
             }
             // spots[32..35] = range shifter (lo, material, rho); a shifted
             // spot's material indexes mc_tables().media like slab_launch's.
+            if record[32] < 0.0 || record[33] < 0.0 {
+                return Err(ComputeError::Message(
+                    "spot range-shifter fields out of range".into(),
+                ));
+            }
             if record[32] > 0.0 {
                 if !(0.0..media as f32).contains(&record[34]) || record[34].fract() != 0.0 {
                     return Err(ComputeError::Message(

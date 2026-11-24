@@ -192,7 +192,9 @@ fn flog(x: f32) -> f32 {
 }
 
 fn quanta(e_ev: f32) -> i32 {
-    return i32(floor(e_ev / QUANTUM + urand() - 1e-7));
+    // |e_ev| past ~2.1e11 eV makes the i32 conversion indeterminate — clamp
+    // so a runaway deposit saturates instead of adding arbitrary tallies.
+    return i32(clamp(floor(e_ev / QUANTUM + urand() - 1e-7), -2.0e9, 2.0e9));
 }
 
 fn add_tally(slot: u32, v: i32) {
@@ -332,8 +334,12 @@ fn bsearch(v: f32, base: i32, n: i32) -> i32 {
 
 // ---------------------------------------------------------------- geometry
 fn voxel_index(x: vec3f) -> i32 {
-    let c = vec3i(floor((x - vec3f(P.ox, P.oy, P.oz)) / vec3f(P.vx, P.vy, P.vz)));
-    if (any(c < vec3i(0)) || any(c >= vec3i(P.nx, P.ny, P.nz))) { return -1; }
+    // Cast first and a NaN/inf position can land on an indeterminate-but-
+    // in-bounds index — bounds-check in the float domain instead.
+    let f = floor((x - vec3f(P.ox, P.oy, P.oz)) / vec3f(P.vx, P.vy, P.vz));
+    let d = vec3f(f32(P.nx), f32(P.ny), f32(P.nz));
+    if (any(!(f >= vec3f(0.0) & f < d))) { return -1; }
+    let c = vec3i(f);
     return c.x + P.nx * (c.y + P.ny * c.z);
 }
 

@@ -1462,7 +1462,14 @@ pub struct Dvh {
 impl Dvh {
     /// Histogram of `dose` inside `mask`, bins up to the whole-volume peak.
     pub(crate) fn of(dose: &[f32], mask: &[bool], voxel_cc: f32) -> Dvh {
-        let peak = dose.iter().copied().fold(0.0f32, f32::max);
+        // The binning loop skips non-finite voxels — the ceiling must too,
+        // or an inf voxel produces NaN edges and identical curves report
+        // "do not share the same dose bins".
+        let peak = dose
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0f32, f32::max);
         let hi = if peak > 0.0 { peak * (1.0 + 1e-6) } else { 1.0 };
         let edges: Vec<f32> = (0..=DVH_BINS)
             .map(|i| hi * i as f32 / DVH_BINS as f32)

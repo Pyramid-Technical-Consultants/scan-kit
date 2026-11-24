@@ -101,7 +101,10 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> Result<String, String> {
     };
     // Every curve's cumulative[i] is read against first.edges[i] - curves
     // with different bins would report volumes against the wrong dose.
-    if curves.iter().any(|curve| curve.edges != first.edges) {
+    if curves
+        .iter()
+        .any(|curve| curve.edges != first.edges || curve.cumulative.len() > curve.edges.len())
+    {
         return Err("dvh curves do not share the same dose bins".into());
     }
     // Row i is indexed positionally against first.edges; shorter curves fill

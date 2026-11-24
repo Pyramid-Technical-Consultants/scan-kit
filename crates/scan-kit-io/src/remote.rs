@@ -393,7 +393,16 @@ mod net {
             };
             session
                 .userauth_password(user, password)
-                .map_err(|_| location::auth_error("the sftp server refused the password"))?;
+                .map_err(|err| match err.code() {
+                    // LIBSSH2_ERROR_AUTHENTICATION_FAILED (-18, a stable
+                    // libssh2 ABI code) is the only failure a retry with a
+                    // new password can fix — timeouts, expired passwords,
+                    // and unsupported methods must surface their own error.
+                    ssh2::ErrorCode::Session(-18) => {
+                        location::auth_error("the sftp server refused the password")
+                    }
+                    _ => err.to_string(),
+                })?;
             if !session.authenticated() {
                 return Err(location::auth_error("the sftp server refused the password"));
             }
@@ -656,12 +665,13 @@ mod net {
     }
 
     fn map_sftp(err: ssh2::Error) -> String {
-        let text = err.to_string();
-        let lower = text.to_ascii_lowercase();
-        if lower.contains("auth") || lower.contains("password") {
-            location::auth_error("the sftp server refused the password")
-        } else {
-            text
+        // Server text can contain "auth"/"password" in a path or deny
+        // message — only the auth-failed code justifies a prompt.
+        match err.code() {
+            ssh2::ErrorCode::Session(-18) => {
+                location::auth_error("the sftp server refused the password")
+            }
+            _ => err.to_string(),
         }
     }
 

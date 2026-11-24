@@ -316,8 +316,16 @@ pub(crate) fn finish_patient_report(
         // A failed CSV must not leave the PDF looking like a successful
         // export — the task reports Err either way.
         if let Err(err) = scan_kit_core::atomic_write(&csv_path, csv.as_bytes()) {
-            let _ = std::fs::remove_file(&pdf);
-            return Err(format!("{}: {err}", csv_path.display()));
+            return Err(match std::fs::remove_file(&pdf) {
+                Ok(()) => format!("{}: {err}", csv_path.display()),
+                // The rollback failed too — a fresh PDF now sits beside an
+                // older CSV, so the error must name the mismatched pair.
+                Err(remove) => format!(
+                    "{}: {err}; {} could not be removed ({remove})",
+                    csv_path.display(),
+                    pdf.display()
+                ),
+            });
         }
         out["dvh_csv"] = json!(csv_path.display().to_string());
     } else {
@@ -350,7 +358,13 @@ fn dvh_figure(
     let mut xmax = 0.0f32;
     for (index, structure) in metrics.structures.iter().enumerate() {
         let (color, name) = COLORS[index % COLORS.len()];
-        names.push(format!("{} ({name})", structure.name));
+        // Past the palette the colors repeat — the caption is the only
+        // legend, so name the repeat or two curves read as one.
+        names.push(if index < COLORS.len() {
+            format!("{} ({name})", structure.name)
+        } else {
+            format!("{} ({name}, repeat)", structure.name)
+        });
         let cumulative = structure.dvh.cumulative();
         xmax = structure.dvh.edges.iter().copied().fold(xmax, f32::max);
         series.push(Series::Polyline {

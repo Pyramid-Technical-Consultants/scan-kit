@@ -142,7 +142,11 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     let mut total = 0u64;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
-        let name = file.name().map_err(|err| err.to_string())?;
+        // A member name that is not UTF-8 cannot be a .npy array — skip it
+        // like the stray-note rule below instead of failing the archive.
+        let Ok(name) = file.name() else {
+            continue;
+        };
         // Metadata-fork members (__MACOSX/x.npy) flatten to the same basename
         // as the real array — skip them before they collide or win.
         if name.split(['/', '\\']).any(|part| part == "__MACOSX") {
@@ -319,8 +323,11 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
     // may emit `"fortran_order": True` or `'fortran_order' : True`, and a
     // Fortran-order array read as C-order is a silent transposition.
     if let Some((_, rest)) = header.split_once("fortran_order") {
-        let value = rest.trim_start_matches(['\'', '"', ' ', ':']);
-        if value.starts_with("True") || value.starts_with("true") {
+        // Fail closed — NumPy treats any truthy literal as Fortran order,
+        // so anything not an explicit False is rejected, not pattern-matched.
+        let value = rest
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ':');
+        if !(value.starts_with("False") || value.starts_with("false")) {
             return Err("fortran npy".into());
         }
     }
