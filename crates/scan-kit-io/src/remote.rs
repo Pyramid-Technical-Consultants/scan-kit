@@ -536,7 +536,10 @@ mod net {
                 if stat.file_type().is_symlink() {
                     continue;
                 }
-                let Some(name) = entry.file_name().and_then(|name| name.to_str()) else {
+                // file_name() would truncate a wire name at its own
+                // separator (`a\b` -> `b`); take it whole so the
+                // separator guards see the real name.
+                let Some(name) = entry.as_os_str().to_str() else {
                     continue;
                 };
                 if name == "." || name == ".." {
@@ -648,8 +651,13 @@ mod net {
             // A remote name is one entry on the server but can hold
             // characters that are path separators locally — `..\x` is a
             // legal unix filename and a traversal on Windows.
+            // Skipping a member silently would stamp an incomplete
+            // session cache as complete - fail the copy loudly.
             if super::unsafe_local_name(&item.name) {
-                continue;
+                return Err(format!(
+                    "remote name {} cannot be written locally",
+                    item.name
+                ));
             }
             let remote = format!("{}/{}", path.trim_end_matches('/'), item.name);
             let local = dest.join(&item.name);
@@ -996,8 +1004,13 @@ mod net {
         let items = fs.list(path)?;
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in items {
+            // Skipping a member silently would stamp an incomplete
+            // session cache as complete - fail the copy loudly.
             if super::unsafe_local_name(&item.name) {
-                continue;
+                return Err(format!(
+                    "remote name {} cannot be written locally",
+                    item.name
+                ));
             }
             let remote = format!("{}/{}", path.trim_end_matches('/'), item.name);
             let local = dest.join(&item.name);
@@ -1089,7 +1102,9 @@ mod net {
             },
         };
         for item in items {
-            if item.name == name {
+            // Case-folding servers (IIS FTP) may list a different case
+            // than the request sent.
+            if item.name == name || item.name.eq_ignore_ascii_case(name) {
                 return Ok(Some(Stat {
                     dir: item.dir,
                     size: item.size,
@@ -1229,10 +1244,9 @@ mod net {
             suppaftp::FtpError::UnexpectedResponse(response) => {
                 matches!(response.status as u32, 332 | 430 | 530)
             }
-            _ => {
-                let text = err.to_string().to_ascii_lowercase();
-                text.contains("auth") || text.contains("login") || text.contains("password")
-            }
+            // A banner or deny message containing "password" is not a
+            // credential refusal - only the numeric codes are.
+            _ => false,
         }
     }
 

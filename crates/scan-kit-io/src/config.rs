@@ -339,7 +339,11 @@ pub fn diff(input: &Value) -> Result<Value, String> {
     // The open file diffs its in-memory text (form edits applied) so pending
     // changes are visible; every other file diffs on disk.
     let mut edited = String::new();
-    let file_rel = text(input, "file").unwrap_or("").trim();
+    let file_raw = match input.get("file") {
+        None | Some(Value::Null) => "",
+        Some(value) => value.as_str().ok_or("file must be a string")?,
+    };
+    let file_rel = file_raw.trim();
     if !file_rel.is_empty() {
         let Some(xml) = input
             .get("xml")

@@ -377,6 +377,10 @@ pub(crate) fn drop_sessions(library: &str) {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .retain(|(root, _), _| root != library);
+    // A forgotten remote library would orphan its whole materialized
+    // cache (up to MAX_COPY_BYTES each) - clear it under the copy lock.
+    let _copy = copy_lock();
+    let _ = std::fs::remove_dir_all(cache_directory(library));
 }
 
 pub(crate) fn cache_directory(library_canonical: &str) -> PathBuf {
@@ -535,6 +539,12 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
             continue;
         };
         if !stat.dir {
+            // mtime 0 means the server gave no timestamp - certifying
+            // size alone seals a same-size replace forever (the
+            // fingerprint layer already refuses this).
+            if stat.mtime_ns == 0 {
+                return Ok("0\n0".into());
+            }
             return Ok(format!("{}\n{}", stat.mtime_ns, stat.size));
         }
         if dir_stat.is_none() {
@@ -546,6 +556,9 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
         size: 0,
         mtime_ns: 0,
     });
+    if stat.mtime_ns == 0 {
+        return Ok("0\n0".into());
+    }
     Ok(format!("{}\n{}", stat.mtime_ns, stat.size))
 }
 
@@ -974,6 +987,14 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     // The path is percent-decoded — the host needs it too, or
     // `sftp://h%6fst/...` can never resolve.
     let host = percent_decode(&host).to_ascii_lowercase();
+    // A decoded host holding a URL-structural char reparses to a
+    // different host/path - the persisted canonical retargets.
+    if host.bytes().any(|byte| {
+        matches!(byte, b'/' | b'\\' | b'@' | b'?' | b'#' | b'[' | b']' | b'%')
+            || byte.is_ascii_whitespace()
+    }) {
+        return Err("the URL holds a host that cannot round-trip".into());
+    }
     let mut path = percent_decode(raw_path);
     // Decoded control chars would land verbatim in the canonical key, which
     // is persisted and logged — CR/LF forges fake log lines.
@@ -990,9 +1011,18 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     if !path.starts_with('/') {
         path.insert(0, '/');
     }
-    if path.len() > 1 {
-        path = path.trim_end_matches('/').to_owned();
+    // Every downstream guard treats `..` as traversal - refuse the
+    // spelling at parse; `.` and `//` collapse to one canonical.
+    if path.split('/').any(|part| part == "..") {
+        return Err("the URL path holds a .. segment".into());
     }
+    let path: String = {
+        let parts: Vec<&str> = path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        format!("/{}", parts.join("/"))
+    };
     let mut remote = Remote {
         canonical: String::new(),
         query: query.to_owned(),
@@ -1156,6 +1186,10 @@ pub fn file_uri_path(rest: &str) -> PathBuf {
             file_uri_path(&format!("/{path}"))
         }
         Some((host, path)) if !host.is_empty() => {
+            // The client collapses `..` on the share - same rule as smb://.
+            if path.split('/').any(|part| part == "..") {
+                return PathBuf::new();
+            }
             PathBuf::from(format!("\\\\{host}\\{}", path.replace('/', "\\")))
         }
         _ if !rest.is_empty() => {
@@ -1759,7 +1793,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                     // A ".." segment survives percent-decoding and passes the
                     // prefix check while the server resolves it outside the
                     // root — reject it before the prefix test.
-                    if child.path.split('/').any(|part| part == "..")
+                    if child.path.split(['/', '\\']).any(|part| part == "..")
                         || (!root_path.is_empty()
                             && !(child.path == root_path
                                 || child.path.starts_with(&format!("{root_path}/"))))
@@ -2071,12 +2105,12 @@ mod tests {
         // `/a/bcd` shares the `/a/b` string prefix without being inside it.
         let sibling = require_remote("sftp://u@h/a/bcd/x").unwrap();
         assert_eq!(relative_remote(&library.canonical, &sibling), "a/bcd/x");
-        let climbing = require_remote("sftp://u@h/a/b/../evil").unwrap();
-        let relative = relative_remote(&library.canonical, &climbing);
-        assert!(
-            relative.split(['/', '\\']).any(|part| part == ".."),
-            "{relative}"
-        );
+        // A `..` segment is refused at parse so it can never reach the
+        // relative/cache paths to climb.
+        assert!(require_remote("sftp://u@h/a/b/../evil").is_err());
+        // `.` and `//` collapse to one canonical spelling.
+        let dotted = require_remote("sftp://u@h/a/./b//c").unwrap();
+        assert_eq!(relative_remote(&library.canonical, &dotted), "c");
     }
     #[test]
     fn forgetting_a_library_drops_its_recorded_sessions() {

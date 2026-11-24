@@ -3462,10 +3462,18 @@ impl Plot {
             width as f32,
             height as f32,
         );
+        // Same contract as fill_quad_cpu: NaN-projected quads discard, and
+        // a degenerate quad produces no GPU fragments.
+        if !p0.iter().all(|v| v.is_finite()) || !p1.iter().all(|v| v.is_finite()) {
+            return;
+        }
         let left = p0[0].min(p1[0]);
         let right = p0[0].max(p1[0]);
         let top = p0[1].min(p1[1]);
         let bottom = p0[1].max(p1[1]);
+        if right == left || bottom == top {
+            return;
+        }
         let span_x = (right - left).max(1.0);
         let span_y = (bottom - top).max(1.0);
         let aspect = span_x / span_y;
@@ -3492,7 +3500,7 @@ impl Plot {
                     .max((x as f32 + 0.5) - right)
                     .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
                 let coverage = (0.5 - outside).clamp(0.0, 1.0);
-                if coverage <= 0.0 {
+                if !(coverage > 0.0) {
                     continue;
                 }
                 let u = ((x as f32 + 0.5 - left + 1.0) / (span_x + 2.0)).clamp(0.0, 1.0);
@@ -7975,6 +7983,14 @@ fn fill_quad_cpu(
     marks: &Marks,
     plot: PlotRect,
 ) {
+    // The GPU clip discards any primitive a NaN projects from — a NaN
+    // ordinate would cast to 0 and smear or erase across the scissor.
+    if !quad.a.iter().all(|v| v.is_finite())
+        || !quad.b.iter().all(|v| v.is_finite())
+        || quad.c.is_some_and(|c| !c.iter().all(|v| v.is_finite()))
+    {
+        return;
+    }
     if let Some(c) = quad.c {
         let p0 = project(
             *matrix,
@@ -8045,7 +8061,7 @@ fn fill_quad_cpu(
                 .max((x as f32 + 0.5) - right)
                 .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
             let coverage = (0.5 - outside).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
+            if !(coverage > 0.0) {
                 continue;
             }
             let mut color = if let Some(index) = quad.heatmap.filter(|_| quad.heat > 0.5) {
@@ -8186,7 +8202,7 @@ fn stroke_cpu(
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
             let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
             let coverage = pattern_coverage(dist, radius, phase + t * len, line.pattern);
-            if coverage <= 0.0 {
+            if !(coverage > 0.0) {
                 continue;
             }
             let mut ink = line.color;
@@ -8290,6 +8306,10 @@ fn disc_cpu(
     color: [f32; 4],
     plot: PlotRect,
 ) {
+    // A NaN center would cast to the origin — the GPU discards the point.
+    if !center.iter().all(|v| v.is_finite()) || !radius.is_finite() {
+        return;
+    }
     let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
     // A payload radius can exceed i64::MAX — a disc bigger than the canvas
     // covers it anyway, so clamp before the cast, not after.
@@ -8327,6 +8347,11 @@ fn disc_cpu(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], glyph: &GlyphRec) {
+    // A NaN anchor or uv floors to 0 and stamps the glyph at the corner —
+    // the GPU discards the vertex.
+    if !glyph.anchor.iter().all(|v| v.is_finite()) || !glyph.uv.iter().all(|v| v.is_finite()) {
+        return;
+    }
     let origin = if glyph.anchor[3] > 0.5 {
         project(
             *matrix,

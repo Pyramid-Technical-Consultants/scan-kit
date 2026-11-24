@@ -180,7 +180,16 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             });
             let position = text_tag(&elems, tag(0x0018, 0x5100));
             if !position.is_empty() {
-                ct_positions.entry(uid.clone()).or_insert(position);
+                if let Some(held) = ct_positions.get(&uid) {
+                    if held != &position {
+                        return Err(format!(
+                            "CT series {uid} mixes patient positions {held}/{position}"
+                        )
+                        .into());
+                    }
+                } else {
+                    ct_positions.insert(uid.clone(), position);
+                }
             }
             let (sops, bucket) = ct_by_series.entry(uid).or_default();
             sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
@@ -219,6 +228,11 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             if dose_type.is_empty() {
                 dose_type = text_tag(&elems, tag(0x3004, 0x0004));
                 summation = text_tag(&elems, tag(0x3004, 0x000A));
+            }
+            // A RELATIVE dose would read its scaled counts as absolute Gy.
+            let units = text_tag(&elems, tag(0x3004, 0x0002));
+            if !units.is_empty() && !units.eq_ignore_ascii_case("GY") {
+                return Err(format!("dose units {units} are not GY").into());
             }
             for slice in image_slices(&elems, scale)? {
                 dose_slices.push((frame.clone(), slice));
@@ -696,6 +710,10 @@ struct Slice {
 }
 
 fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
+    let photometric = text_tag(elems, tag(0x0028, 0x0004));
+    if !photometric.is_empty() && !photometric.eq_ignore_ascii_case("MONOCHROME2") {
+        return Err(format!("photometric interpretation {photometric} is not MONOCHROME2").into());
+    }
     // int_tag can text-parse a 2-byte US payload whose bytes spell an ASCII
     // number (e.g. value 12589 = "-1") — reject non-positive results rather
     // than casting them to usize::MAX.
@@ -800,6 +818,9 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             })
             .collect()
     };
+    if stored.iter().any(|value| !value.is_finite()) {
+        return Err("pixel data computes a non-finite value".into());
+    }
     if rows == 0 || cols == 0 {
         return Err("missing pixel dimensions".into());
     }
@@ -931,7 +952,7 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
     else {
         return Err("CT volume is too large".into());
     };
-    if voxels > (1 << 30) {
+    if voxels > (1 << 28) {
         return Err("CT volume exceeds the voxel bound".into());
     }
     let mut hu = vec![0.0; voxels];
@@ -1307,6 +1328,18 @@ fn read_structures(elems: &[Elem]) -> Result<Vec<Structure>, String> {
             if data.is_empty() && elem(item, tag(0x3006, 0x0050)).is_some() {
                 return Err("corrupt ContourData — one bad value drops the slice".into());
             }
+            // "nan"/"inf" parse as f32 — a non-finite vertex slips the
+            // min/max straddle check and silently miscounts crossings.
+            if data.iter().any(|value| !value.is_finite()) {
+                return Err("ContourData holds a non-finite coordinate".into());
+            }
+            if data.len() % 3 != 0 {
+                return Err("ContourData does not hold whole xyz triples".into());
+            }
+            let declared = int_tag(item, tag(0x3006, 0x0046));
+            if declared.is_some_and(|count| count >= 0 && count as usize != data.len() / 3) {
+                return Err("ContourData point count disagrees with NumberOfContourPoints".into());
+            }
             let plane: Vec<[f32; 3]> = data
                 .chunks(3)
                 .filter(|point| point.len() == 3)
@@ -1627,6 +1660,14 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
         } else {
             (Vec::new(), false)
         };
+        if elems
+            .iter()
+            .any(|held: &Elem| held.tag == tag(group, element))
+        {
+            return Err(format!(
+                "duplicate tag ({group:04X},{element:04X}) in one dataset"
+            ));
+        }
         elems.push(Elem {
             tag: tag(group, element),
             vr: if implicit { [0, 0] } else { vr },
@@ -1715,6 +1756,14 @@ fn seq(elems: &[Elem], tag: u32) -> &[Vec<Elem>] {
 }
 
 fn text_of(bytes: &[u8]) -> String {
+    // Interior control bytes (charset escapes, CSI, newlines) must not
+    // reach reports or JSON verbatim.
+    let bytes: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|byte| *byte >= 0x20 && *byte != 0x7F)
+        .collect();
+    let bytes = &bytes[..];
     String::from_utf8_lossy(bytes)
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_owned()
@@ -1854,6 +1903,9 @@ fn int_tag(elems: &[Elem], tag: u32) -> Option<i32> {
             elem.bytes[0],
             elem.bytes[1],
         ])));
+    }
+    if elem.bytes.len() == 4 && elem.bytes.contains(&0) && elem.vr == [0, 0] {
+        return Some(i32::from_le_bytes(elem.bytes[..4].try_into().ok()?));
     }
     let text = text_of(&elem.bytes);
     if let Ok(value) = text.parse::<i32>() {
@@ -2220,16 +2272,20 @@ pub fn write_rtdose(
     push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time))?;
     cs(&mut bytes, 0x0008, 0x0060, "RTDOSE")?;
     lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants")?;
-    // LO holds 64 characters; a byte slice would panic inside a multi-byte char.
-    let series_description: String = format!("{description} (research only)")
-        .chars()
-        .take(64)
-        .collect();
+    // LO/PN hold 64 bytes in the declared charset — take whole chars that fit.
+    let cap64 = |text: &str| -> String {
+        text.chars()
+            .scan(0usize, |used, ch| {
+                *used += ch.len_utf8();
+                (*used <= 64).then_some(ch)
+            })
+            .collect()
+    };
+    let series_description = cap64(&format!("{description} (research only)"));
     lo(&mut bytes, 0x0008, 0x103E, &series_description)?;
-    // PN/LO cap at 64 characters - a malformed source CT must not write an
-    // overlong value into the export.
-    let patient_name: String = ct.patient_name.chars().take(64).collect();
-    let patient_id: String = ct.patient_id.chars().take(64).collect();
+    // A malformed source CT must not write an overlong value into the export.
+    let patient_name = cap64(&ct.patient_name);
+    let patient_id = cap64(&ct.patient_id);
     pn(&mut bytes, 0x0010, 0x0010, &patient_name)?;
     lo(&mut bytes, 0x0010, 0x0020, &patient_id)?;
     ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]])?;
@@ -2942,8 +2998,8 @@ mod tests {
             series_uid: String::new(),
             sop_uids: Vec::new(),
         };
-        // "x" + 60 é's is 77 characters and puts a two-byte char across the
-        // old 64-byte cut.
+        // "x" + 60 é's is 77 characters; the LO cap is 64 bytes, so only
+        // whole chars that fit survive — x plus 31 two-byte é's.
         let description = format!("x{}", "é".repeat(60));
         let path = write_rtdose(
             &dir.join("dose.dcm"),
@@ -2958,7 +3014,8 @@ mod tests {
         .unwrap();
         let elems = parse_dataset(&fs::read(&path).unwrap()[132..]).unwrap();
         let written = text_tag(&elems, tag(0x0008, 0x103E));
-        assert_eq!(written.chars().count(), 64);
+        assert!(written.len() <= 64);
+        assert_eq!(written.chars().count(), 32);
         assert!(written.starts_with('x'));
         assert_eq!(int_tag(&elems, tag(0x0028, 0x0101)), Some(32));
         assert_eq!(int_tag(&elems, tag(0x0028, 0x0102)), Some(31));

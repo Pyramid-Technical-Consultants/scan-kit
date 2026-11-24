@@ -1209,7 +1209,7 @@ fn match_delivery(
                         (spot, (planned.x - mx).hypot(planned.y - my))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .unwrap();
+                    .expect("energy_layers only emits layers holding spots");
                 misses.push(near.1);
                 let planned = &beam.spots[near.0];
                 spots.push(MatchedSpot {

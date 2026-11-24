@@ -91,6 +91,12 @@ pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, 
             let view = text(input, "view")?;
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
+            // The volumetric branch renders anything it is handed — the
+            // sibling views cap selection at five via analysis_scene, so
+            // this stateless tool gets the same bound.
+            if session_ids.len() > 5 {
+                return Err("at most five sessions can be selected".into());
+            }
             let options = object_arg(input, "options")?;
             let width = dim(input, "width", 960)?;
             let height = dim(input, "height", 640)?;
@@ -125,8 +131,8 @@ pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, 
             options["dest"] = json!(text(input, "dest")?);
             if name == "scan_kit_write_dose" {
                 let description = match input.get("description") {
+                    None | Some(Value::Null) => "scan-kit MC",
                     Some(value) => value.as_str().ok_or("description must be a string")?,
-                    None => "scan-kit MC",
                 };
                 options["description"] = json!(description);
             }
