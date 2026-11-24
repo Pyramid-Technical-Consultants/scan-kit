@@ -228,17 +228,33 @@ export function LibraryTable({
   );
 
   const noteEdit = useRef<{ id: string; note: string; library: string } | null>(null);
+  // A committed note stays "after" until rows catch up with the write —
+  // a second edit opened in that window must not capture the stale cell
+  // as `before` (it would prefill the old text and corrupt the undo chain).
+  const pendingNotes = useRef(new Map<string, string>());
   const onCellActivated = useCallback(
     (cell: Item) => {
       const [col, rowIndex] = cell;
       const source = order[rowIndex];
       const row = source == null ? undefined : rows[source];
+      // rows caught up after a commit — drop entries the catalog reflects.
+      for (const [id, note] of pendingNotes.current) {
+        const current = rows.find((entry) => entry.session_id === id);
+        if (current == null || current.note === note) {
+          pendingNotes.current.delete(id);
+        }
+      }
       // Capture the session and its note when the editor opens — an
       // in-flight catalog refresh can move a different session into this
       // row before commit, and undo restores `before` verbatim.
+      const pending = row == null ? undefined : pendingNotes.current.get(row.session_id);
       noteEdit.current =
         clickEditsNote(col) && row != null
-          ? { id: row.session_id, note: row.note, library: row.library ?? folder ?? "" }
+          ? {
+              id: row.session_id,
+              note: pending ?? row.note,
+              library: row.library ?? folder ?? "",
+            }
           : null;
     },
     [folder, order, rows],
@@ -259,6 +275,7 @@ export function LibraryTable({
       const edit = noteEdit.current;
       const before = edit?.note ?? row.note;
       if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
+        pendingNotes.current.set(edit?.id ?? row.session_id, newValue.data);
         onCommitNote({
           sessionId: edit?.id ?? row.session_id,
           library: edit?.library ?? row.library ?? folder ?? "",

@@ -501,6 +501,10 @@ pub(super) fn lerp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
 
 /// Energy left and primary protons kept after `wet_mm` of water.
 pub fn through_wet(energy_mev: f64, wet_mm: f64) -> (f64, f64) {
+    // A negative thickness is "no absorber" like the MC path's clamp —
+    // unclamped it would *raise* the exit energy and multiply the kept
+    // primaries, a boosted dose instead of an attenuated one.
+    let wet_mm = wet_mm.max(0.0);
     let e = energy_mev.max(1.0);
     let r = csda_range_mm(WATER, e);
     let left = r - wet_mm;
@@ -525,6 +529,21 @@ pub fn protons_from_mu(mu: f64, energy: f64, gap_mm: f64, k_mu: f64) -> f64 {
 mod tests {
     use super::super::WATER;
     use super::{bragg_idd, build_kernel, csda_range_mm, mcs_along, mcs_at, protons_from_mu};
+
+    #[test]
+    fn a_negative_wet_is_no_absorber_not_a_boost() {
+        // Unclamped, wet < 0 makes `left` exceed the CSDA range — the exit
+        // energy rises and `kept` multiplies primaries past their incident
+        // count, a boosted dose. It must behave like no absorber at all.
+        let (e_out, kept) = super::through_wet(100.0, -50.0);
+        let (e_ref, kept_ref) = super::through_wet(100.0, 0.0);
+        assert_eq!(e_out, e_ref);
+        // Table inversion overshoots ~4e-5 MeV even at wet=0 — the clamped
+        // result must match that, not a 30 MeV boost.
+        assert!(e_out <= 100.001, "{e_out}");
+        assert!(kept <= 1.0, "{kept}");
+        assert_eq!(kept, kept_ref);
+    }
 
     #[test]
     fn protons_per_mu_follow_the_commissioned_beam_data() {

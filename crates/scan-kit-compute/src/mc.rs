@@ -370,6 +370,8 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
             && weight.is_finite()
             && x.is_finite()
             && y.is_finite()
+            && sx.is_finite()
+            && sy.is_finite()
             && energy > 0.0
             && weight > 0.0
         {
@@ -397,6 +399,16 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         }
         let last = spots.len() - 2;
         spots[last] = 1.0;
+    }
+    if !request.spread_pct.is_finite()
+        || !request.voxel_mm.is_finite()
+        || !request.depth_mm.is_finite()
+        || !request.wet_mm.is_finite()
+        || request.origin.iter().any(|v| !v.is_finite())
+    {
+        return Err(ComputeError::Message(
+            "slab scalars and origin must be finite".into(),
+        ));
     }
     let voxel = request.voxel_mm.max(0.25);
     let cm = voxel / 10.0;
@@ -433,6 +445,13 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     if request.material.iter().any(|&m| m as usize >= media) {
         return Err(ComputeError::Message("material index out of range".into()));
     }
+    if !request.spacing_mm.iter().all(|v| v.is_finite())
+        || !request.origin_mm.iter().all(|v| v.is_finite())
+    {
+        return Err(ComputeError::Message(
+            "grid origin and spacing must be finite".into(),
+        ));
+    }
     if request.density.iter().any(|d| !d.is_finite() || *d <= 0.0) {
         return Err(ComputeError::Message(
             "density must be finite and positive".into(),
@@ -448,7 +467,7 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             .as_chunks::<16>()
             .0
             .iter()
-            .any(|r| r[13] <= 0.0 || r[14] <= 0.0)
+            .any(|r| r[12] <= 0.0 || r[13] <= 0.0 || r[14] <= 0.0)
     {
         return Err(ComputeError::Message(
             "beams must be whole finite 16-float records".into(),
@@ -474,6 +493,11 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             if !record.iter().all(|value| value.is_finite()) {
                 return Err(ComputeError::Message(
                     "spot record holds a non-finite field".into(),
+                ));
+            }
+            if !(0.0..=1.0).contains(&record[4]) {
+                return Err(ComputeError::Message(
+                    "spot gaussian share outside 0..=1".into(),
                 ));
             }
             let beam = record[6];
@@ -675,18 +699,21 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     // so bound it here where the failure is a clean ComputeError.
     let limits = gpu.device.limits();
     let binding_cap = limits.max_storage_buffer_binding_size as usize;
+    // Storage buffers bind under min(binding, max_buffer_size) — an adapter
+    // may report either one smaller, and the LET buffer is nvox*16.
+    let buffer_cap = binding_cap.min(limits.max_buffer_size as usize);
     // The LET buffer binds nvox*16 but readback stages nvox*20+80 — both
     // caps bind the run, and max_buffer_size can sit near the binding limit.
     let staging = nvox.saturating_mul(20).saturating_add(80);
-    if nvox > binding_cap / 16 || staging > limits.max_buffer_size as usize {
+    if nvox > buffer_cap / 16 || staging > limits.max_buffer_size as usize {
         return Err(ComputeError::Message(format!(
             "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
         )));
     }
     // spots/beams bind whole — oversized ones hit create_bind_group
     // validation as a panic, same class as the nvox guard above.
-    if launch.spots.len().saturating_mul(4) > binding_cap
-        || launch.beams.len().saturating_mul(4) > binding_cap
+    if launch.spots.len().saturating_mul(4) > buffer_cap
+        || launch.beams.len().saturating_mul(4) > buffer_cap
     {
         return Err(ComputeError::Message(
             "job buffers exceed the GPU binding limit".into(),
@@ -1951,6 +1978,64 @@ mod tests {
         bad.spots[32] = 1.0;
         bad.spots[34] = 99.0;
         assert!(patient_launch(&bad).is_err());
+        // +inf survives .max() floors and NaN passes untouched — the grid
+        // scalars must be finite or the shader deposits indeterminate voxels.
+        let mut bad = request();
+        bad.spacing_mm[0] = f32::INFINITY;
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.origin_mm[1] = f32::NAN;
+        assert!(patient_launch(&bad).is_err());
+        // beams[12] is the nozzle distance — <= 0 is finite, wrong geometry.
+        let mut bad = request();
+        bad.beams[12] = -1.0;
+        assert!(patient_launch(&bad).is_err());
+        // spots[4] is the Gaussian mixture share — outside [0,1] the shader
+        // silently samples one tail forever.
+        let mut bad = request();
+        bad.spots[4] = 2.0;
+        assert!(patient_launch(&bad).is_err());
         assert!(patient_launch(&request()).is_ok());
+    }
+
+    #[test]
+    fn slab_launch_rejects_non_finite_scalars() {
+        // The .max() floors pass +inf through and origin goes unchecked.
+        for bad in [f32::INFINITY, f32::NAN] {
+            assert!(slab_launch(&SlabRequest {
+                spread_pct: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                voxel_mm: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                depth_mm: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                wet_mm: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                origin: [bad, 0.0, 0.0],
+                ..slab(1)
+            })
+            .is_err());
+        }
+        // A non-finite spot sigma drops the spot like a non-finite energy —
+        // with one spot the launch then has no protons, not an inf sigma.
+        let dropped = slab_launch(&SlabRequest {
+            sx: vec![f32::INFINITY],
+            ..slab(1)
+        })
+        .unwrap();
+        assert!(dropped.spots.is_empty());
+        assert!(slab_launch(&slab(1)).is_ok());
     }
 }

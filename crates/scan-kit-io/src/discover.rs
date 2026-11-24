@@ -58,6 +58,9 @@ pub(crate) fn discover(
     if crate::location::is_remote_location(&text) {
         return crate::location::discover_remote(&text, keep);
     }
+    if !keep(0, 0) {
+        return Err("cancelled".into());
+    }
     let mut entries = Vec::new();
     let mut skipped = Vec::new();
     let mut archives = Vec::new();
@@ -76,7 +79,7 @@ pub(crate) fn discover(
                 "",
             );
         }
-    } else if let Some(exam) = exam_in(root, &mut walk_failed) {
+    } else if let Some(exam) = exam_in(root, &mut walk_failed, keep) {
         add_exam(&mut exams, &mut skipped, exam, "");
     } else {
         walk_local(
@@ -203,8 +206,11 @@ fn walk_local(
         {
             continue;
         }
+        if !keep(0, 0) {
+            return Err("cancelled".into());
+        }
         let path = child.path();
-        if let Some(exam) = exam_in(&path, walk_failed) {
+        if let Some(exam) = exam_in(&path, walk_failed, keep) {
             add_exam(exams, skipped, exam, &relative(library, &path));
             continue;
         }
@@ -225,8 +231,14 @@ fn walk_local(
 
 /// True when an unpacked session lives anywhere below `dir` within the
 /// discovery depth — such a directory is a container, never an exam.
-fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
-    if depth >= crate::location::NEST_DEPTH {
+fn holds_session(
+    dir: &Path,
+    depth: u32,
+    walk_failed: &mut bool,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> bool {
+    // A cancelled probe answers false; the walk's next keep check aborts.
+    if depth >= crate::location::NEST_DEPTH || !keep(0, 0) {
         return false;
     }
     if is_unpacked_session(dir, walk_failed) {
@@ -248,7 +260,7 @@ fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
         };
         if kind.is_dir()
             && !kind.is_symlink()
-            && holds_session(&entry.path(), depth + 1, walk_failed)
+            && holds_session(&entry.path(), depth + 1, walk_failed, keep)
         {
             return true;
         }
@@ -256,10 +268,14 @@ fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
     false
 }
 
-fn exam_in(dir: &Path, walk_failed: &mut bool) -> Option<ExamHit> {
+fn exam_in(
+    dir: &Path,
+    walk_failed: &mut bool,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Option<ExamHit> {
     // A stray .dcm beside session folders does not make this an exam — the
     // walk must keep descending or the nested sessions disappear.
-    if holds_session(dir, 0, walk_failed) {
+    if holds_session(dir, 0, walk_failed, keep) || !keep(0, 0) {
         return None;
     }
     let folder_name = file_name(dir)?;

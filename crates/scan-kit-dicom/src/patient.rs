@@ -509,7 +509,10 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     let frame = "1.2.3.4.5";
     for (index, z) in [0.0f32, 1.0].into_iter().enumerate() {
         let mut bytes = preamble();
+        let sop = uid();
+        file_meta(&mut bytes, "1.2.840.10008.5.1.4.1.1.2", &sop)?;
         ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2")?;
+        ui(&mut bytes, 0x0008, 0x0018, &sop)?;
         cs(&mut bytes, 0x0008, 0x0060, "CT")?;
         ui(&mut bytes, 0x0020, 0x000D, "1.2.3")?;
         ui(&mut bytes, 0x0020, 0x000E, "1.2.3.1")?;
@@ -522,10 +525,14 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         ds(&mut bytes, 0x0028, 0x1052, &[0.0])?;
         ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
         ow(&mut bytes, 0x7FE0, 0x0010, &[0u16; 16])?;
-        fs::write(dir.join(format!("ct{index}.dcm")), bytes).map_err(|err| err.to_string())?;
+        scan_kit_core::atomic_write(&dir.join(format!("ct{index}.dcm")), &bytes)
+            .map_err(|err| err.to_string())?;
     }
     let mut plan = preamble();
-    ui(&mut plan, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8")?;
+    let plan_sop = uid();
+    file_meta(&mut plan, RT_ION_PLAN_CLASS, &plan_sop)?;
+    ui(&mut plan, 0x0008, 0x0016, RT_ION_PLAN_CLASS)?;
+    ui(&mut plan, 0x0008, 0x0018, &plan_sop)?;
     cs(&mut plan, 0x0008, 0x0060, "RTPLAN")?;
     ui(&mut plan, 0x0020, 0x0052, frame)?;
     let setup = {
@@ -550,6 +557,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     sq(&mut plan, 0x300A, 0x0180, &[setup])?;
     let control = {
         let mut item = Vec::new();
+        is(&mut item, 0x300A, 0x0112, 1)?;
         ds(&mut item, 0x300A, 0x0114, &[100.0])?;
         ds(&mut item, 0x300A, 0x011E, &[0.0])?;
         ds(&mut item, 0x300A, 0x0122, &[0.0])?;
@@ -571,7 +579,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         item
     };
     sq(&mut plan, 0x300A, 0x03A2, &[beam])?;
-    fs::write(dir.join("plan.dcm"), plan).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(&dir.join("plan.dcm"), &plan).map_err(|err| err.to_string())?;
     let roi = {
         let mut item = Vec::new();
         is(&mut item, 0x3006, 0x0022, 1)?;
@@ -596,12 +604,19 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         item
     };
     let mut structures = preamble();
+    let struct_sop = uid();
+    file_meta(
+        &mut structures,
+        "1.2.840.10008.5.1.4.1.1.481.3",
+        &struct_sop,
+    )?;
     ui(
         &mut structures,
         0x0008,
         0x0016,
         "1.2.840.10008.5.1.4.1.1.481.3",
     )?;
+    ui(&mut structures, 0x0008, 0x0018, &struct_sop)?;
     ui(&mut structures, 0x0020, 0x0052, frame)?;
     let observation = {
         let mut item = Vec::new();
@@ -614,9 +629,13 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     // RT ROI Observations is Type 1 — without it the set has contours but
     // no interpreted semantics.
     sq(&mut structures, 0x3006, 0x0080, &[observation])?;
-    fs::write(dir.join("struct.dcm"), structures).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(&dir.join("struct.dcm"), &structures)
+        .map_err(|err| err.to_string())?;
     let mut dose = preamble();
-    ui(&mut dose, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2")?;
+    let dose_sop = uid();
+    file_meta(&mut dose, RT_DOSE_CLASS, &dose_sop)?;
+    ui(&mut dose, 0x0008, 0x0016, RT_DOSE_CLASS)?;
+    ui(&mut dose, 0x0008, 0x0018, &dose_sop)?;
     cs(&mut dose, 0x0008, 0x0060, "RTDOSE")?;
     ui(&mut dose, 0x0020, 0x0052, frame)?;
     ds(&mut dose, 0x0020, 0x0032, &[0.0, 0.0, 0.0])?;
@@ -627,7 +646,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     ds(&mut dose, 0x3004, 0x000C, &[0.0, 1.0])?;
     ds(&mut dose, 0x3004, 0x000E, &[0.01])?;
     ow(&mut dose, 0x7FE0, 0x0010, &[100u16; 32])?;
-    fs::write(dir.join("dose.dcm"), dose).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(&dir.join("dose.dcm"), &dose).map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -1852,19 +1871,6 @@ pub(crate) fn fl(
     push_elem(bytes, group, element, b"FL", &raw)
 }
 
-pub(crate) fn fd(
-    bytes: &mut Vec<u8>,
-    group: u16,
-    element: u16,
-    values: &[f64],
-) -> Result<(), String> {
-    let mut raw = Vec::with_capacity(values.len() * 8);
-    for value in values {
-        raw.extend_from_slice(&value.to_le_bytes());
-    }
-    push_elem(bytes, group, element, b"FD", &raw)
-}
-
 pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) -> Result<(), String> {
     push_elem(bytes, group, element, b"IS", &even(&value.to_string()))
 }
@@ -1910,10 +1916,33 @@ pub(crate) fn sq(
     for item in items {
         body.extend_from_slice(&0xFFFEu16.to_le_bytes());
         body.extend_from_slice(&0xE000u16.to_le_bytes());
-        body.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        body.extend_from_slice(
+            &u32::try_from(item.len())
+                .map_err(|_| "a sequence item exceeds the 4 GiB length limit".to_owned())?
+                .to_le_bytes(),
+        );
         body.extend_from_slice(item);
     }
     push_elem(bytes, group, element, b"SQ", &body)
+}
+
+/// Group-0002 File Meta Information — always explicit VR LE, required for a
+/// conformant Part-10 file. `bytes` must hold exactly the 132-byte preamble.
+pub(crate) fn file_meta(
+    bytes: &mut Vec<u8>,
+    sop_class: &str,
+    sop_instance: &str,
+) -> Result<(), String> {
+    let mut meta = Vec::new();
+    ob(&mut meta, 0x0002, 0x0001, &[0, 1])?;
+    ui(&mut meta, 0x0002, 0x0002, sop_class)?;
+    ui(&mut meta, 0x0002, 0x0003, sop_instance)?;
+    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE)?;
+    ui(&mut meta, 0x0002, 0x0012, IMPL_UID)?;
+    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT")?;
+    ul(bytes, 0x0002, 0x0000, meta.len() as u32)?;
+    bytes.extend_from_slice(&meta);
+    Ok(())
 }
 
 fn ul(bytes: &mut Vec<u8>, group: u16, element: u16, value: u32) -> Result<(), String> {
@@ -2056,27 +2085,28 @@ pub fn write_rtdose(
         // silently all-zero — degenerate input, not data to encode.
         return Err("the dose peak is outside the encodable range".into());
     }
-    let pixels: Vec<u32> = dose
+    let pixels: Result<Vec<u32>, String> = dose
         .iter()
         .map(|&v| {
             let value = if v.is_nan() { 0.0 } else { v as f64 };
-            (value.max(0.0) / scale).round_ties_even() as u32
+            // Dose is a sum of non-negative contributions — a negative
+            // voxel is corrupt input, not something to floor to zero.
+            if value < 0.0 {
+                return Err("the dose contains a negative value".to_owned());
+            }
+            Ok((value / scale).round_ties_even() as u32)
         })
         .collect();
+    let pixels = pixels?;
     let sop_uid = uid();
     let (date, time) = stamp();
 
     let mut bytes = preamble();
-    let mut meta = Vec::new();
-    ob(&mut meta, 0x0002, 0x0001, &[0, 1])?;
-    ui(&mut meta, 0x0002, 0x0002, RT_DOSE_CLASS)?;
-    ui(&mut meta, 0x0002, 0x0003, &sop_uid)?;
-    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE)?;
-    ui(&mut meta, 0x0002, 0x0012, IMPL_UID)?;
-    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT")?;
-    ul(&mut bytes, 0x0002, 0x0000, meta.len() as u32)?;
-    bytes.extend_from_slice(&meta);
+    file_meta(&mut bytes, RT_DOSE_CLASS, &sop_uid)?;
 
+    // Patient names and ids arrive as UTF-8 from the source CT — declare the
+    // repertoire or a non-ASCII name writes undecodable bytes.
+    cs(&mut bytes, 0x0008, 0x0005, "ISO_IR 192")?;
     push_elem(&mut bytes, 0x0008, 0x0012, b"DA", &even(&date))?;
     push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time))?;
     ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS)?;
@@ -2638,6 +2668,77 @@ mod tests {
             "HFS"
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_negative_dose_is_an_error_not_a_silent_floor() {
+        // Dose is a sum of non-negative contributions — flooring a negative
+        // would hide upstream corruption.
+        let dir = std::env::temp_dir().join(format!("scan-kit-negdose-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "1.2.3".into(),
+            origin: [0.0, 0.0, 0.0],
+            spacing: [1.0, 1.0, 1.0],
+            shape: [2, 2, 2],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            patient_id: "P1".into(),
+            patient_name: "A^B".into(),
+            study_uid: "1.2.3".into(),
+            series_uid: "1.2.3.1".into(),
+            sop_uids: vec!["1.2.3.1.1".into()],
+        };
+        let mut dose = vec![1.0f32; 8];
+        dose[3] = -0.5;
+        let err = write_rtdose(
+            &dir.join("dose.dcm"),
+            &dose,
+            &ct,
+            "9.8",
+            "FRACTION",
+            "PHYSICAL",
+            "t",
+            "{}",
+        )
+        .unwrap_err();
+        assert!(err.contains("negative"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_water_study_stamps_file_meta_and_a_control_point_index() {
+        let root = std::env::temp_dir().join(format!("scan-kit-wmeta-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write_water_study(&root).unwrap();
+        for name in ["ct0.dcm", "ct1.dcm", "plan.dcm", "struct.dcm", "dose.dcm"] {
+            let bytes = fs::read(root.join(name)).unwrap();
+            assert!(
+                crate::meta_sop_class(&bytes).is_some(),
+                "{name} missing meta"
+            );
+        }
+        let bytes = fs::read(root.join("plan.dcm")).unwrap();
+        assert_eq!(
+            crate::meta_sop_class(&bytes).as_deref(),
+            Some(RT_ION_PLAN_CLASS)
+        );
+        let elems = parse_file(&bytes).unwrap();
+        let beams = seq(&elems, tag(0x300A, 0x03A2));
+        let control = seq(&beams[0], tag(0x300A, 0x03A8));
+        assert!(!control.is_empty());
+        for item in control {
+            // Control Point Index is Type 1 on every item.
+            assert!(elem(item, tag(0x300A, 0x0112)).is_some());
+            let tags: Vec<u32> = item.iter().map(|entry| entry.tag).collect();
+            let mut sorted = tags.clone();
+            sorted.sort();
+            assert_eq!(tags, sorted, "control point tags out of order");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

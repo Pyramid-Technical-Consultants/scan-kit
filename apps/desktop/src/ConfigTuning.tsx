@@ -195,6 +195,13 @@ export function ConfigTuning({
     () => selectedIds.filter((id) => !excluded.includes(id)),
     [excluded, selectedIds],
   );
+  // An exclusion of a no-longer-selected session must not linger — the view
+  // is kept mounted, so a re-selected id would arrive still excluded.
+  const [prevSelectedIds, setPrevSelectedIds] = useState(selectedIds);
+  if (prevSelectedIds !== selectedIds) {
+    setPrevSelectedIds(selectedIds);
+    setExcluded((current) => current.filter((id) => selectedIds.includes(id)));
+  }
   // Only the anchor decides which config opens — the array identity
   // changes on every exclusion click and would re-fire the open.
   const anchorId = sessionIds[0] ?? "";

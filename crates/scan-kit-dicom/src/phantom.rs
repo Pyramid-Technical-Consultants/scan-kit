@@ -124,6 +124,7 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
         }
         let sop = uid();
         let mut bytes = patient::preamble();
+        patient::file_meta(&mut bytes, CT, &sop)?;
         patient::ui(&mut bytes, 0x0008, 0x0016, CT)?;
         patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
         patient::cs(&mut bytes, 0x0008, 0x0060, "CT")?;
@@ -160,7 +161,7 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
         patient::ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
         patient::ow(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
         let name = format!("CT_{}.dcm", &sop[sop.len().saturating_sub(12)..]);
-        fs::write(dir.join(name), bytes).map_err(|err| err.to_string())?;
+        scan_kit_core::atomic_write(&dir.join(name), &bytes).map_err(|err| err.to_string())?;
     }
     write_struct(dir, &request, &study, &frame, &ct_series)?;
     write_plan(dir, &request, &study, &frame)?;
@@ -254,8 +255,10 @@ fn write_struct(
         )?;
     }
     let mut bytes = patient::preamble();
+    let sop = uid();
+    patient::file_meta(&mut bytes, RT_STRUCT, &sop)?;
     patient::ui(&mut bytes, 0x0008, 0x0016, RT_STRUCT)?;
-    patient::ui(&mut bytes, 0x0008, 0x0018, &uid())?;
+    patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
     patient::cs(&mut bytes, 0x0008, 0x0060, "RTSTRUCT")?;
     patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
     patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
@@ -269,7 +272,8 @@ fn write_struct(
     patient::sq(&mut bytes, 0x3006, 0x0039, &contours)?;
     // RT ROI Observations is Type 1 — required for a readable structure set.
     patient::sq(&mut bytes, 0x3006, 0x0080, &observations)?;
-    fs::write(dir.join("RS_synthetic.dcm"), bytes).map_err(|err| err.to_string())
+    scan_kit_core::atomic_write(&dir.join("RS_synthetic.dcm"), &bytes)
+        .map_err(|err| err.to_string())
 }
 
 fn referenced_frame(frame: &str, study: &str, ct_series: &str) -> Result<Vec<u8>, String> {
@@ -331,8 +335,10 @@ fn push_roi(
 
 fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result<(), String> {
     let mut bytes = patient::preamble();
+    let sop = uid();
+    patient::file_meta(&mut bytes, RT_PLAN, &sop)?;
     patient::ui(&mut bytes, 0x0008, 0x0016, RT_PLAN)?;
-    patient::ui(&mut bytes, 0x0008, 0x0018, &uid())?;
+    patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
     patient::cs(&mut bytes, 0x0008, 0x0060, "RTPLAN")?;
     patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
     patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
@@ -380,6 +386,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     for energy in &request.energies {
         for last in [false, true] {
             let mut cp = Vec::new();
+            patient::is(&mut cp, 0x300A, 0x0112, cps.len() as i32 + 1)?;
             patient::ds(&mut cp, 0x300A, 0x0114, &[*energy as f32])?;
             if first {
                 patient::ds(&mut cp, 0x300A, 0x011E, &[request.gantry as f32])?;
@@ -390,7 +397,6 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     0x012C,
                     &[0.0, ((PTV.y0 + PTV.y1) / 2.0) as f32, 0.0],
                 )?;
-                patient::is(&mut cp, 0x300A, 0x0112, cps.len() as i32 + 1)?;
                 patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
                 patient::fl(&mut cp, 0x300A, 0x030D, &[300.0])?;
                 if request.wet > 0.0 {
@@ -432,7 +438,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
         patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
-        patient::fd(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
+        patient::fl(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
         // Number of Range Shifters is Type 1 — a no-shifter plan still
         // writes it.
         patient::is(&mut item, 0x300A, 0x0312, i32::from(request.wet > 0.0))?;
@@ -448,7 +454,8 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         item
     };
     patient::sq(&mut bytes, 0x300A, 0x03A2, &[beam])?;
-    fs::write(dir.join("RP_synthetic.dcm"), bytes).map_err(|err| err.to_string())
+    scan_kit_core::atomic_write(&dir.join("RP_synthetic.dcm"), &bytes)
+        .map_err(|err| err.to_string())
 }
 
 /// Column sign, then row sign, for the four axial patient positions.
@@ -797,6 +804,22 @@ mod tests {
         )
         .unwrap();
         assert!(note.contains("35 CT slices"));
+        // Every emitted file is a conformant Part-10 file: preamble, then
+        // the group-0002 meta block.
+        for name in ["RS_synthetic.dcm", "RP_synthetic.dcm"] {
+            let bytes = fs::read(dir.join(name)).unwrap();
+            assert!(
+                crate::meta_sop_class(&bytes).is_some(),
+                "{name} missing file meta"
+            );
+        }
+        // Control Point Index is Type 1 on every item — 3 energies x 2 items.
+        let plan = fs::read(dir.join("RP_synthetic.dcm")).unwrap();
+        let index_tags = plan
+            .windows(4)
+            .filter(|window| *window == [0x0A, 0x30, 0x12, 0x01])
+            .count();
+        assert_eq!(index_tags, 6);
         let study = load_study(&dir).unwrap();
         assert_eq!(study.fractions, 3);
         assert_eq!(study.ct.shape, [40, 40, 35]);

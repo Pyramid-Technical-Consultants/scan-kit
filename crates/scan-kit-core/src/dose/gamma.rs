@@ -432,8 +432,12 @@ pub(super) fn gamma_offsets(
             shape[axis] as f64
         };
         // The +1 must not wrap the clamp's upper bound below its lower bound.
+        // An unclamped dta at tiny spacing would balloon the offset list
+        // into a multi-GB allocation — 64 steps per axis bounds the worst
+        // case near 34 MB and the far offsets die first.
         let n = ((reach as f64 / step as f64).ceil() as i64)
-            .clamp(0, (limit.ceil() as i64).saturating_add(1));
+            .clamp(0, (limit.ceil() as i64).saturating_add(1))
+            .min(64);
         let mut axis = Vec::new();
         for i in -n..=n {
             axis.push(i as f32 * step);
@@ -467,9 +471,9 @@ pub(super) fn sample_linear(vol: &[f32], shape: [usize; 3], x: f32, y: f32, z: f
     for dz in 0..2 {
         for dy in 0..2 {
             for dx in 0..2 {
-                let xx = x0 + dx;
-                let yy = y0 + dy;
-                let zz = z0 + dz;
+                let xx = x0.saturating_add(dx);
+                let yy = y0.saturating_add(dy);
+                let zz = z0.saturating_add(dz);
                 let value = if xx < 0
                     || yy < 0
                     || zz < 0
@@ -623,6 +627,14 @@ mod tests {
             assert!(gamma_offsets([1.0; 3], dta, 2.0, [10, 10, 10]).is_empty());
         }
         assert!(gamma_offsets([0.0; 3], 2.0, 2.0, [10, 10, 10]).is_empty());
+    }
+
+    #[test]
+    fn a_huge_dta_bounds_the_offset_list() {
+        // 512^3 at 1 mm with a 500 mm reach would enumerate ~10^9
+        // candidates without the per-axis step bound.
+        let offsets = gamma_offsets([1.0; 3], 500.0, 2.0, [512, 512, 512]);
+        assert!(offsets.len() <= (2usize * 64 + 1).pow(3));
     }
 
     #[test]

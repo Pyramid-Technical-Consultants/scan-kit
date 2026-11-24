@@ -65,10 +65,13 @@ export function ExamTable({
     return indexes;
   }, [rows, sort]);
   // Positional selection is meaningless across a display-order change — a
-  // re-sort permutes order without touching rows, like LibraryTable.
-  const [prevOrder, setPrevOrder] = useState(order);
-  if (prevOrder !== order) {
-    setPrevOrder(order);
+  // re-sort permutes order without touching rows, like LibraryTable. Compare
+  // the ordered keys, not the array: a catalog refresh rebuilds rows with a
+  // new identity every pull and must not wipe a still-valid highlight.
+  const orderKey = order.map((index) => rows[index]?.exam ?? "").join("\0");
+  const [prevOrderKey, setPrevOrderKey] = useState(orderKey);
+  if (prevOrderKey !== orderKey) {
+    setPrevOrderKey(orderKey);
     setGridSelection(emptyGridSelection);
   }
   const baseColumns: GridColumn[] = COLUMNS.map((column, index) => ({

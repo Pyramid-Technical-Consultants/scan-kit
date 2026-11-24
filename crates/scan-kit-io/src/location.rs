@@ -172,7 +172,7 @@ pub(crate) fn discover_remote(
             },
             root_name,
         );
-    } else if let Some(exam) = remote_exam(&mut *fs, &remote.path, root_name, canonical)? {
+    } else if let Some(exam) = remote_exam(&mut *fs, &remote.path, root_name, canonical, keep)? {
         discover::add_exam(&mut exams, &mut skipped, exam, root_name);
     } else {
         walk_remote(
@@ -243,8 +243,15 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
     let mut dir_stat = None;
     for path in candidates {
         // A miss on one candidate must not end the search — the nested
-        // session layout stores the marker under {base}/{id}/{id}/.
-        let Ok(Some(stat)) = fs.stat(&path) else {
+        // session layout stores the marker under {base}/{id}/{id}/. An
+        // Err is not a miss either: remote_stamp aborts on the same
+        // failure, so skipping here would fingerprint a different marker
+        // than the copy validates (and None already reads as "retry").
+        let stat = match fs.stat(&path) {
+            Ok(stat) => stat,
+            Err(_) => return None,
+        };
+        let Some(stat) = stat else {
             continue;
         };
         if archive_name(&remote.path) || !stat.dir {
@@ -319,9 +326,14 @@ pub(crate) fn replace_catalog(entries: &[(String, String, String, String)]) {
     }
 }
 
-pub(crate) fn replace_sessions(library: &str, places: &[(String, String)]) {
+/// `complete` is false on a partial walk — replacing then would drop the
+/// bindings of every session under an unlistable directory, the same blind
+/// delete delete_missing is guarded against.
+pub(crate) fn replace_sessions(library: &str, places: &[(String, String)], complete: bool) {
     let mut map = sessions().lock().unwrap_or_else(|err| err.into_inner());
-    map.retain(|(root, _), _| root != library);
+    if complete {
+        map.retain(|(root, _), _| root != library);
+    }
     for (session_id, place) in places {
         map.insert((library.to_owned(), session_id.clone()), place.clone());
     }
@@ -544,7 +556,7 @@ fn walk_remote(
     // walk — skip it instead of failing the whole discovery.
     let items = match fs.list(path) {
         Ok(items) => items,
-        Err(err) if depth == 0 => return Err(err),
+        Err(err) if depth == 0 => return Err(format!("cannot list {path}: {err}")),
         Err(_) => {
             *walk_failed = true;
             skipped.push(rel.to_owned());
@@ -618,10 +630,13 @@ fn walk_remote(
         if skipped.contains(&join_rel(rel, name)) {
             continue;
         }
+        if !keep(0, 0) {
+            return Err("cancelled".into());
+        }
         let child = join_path(path, name);
         let child_rel = join_rel(rel, name);
         let url = join_rel(library_url, &encode_path(&child_rel));
-        match remote_exam(fs, &child, name, &url) {
+        match remote_exam(fs, &child, name, &url, keep) {
             Ok(Some(exam)) => {
                 discover::add_exam(exams, skipped, exam, &child_rel);
                 continue;
@@ -655,6 +670,7 @@ fn remote_exam(
     path: &str,
     folder_name: &str,
     storage_url: &str,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<Option<discover::ExamHit>, String> {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -690,9 +706,12 @@ fn remote_exam(
     // walk must keep descending or the nested sessions disappear.
     for name in &dirs {
         let child = join_path(path, name);
-        if remote_holds_session(fs, &child, 0)? {
+        if remote_holds_session(fs, &child, 0, keep)? {
             return Ok(None);
         }
+    }
+    if !keep(0, 0) {
+        return Err("cancelled".into());
     }
     // An unreadable sample is no exam at all - fabricating one from empty
     // bytes writes a phantom record with the folder name as its uid.
@@ -733,9 +752,13 @@ fn remote_holds_session(
     fs: &mut dyn crate::remote::Fs,
     path: &str,
     depth: u32,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<bool, String> {
     if depth >= NEST_DEPTH {
         return Ok(false);
+    }
+    if !keep(0, 0) {
+        return Err("cancelled".into());
     }
     if is_file(fs, &join_path(path, "input_map.csv"))? {
         return Ok(true);
@@ -748,7 +771,7 @@ fn remote_holds_session(
             && !item.name.contains(['/', '\\'])
         {
             let child = join_path(path, &item.name);
-            if remote_holds_session(fs, &child, depth + 1)? {
+            if remote_holds_session(fs, &child, depth + 1, keep)? {
                 return Ok(true);
             }
         }
@@ -1506,22 +1529,30 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     for base in &bases {
         for name in &names {
             let path = base.join(name);
+            // is_dir()/is_file() answer false on ANY metadata error — a
+            // denied stat would shrink the delete list so the row goes while
+            // the storage stays. Only NotFound is absence; the rest aborts.
+            let kind = match path.symlink_metadata() {
+                Ok(meta) => Some(meta.is_dir()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(format!("cannot stat {}: {err}", path.display())),
+            };
             let hit = if *name == session_id {
                 // A stray file carrying the id is not the session folder.
-                path.is_dir()
+                kind == Some(true)
             } else if name.ends_with(".zip") {
                 // A readable zip's identity is the folder it wraps — one
                 // wrapping another session is not this session's storage,
                 // and trashing must not destroy it. An unreadable file
                 // carries no wrapped id to contradict its name.
-                path.is_file()
+                kind == Some(false)
                     && match discover::archive_identity(&path) {
                         Some((id, _)) => id == session_id,
                         None => true,
                     }
             } else {
                 // Tars cannot peek cheaply — their filename stem IS the id.
-                path.is_file()
+                kind == Some(false)
             };
             let place = path.to_string_lossy().into_owned();
             if hit && !found.contains(&place) {
@@ -1924,10 +1955,29 @@ mod tests {
     }
     #[test]
     fn forgetting_a_library_drops_its_recorded_sessions() {
-        replace_sessions("a-test-lib", &[("sess".to_owned(), "place".to_owned())]);
+        replace_sessions(
+            "a-test-lib",
+            &[("sess".to_owned(), "place".to_owned())],
+            true,
+        );
         assert!(recorded("a-test-lib", "sess").is_some());
         drop_sessions("a-test-lib");
         assert!(recorded("a-test-lib", "sess").is_none());
+    }
+
+    #[test]
+    fn a_partial_scan_merges_instead_of_wiping_unseen_sessions() {
+        // A walk that aborted mid-listing must not make every unvisited
+        // session look deleted — the binding map merges, never replaces.
+        let lib = "partial-scan-lib";
+        replace_sessions(lib, &[("a".to_owned(), "p1".to_owned())], true);
+        replace_sessions(lib, &[("b".to_owned(), "p2".to_owned())], false);
+        assert!(recorded(lib, "a").is_some());
+        assert!(recorded(lib, "b").is_some());
+        // A complete scan still drops the rows it no longer sees.
+        replace_sessions(lib, &[("b".to_owned(), "p2".to_owned())], true);
+        assert!(recorded(lib, "a").is_none());
+        drop_sessions(lib);
     }
 
     #[test]

@@ -993,7 +993,7 @@ pub fn index_library(
     // Refresh the recorded bindings now, not only after the hydrate loop -
     // a cancel or error below used to leave new storage_paths committed
     // while the in-memory maps still resolved the old locations.
-    location::replace_sessions(&root, &places);
+    location::replace_sessions(&root, &places, !walk_failed);
     store::locked(|| publish_catalog(conn))?;
     if !keep(0, total, None) {
         return Err("cancelled".into());

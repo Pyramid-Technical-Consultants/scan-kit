@@ -313,6 +313,7 @@ mod net {
     use std::net::ToSocketAddrs;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use super::{copy_file_to, Fs, Item, Stat, COPY_DEPTH};
     use crate::location::{self, Remote, Scheme};
@@ -320,6 +321,40 @@ mod net {
     /// A session archive is at most gigabytes. Anything bigger is a hostile
     /// server trying to exhaust memory, not a session.
     const MAX_OBJECT_BYTES: u64 = 4 << 30;
+
+    /// The LIST data channel is not the object body — a server streaming an
+    /// endless listing grows line buffers with no per-read trip. Same
+    /// hostile-server class as MAX_OBJECT_BYTES.
+    const MAX_LIST_BYTES: u64 = 64 << 20;
+    /// Entries in one remote directory.
+    const MAX_LIST_ENTRIES: usize = 100_000;
+    /// stat() falls back to a parent listing when MLST fails; a server
+    /// without MLST recurses once per path component — a deep path is a
+    /// stack overflow, not an error.
+    const STAT_DEPTH: u32 = 32;
+    /// A stall timeout bounds each read syscall, but a peer trickling one
+    /// byte per window still pins the transfer — and the process-global
+    /// copy lock behind it — forever.
+    /// ponytail: generous ceiling; the biggest allowed copy fits it at
+    /// ~2.4 MB/s, and real stalls still fail on the per-read timeout.
+    const TRANSFER_BUDGET: Duration = Duration::from_secs(30 * 60);
+
+    struct DeadlineRead<'a> {
+        inner: &'a mut dyn Read,
+        deadline: Instant,
+    }
+
+    impl Read for DeadlineRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "transfer deadline exceeded",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
 
     pub(super) fn connect(remote: &Remote, password: &str) -> Result<Box<dyn Fs>, String> {
         match remote.scheme {
@@ -436,10 +471,16 @@ mod net {
         let sftp = fs.sftp()?;
         match sftp.open(Path::new(path)) {
             Ok(mut file) => {
+                let deadline = Instant::now() + TRANSFER_BUDGET;
                 if let Some(max) = max {
                     let mut bytes = vec![0u8; max];
                     let mut filled = 0;
                     while filled < max {
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "{path} did not finish within the transfer budget"
+                            ));
+                        }
                         match file.read(&mut bytes[filled..]) {
                             Ok(0) => break,
                             Ok(n) => filled += n,
@@ -450,9 +491,13 @@ mod net {
                     return Ok(Some(bytes));
                 }
                 let mut bytes = Vec::new();
-                file.take(MAX_OBJECT_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|err| err.to_string())?;
+                let mut capped = file.take(MAX_OBJECT_BYTES + 1);
+                DeadlineRead {
+                    inner: &mut capped,
+                    deadline,
+                }
+                .read_to_end(&mut bytes)
+                .map_err(|err| err.to_string())?;
                 if bytes.len() as u64 > MAX_OBJECT_BYTES {
                     return Err(format!("{path} is bigger than {MAX_OBJECT_BYTES} bytes"));
                 }
@@ -467,6 +512,12 @@ mod net {
         fn list(&mut self, path: &str) -> Result<Vec<Item>, String> {
             let sftp = self.sftp()?;
             let entries = sftp.readdir(Path::new(path)).map_err(map_sftp)?;
+            if entries.len() > MAX_LIST_ENTRIES {
+                return Err(format!(
+                    "{path} lists {} entries - more than {MAX_LIST_ENTRIES}",
+                    entries.len()
+                ));
+            }
             let mut items = Vec::new();
             for (entry, stat) in entries {
                 if stat.file_type().is_symlink() {
@@ -568,8 +619,9 @@ mod net {
                 "remote tree deeper than {COPY_DEPTH} levels: {path}"
             ));
         }
+        let items = fs.list(path)?;
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
-        for item in fs.list(path)? {
+        for item in items {
             // A remote name is one entry on the server but can hold
             // characters that are path separators locally — `..\x` is a
             // legal unix filename and a traversal on Windows.
@@ -615,6 +667,7 @@ mod net {
 
     struct FtpFs {
         client: FtpClient,
+        probe_depth: u32,
     }
 
     enum FtpClient {
@@ -676,7 +729,10 @@ mod net {
                     .map_err(map_ftp)?;
                 FtpClient::Plain(stream)
             };
-            Ok(Self { client })
+            Ok(Self {
+                client,
+                probe_depth: 0,
+            })
         }
     }
 
@@ -698,9 +754,11 @@ mod net {
 
     impl Fs for FtpFs {
         fn list(&mut self, path: &str) -> Result<Vec<Item>, String> {
+            // ftp.list() streams the data channel uncapped — a peer feeding
+            // an endless LIST exhausts memory like an uncapped body.
             let lines = match &mut self.client {
-                FtpClient::Plain(ftp) => ftp.list(Some(path)),
-                FtpClient::Tls(ftp) => ftp.list(Some(path)),
+                FtpClient::Plain(ftp) => list_bounded(ftp, path),
+                FtpClient::Tls(ftp) => list_bounded(ftp, path),
             }
             .map_err(map_ftp)?;
             let mut items = Vec::new();
@@ -760,11 +818,15 @@ mod net {
 
         fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
             let mut bytes = Vec::new();
+            let deadline = Instant::now() + TRANSFER_BUDGET;
             let mut read_all = |reader: &mut dyn Read| {
-                reader
-                    .take(MAX_OBJECT_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(suppaftp::FtpError::ConnectionError)
+                DeadlineRead {
+                    inner: reader,
+                    deadline,
+                }
+                .take(MAX_OBJECT_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(suppaftp::FtpError::ConnectionError)
             };
             // retr reads the stream and finishes the transfer in one call,
             // reporting the reader's error before the finalize's.
@@ -784,11 +846,15 @@ mod net {
         }
 
         fn stat(&mut self, path: &str) -> Result<Option<Stat>, String> {
+            if self.probe_depth >= STAT_DEPTH {
+                return Err(format!("{path} is too deep to probe"));
+            }
+            self.probe_depth += 1;
             let listed = match &mut self.client {
                 FtpClient::Plain(ftp) => ftp.mlst(Some(path)),
                 FtpClient::Tls(ftp) => ftp.mlst(Some(path)),
             };
-            match listed {
+            let out = match listed {
                 // An unparseable reply is not "file missing" — treating it as
                 // None silently vanishes a real object from stat consumers.
                 // A symlink reply is absent by contract, like sftp.
@@ -819,7 +885,9 @@ mod net {
                     }
                 }),
                 Err(_) => stat_from_list(self, path),
-            }
+            };
+            self.probe_depth -= 1;
+            out
         }
 
         fn copy_to(&mut self, path: &str, dest: &Path) -> Result<(), String> {
@@ -884,8 +952,9 @@ mod net {
                 "remote tree deeper than {COPY_DEPTH} levels: {path}"
             ));
         }
+        let items = fs.list(path)?;
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
-        for item in fs.list(path)? {
+        for item in items {
             if super::unsafe_local_name(&item.name) {
                 continue;
             }
@@ -908,6 +977,41 @@ mod net {
             }
         }
         Ok(())
+    }
+
+    fn list_bounded<T: suppaftp::TlsStream>(
+        ftp: &mut suppaftp::ImplFtpStream<T>,
+        path: &str,
+    ) -> suppaftp::FtpResult<Vec<String>> {
+        // Same wire text and expected reply as ftp.list() — only the read
+        // is bounded. finish() always runs so the control channel stays
+        // synchronized even when the cap trips mid-line.
+        let (_, mut stream) =
+            ftp.custom_data_command(format!("LIST {path}"), &[suppaftp::Status::AboutToSend])?;
+        let mut deadline = DeadlineRead {
+            inner: &mut stream,
+            deadline: Instant::now() + TRANSFER_BUDGET,
+        };
+        let mut bytes = Vec::new();
+        let read = (&mut deadline)
+            .take(MAX_LIST_BYTES + 1)
+            .read_to_end(&mut bytes);
+        let finish = stream.finish();
+        read.map_err(suppaftp::FtpError::ConnectionError)?;
+        finish?;
+        if bytes.len() as u64 > MAX_LIST_BYTES {
+            return Err(suppaftp::FtpError::ConnectionError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("listing for {path} exceeds {MAX_LIST_BYTES} bytes"),
+            )));
+        }
+        Ok(bytes
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                (!line.is_empty()).then(|| String::from_utf8_lossy(line).into_owned())
+            })
+            .collect())
     }
 
     fn stat_from_list(fs: &mut FtpFs, path: &str) -> Result<Option<Stat>, String> {
@@ -1170,12 +1274,14 @@ mod net {
             .call()
             .map_err(map_http)?;
         let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(MAX_OBJECT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|err| err.to_string())?;
+        let mut body = response.body_mut().as_reader();
+        DeadlineRead {
+            inner: &mut body,
+            deadline: Instant::now() + TRANSFER_BUDGET,
+        }
+        .take(MAX_OBJECT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
         if bytes.len() as u64 > MAX_OBJECT_BYTES {
             return Err(format!("{url} is bigger than {MAX_OBJECT_BYTES} bytes"));
         }

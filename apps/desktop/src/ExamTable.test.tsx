@@ -9,6 +9,8 @@ type EditorProps = {
   getCellContent: (cell: readonly [number, number]) => GridCell;
   onHeaderClicked: (column: number) => void;
   columns: Array<{ title: string }>;
+  gridSelection?: object;
+  onGridSelectionChange?: (selection: object) => void;
 };
 
 let editor: EditorProps | null = null;
@@ -26,6 +28,38 @@ const rows: ExamRow[] = [
   { exam: "b", patient: "Ann", patient_id: "2", date: "2020", description: "later", files: 2 },
   { exam: "a", patient: "Bea", patient_id: "1", date: "2021", description: "earlier", files: 10 },
 ];
+
+it("keeps the highlight on a same-order refresh and clears it when the rows change", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const props = { theme: {} as Theme, width: 400, height: 200 };
+  await act(async () => {
+    root = createRoot(host);
+    root.render(<ExamTable rows={rows} {...props} />);
+  });
+  const selection = { rows: { has: () => true } };
+  await act(async () => {
+    editor?.onGridSelectionChange?.(selection);
+  });
+  expect(editor?.gridSelection).toBe(selection);
+  // A catalog pull rebuilds rows with a new array identity every 5 s — the
+  // ordered keys are identical, so the highlight must survive.
+  await act(async () => {
+    root?.render(<ExamTable rows={rows.map((row) => ({ ...row }))} {...props} />);
+  });
+  expect(editor?.gridSelection).toBe(selection);
+  // A different exam set at the same positions is not the same display
+  // order — the positional highlight is meaningless and must clear.
+  await act(async () => {
+    root?.render(
+      <ExamTable
+        rows={[rows[0], { ...rows[1], exam: "c" }]}
+        {...props}
+      />,
+    );
+  });
+  expect(editor?.gridSelection).toEqual({});
+});
 
 let root: Root | null = null;
 
