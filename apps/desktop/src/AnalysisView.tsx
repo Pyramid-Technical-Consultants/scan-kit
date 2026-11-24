@@ -668,10 +668,10 @@ export function AnalysisView({
   };
 
   const loadPayload = (): string => {
-    if (payload.current != null) {
-      picture.current = payload.current;
-    }
-    if (picture.current == null) {
+    // No promotion: loadPlot reads payload.current first and only the
+    // success path may write picture.current — promoting here would stash
+    // bad bytes where the catch's payload.current = null can't reach them.
+    if (picture.current == null && payload.current == null) {
       return "";
     }
     const jobs: [Plotter, number | null][] =
@@ -816,6 +816,8 @@ export function AnalysisView({
         palette: [],
       },
       (report) => setExportReport(report.finished ? null : report),
+      // stop: () => false is deliberate — an export is a write task, so it
+      // finishes even if the view unmounts; liveRef suppresses the toasts.
       () => false,
     )
       .then(() => {

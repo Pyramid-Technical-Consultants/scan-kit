@@ -128,6 +128,11 @@ export function editCell(nodes: FormNode[], id: string, row: number, column: num
         return cells;
       }
       const next = cells.slice();
+      // A malformed form doc could index past the row — sparse holes would
+      // serialize as nulls downstream, so pad rather than write past it.
+      while (next.length <= column) {
+        next.push("");
+      }
       next[column] = value;
       return next;
     });
