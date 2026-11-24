@@ -267,18 +267,29 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
             .as_mut()
             .filter(|live| live.epoch == epoch)
             .ok_or_else(connection_gone)?;
-        let read = read_one(
-            &mut live.socket,
-            POINTS_UPLOAD_TARGET,
-            Duration::from_secs(4),
-        )?;
-        let target = read
-            .as_str()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .unwrap_or(DEFAULT_CONTROL_POINTS)
-            .to_owned();
-        (live.host.clone(), live.epoch, target)
+        // Poll until the field echoes the value just sent — a stale
+        // readback would PUT to one path while the device later loads
+        // whatever file the late-landing set points at.
+        let settle = Instant::now() + Duration::from_secs(4);
+        loop {
+            let read = read_one(
+                &mut live.socket,
+                POINTS_UPLOAD_TARGET,
+                Duration::from_secs(2),
+            )?;
+            if read.as_str().map(str::trim) == Some(DEFAULT_CONTROL_POINTS) {
+                break;
+            }
+            if Instant::now() >= settle {
+                return Err("points upload target did not accept the upload path".into());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        (
+            live.host.clone(),
+            live.epoch,
+            DEFAULT_CONTROL_POINTS.to_owned(),
+        )
     };
     http_put(&host, &target, &bytes)?;
     // A disconnect+connect between windows swaps the Live — commanding the
@@ -292,6 +303,10 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         set_field(&mut live.socket, POINTS_UPLOAD, &json!(true))?;
     }
     let deadline = Instant::now() + Duration::from_secs(30);
+    // A success left over from the previous load must not pass this one —
+    // require a non-success state first, or a short settle window.
+    let mut armed = false;
+    let settle = Instant::now() + Duration::from_millis(600);
     loop {
         let code = {
             let mut guard = lock();
@@ -300,9 +315,15 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
                 .filter(|live| live.epoch == epoch)
                 .ok_or_else(connection_gone)?;
             let state = read_one(&mut live.socket, POINTS_LOAD_STATE, Duration::from_secs(2))?;
-            io_number(&state).map(|value| value as i64)
+            // A fractional state is a mid-write marker, never a success.
+            io_number(&state)
+                .filter(|value| value.fract() == 0.0)
+                .map(|value| value as i64)
         };
-        if code == Some(LOAD_STATE_SUCCESS) {
+        if code.is_some() && code != Some(LOAD_STATE_SUCCESS) {
+            armed = true;
+        }
+        if code == Some(LOAD_STATE_SUCCESS) && (armed || Instant::now() >= settle) {
             break;
         }
         if let Some(code) = code {
@@ -816,7 +837,10 @@ fn recv(
     match socket.read() {
         Ok(Message::Binary(bytes)) => {
             let mut cursor = std::io::Cursor::new(bytes.as_ref());
-            let value = rmpv::decode::read_value(&mut cursor).map_err(|err| err.to_string())?;
+            // rmpv's default cap (1024) is far deeper than any device
+            // table — bound it tighter so a hostile frame errors sooner.
+            let value = rmpv::decode::read_value_with_max_depth(&mut cursor, 128)
+                .map_err(|err| err.to_string())?;
             // One message per frame — trailing bytes or a second value
             // silently desynchronize the protocol.
             if cursor.position() != bytes.len() as u64 {

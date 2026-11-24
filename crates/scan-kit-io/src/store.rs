@@ -40,7 +40,8 @@ static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn default_db_path() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".scan-kit").join("scan-kit.sqlite")
@@ -808,9 +809,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             "this library was written by a newer Scan Kit (schema v{version}); upgrade to open it"
         ));
     }
-    if version < 1 {
-        conn.execute_batch(
-            "
+    // The CREATEs heal every version — a versioned file missing a table
+    // (torn creation, foreign partial write) self-repairs like an unstamped
+    // one instead of failing every later open.
+    conn.execute_batch(
+        "
             CREATE TABLE IF NOT EXISTS prefs (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -847,10 +850,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                 UNIQUE(library_id, session_id)
             );
             ",
-        )
+    )
+    .map_err(|err| err.to_string())?;
+    conn.execute_batch(EXAMS_TABLE)
         .map_err(|err| err.to_string())?;
-        conn.execute_batch(EXAMS_TABLE)
-            .map_err(|err| err.to_string())?;
+    if version < 1 {
         // Tables that predate version stamping keep their older shape —
         // heal the later columns the same way a versioned DB does.
         migrate_columns(
@@ -886,6 +890,20 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                 ("note", "TEXT NOT NULL DEFAULT ''"),
             ],
         )?;
+        // Tables that predate version stamping may lack the UNIQUE
+        // constraints the ON CONFLICT upserts resolve against — dedupe
+        // then index or every session/exam write fails on such a DB.
+        conn.execute_batch(
+            "DELETE FROM sessions WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM sessions GROUP BY library_id, session_id);
+             DELETE FROM exams WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM exams GROUP BY library_id, study_uid);
+             CREATE UNIQUE INDEX IF NOT EXISTS sessions_unique
+                ON sessions(library_id, session_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS exams_unique
+                ON exams(library_id, study_uid);",
+        )
+        .map_err(|err| err.to_string())?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|err| err.to_string())?;
         return Ok(());
@@ -1010,10 +1028,17 @@ pub(crate) fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Resu
     // corrupt one — stamping notes_imported would discard it forever.
     let notes_ok = notes_raw
         .as_ref()
-        .map(|value| value.is_object())
+        .map(|value| {
+            value
+                .as_object()
+                .map(|map| map.values().all(Value::is_string))
+                .unwrap_or(false)
+        })
         .unwrap_or(!notes_path.exists());
     let settings = settings_raw.unwrap_or_else(|| json!({}));
-    if !notes_done && notes_ok && settings_ok {
+    // The notes import does not depend on a healthy settings.json — gating
+    // on settings_ok used to wedge a good notes file behind a corrupt one.
+    if !notes_done && notes_ok {
         if let Some(notes) = notes_raw.and_then(|value| value.as_object().cloned()) {
             for (session_id, text) in notes {
                 let Some(text) = text.as_str() else {
@@ -1231,7 +1256,13 @@ pub(crate) fn delete_missing(
         if found.contains(&id) {
             Some(id)
         } else {
-            found.iter().find(|f| f.eq_ignore_ascii_case(&id)).cloned()
+            // Same rule as the row rekey above — an ambiguous case match
+            // must not hand the selection to an arbitrary survivor.
+            let mut matches = found.iter().filter(|f| f.eq_ignore_ascii_case(&id));
+            match (matches.next(), matches.next()) {
+                (Some(only), None) => Some(only.clone()),
+                _ => None,
+            }
         }
     });
     let mut seen = std::collections::HashSet::new();

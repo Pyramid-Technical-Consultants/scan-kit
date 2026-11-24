@@ -801,8 +801,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_scanners" => {
             let db = database_path(input)?;
             let action = required_str(input, "action")?;
-            scanners(&db, action, input.get("folder").and_then(Value::as_str))
-                .map_err(InvokeError::Message)
+            scanners(&db, action, optional_str(input, "folder")?).map_err(InvokeError::Message)
         }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),

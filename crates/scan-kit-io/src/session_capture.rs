@@ -283,6 +283,7 @@ fn client_name(client: &str) -> String {
         .to_ascii_uppercase()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .take(64)
         .collect();
     // A bare DOS device stem (`CON.log`, `NUL_spot_data.csv`) fails every
     // write on Windows — the charset filter alone lets it through.
@@ -1683,6 +1684,7 @@ fn fetch_aux(
                             .filter(|ch| {
                                 ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == '.'
                             })
+                            .take(64)
                             .collect();
                         let base = if base.is_empty() || base.ends_with('.') || dos_reserved(&base)
                         {

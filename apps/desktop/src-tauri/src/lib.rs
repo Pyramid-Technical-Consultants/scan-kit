@@ -385,7 +385,10 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let folder = path.parent().unwrap_or(path);
+        let folder = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
         vec![folder.as_os_str().to_os_string()]
     }
 }
