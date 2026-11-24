@@ -294,6 +294,13 @@ export default function App() {
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
   const [analysis, setAnalysis] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
+  const [trashConfirm, setTrashConfirm] = useState<{
+    sessionId: string;
+    folderId?: string;
+    library: string;
+    remote: boolean;
+    paths: string[];
+  } | null>(null);
   const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
   useEffect(() => {
     selectionLive.current = selectionOrder;
@@ -499,10 +506,6 @@ export default function App() {
         }
         if (catalogEpoch.current === epoch) {
           pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
-        } else {
-          // A superseded run must not leave stale pending roots — the next
-          // password submit would re-index removed locations.
-          pendingLocations.current = [];
           try {
             await pullCatalog(epoch);
             dismissNotice();
@@ -511,6 +514,10 @@ export default function App() {
           } catch (error: unknown) {
             notifyError(error);
           }
+        } else {
+          // A superseded run must not leave stale pending roots — the next
+          // password submit would re-index removed locations.
+          pendingLocations.current = [];
         }
       } finally {
         endCatalogLoad();
@@ -527,10 +534,19 @@ export default function App() {
     async (path: string) => {
       // Bump first — a queued indexMany would re-register the forgotten
       // root inside index_library's transaction and republish it.
-      ++catalogEpoch.current;
+      const epoch = ++catalogEpoch.current;
       pendingLocations.current = [];
       try {
-        applyCatalog(await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path }));
+        const payload = await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path });
+        // A newer open/indexMany that landed during the invoke already
+        // pulled — its catalog is fresher than this pre-commit snapshot.
+        if (catalogEpoch.current === epoch) {
+          applyCatalog(payload);
+          setUndo([]);
+          setRedo([]);
+          setSessionMenu(null);
+          setTrashConfirm(null);
+        }
       } catch (error: unknown) {
         notifyError(error);
       }
@@ -799,14 +815,6 @@ export default function App() {
     [selectTab],
   );
 
-  const [trashConfirm, setTrashConfirm] = useState<{
-    sessionId: string;
-    folderId?: string;
-    library: string;
-    remote: boolean;
-    paths: string[];
-  } | null>(null);
-
   const requestTrash = useCallback(
     async (sessionId: string, library: string) => {
       const row = rows.find((item) => item.session_id === sessionId && item.library === library);
@@ -898,13 +906,15 @@ export default function App() {
     setSelectionOrder(next.ids);
     setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
     const write = ++selectionSeq.current;
+    const catalogAt = catalogEpoch.current;
     void (async () => {
       selectionWrites.current += 1;
       try {
         for (const root of locations) {
           // A newer selection supersedes this loop — stop before the next
-          // root so the last write to land is always the newest.
-          if (selectionSeq.current !== write) {
+          // root so the last write to land is always the newest. A location
+          // forgotten mid-write must not get a ghost selection persisted.
+          if (selectionSeq.current !== write || catalogEpoch.current !== catalogAt) {
             return;
           }
           const sessionIds = rowsRef.current.flatMap((row) => {
@@ -939,8 +949,12 @@ export default function App() {
       // failure even when it has already settled.
       const stillMine = selectionSeq.current === write;
       if (stillMine) {
-        const restore = new Set(before);
-        setSelectionOrder(before);
+        // A pull that landed mid-write may have shrunk the catalog — only
+        // restore ids that still list, like the drain filter does.
+        const listed = new Set(rowsRef.current.map((row) => row.session_id));
+        const kept = before.filter((id) => listed.has(id));
+        const restore = new Set(kept);
+        setSelectionOrder(kept);
         setRows((items) =>
           items.map((item) => ({ ...item, selected: restore.has(item.session_id) })),
         );
