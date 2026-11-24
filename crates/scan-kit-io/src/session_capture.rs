@@ -335,7 +335,7 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
     let mut rows = Vec::new();
     // A close-delimited reply has no length to check - a body that does not
     // end in a newline was cut mid-record even though the parse is clean.
-    let mut truncated = !bytes.is_empty() && bytes.last() != Some(&10);
+    let mut truncated = !bytes.is_empty() && !matches!(bytes.last(), Some(&10) | Some(&13));
     for record in reader.records() {
         let Ok(record) = record else {
             truncated = true;
@@ -386,7 +386,13 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
             .get(row)
             .and_then(|cells| cells.get(column))
             .map(String::as_str);
-        let id = if row < sheet.rows.len() && cell.is_none_or(|id| clean(id).is_empty()) {
+        let id = if row < sheet.rows.len()
+            && cell.is_none_or(|id| {
+                // A repeated literal header line mid-file is not a layer —
+                // inherit the open run like a ragged cell.
+                let id = clean(id);
+                id.is_empty() || id.eq_ignore_ascii_case("layer_id")
+            }) {
             prev_eff.clone()
         } else {
             cell.map(|id| join_key(clean(id)))
@@ -641,7 +647,7 @@ pub fn capture(
                 .last()
                 .and_then(|row| row.get(c))
                 .map(|cell| join_key(clean(cell)))
-                .filter(|cell| !cell.is_empty())
+                .filter(|cell| !cell.is_empty() && cell != "layer_id")
         })
         .unwrap_or_else(|| "0".into());
     let state = match status
@@ -821,7 +827,7 @@ fn join_timeslices(
                 .and_then(|i| row.get(i))
                 .map(|cell| clean(cell))
                 .unwrap_or_default();
-            if !raw_layer.is_empty() {
+            if !raw_layer.is_empty() && !raw_layer.eq_ignore_ascii_case("layer_id") {
                 eff_layer = raw_layer.to_owned();
             }
             let raw_spot = spot_i
@@ -1001,7 +1007,7 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)], warnings: &mut Vec<String>)
             // A ragged layer cell inherits the running layer like blocks()
             // does - foldering and joining must agree on the same layer.
             let raw_layer = clean(row.get(layer_i).map(String::as_str).unwrap_or_default());
-            if !raw_layer.is_empty() {
+            if !raw_layer.is_empty() && !raw_layer.eq_ignore_ascii_case("layer_id") {
                 eff_layer = raw_layer.to_owned();
             }
             let layer = join_key(&eff_layer);
@@ -1525,10 +1531,12 @@ fn write_termination(
         },
         chrono::Local::now().format("%a %b %e %T %Y"),
     );
+    // These are raw nC readings, not MU — a "total dose" label would be
+    // parsed as MU by the summary reader and displayed as ~1e8 MU.
     for (label, ic) in [
-        ("Primary total dose", "ic3"),
-        ("Secondary total dose", "ic1"),
-        ("Tertiary total dose", "ic2"),
+        ("Primary total charge (nC)", "ic3"),
+        ("Secondary total charge (nC)", "ic1"),
+        ("Tertiary total charge (nC)", "ic2"),
     ] {
         if let Some(dose) = last_dose(ic) {
             // Device text lands raw in this file — a newline would forge a
@@ -1749,7 +1757,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
         let dose_line = text
             .lines()
-            .find(|line| line.starts_with("Secondary total dose"))
+            .find(|line| line.starts_with("Secondary total charge"))
             .unwrap_or("");
         let target_line = text
             .lines()
@@ -2012,7 +2020,10 @@ mod tests {
         let summary = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
         assert!(summary.contains("Layer delivery: 1/1"), "{summary}");
         assert!(summary.contains("Spot delivery: 2/1"), "{summary}");
-        assert!(summary.contains("Secondary total dose: 7"), "{summary}");
+        assert!(
+            summary.contains("Secondary total charge (nC): 7"),
+            "{summary}"
+        );
         assert!(
             summary.contains("Energy min: 70\nEnergy max: 70"),
             "{summary}"

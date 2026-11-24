@@ -486,7 +486,7 @@ pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
     }
     let (mut members, roots) =
         archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default();
-    if roots.len() != 1 {
+    if !roots.is_empty() {
         let prefix = format!("{session_id}/");
         members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
     }
@@ -508,7 +508,7 @@ pub fn read_timeslice_frames(storage: &Path, session_id: &str) -> Vec<(i64, Vec<
         let (mut members, roots) =
             archive_members(storage, &|name| is_timeslice(&normalize_member(name)))
                 .unwrap_or_default();
-        if roots.len() != 1 {
+        if !roots.is_empty() {
             let prefix = format!("{session_id}/");
             members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
         }
@@ -951,10 +951,12 @@ fn visit_files(
 type Members = (Vec<(String, Vec<u8>)>, std::collections::BTreeSet<String>);
 
 fn member_root(name: &str) -> Option<String> {
-    normalize_member(name)
-        .split('/')
+    // Flat members carry no tree root — a flat zip is one tree, not one
+    // root per filename.
+    let name = normalize_member(name);
+    name.split('/')
         .next()
-        .filter(|root| !root.is_empty())
+        .filter(|root| name.contains('/') && !root.is_empty())
         .map(str::to_owned)
 }
 

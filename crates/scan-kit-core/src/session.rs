@@ -162,7 +162,7 @@ impl SummaryDate {
         }
         let second: u32 = second_text.split('.').next()?.parse().ok()?;
         if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
+            || !(1..=days_in_month(year, month)).contains(&day)
             || hour > 23
             || minute > 59
             || second > 60
@@ -217,15 +217,15 @@ pub fn parse_termination_summary_text(text: &str) -> SessionMeta {
             }
         } else if line.starts_with("Primary total dose:") {
             if let Some(parsed) = labeled_number(line, "Primary total dose") {
-                primary_mu = Some(parsed);
+                primary_mu = (parsed > 0.0).then_some(parsed);
             }
         } else if line.starts_with("Treatment time:") {
             if let Some(parsed) = labeled_number(line, "Treatment time") {
-                treatment_s = i32::try_from(parsed as i64).ok();
+                treatment_s = i32::try_from(parsed as i64).ok().filter(|v| *v >= 0);
             }
         } else if line.starts_with("Room number:") {
             if let Some(parsed) = labeled_number(line, "Room number") {
-                room_number = i32::try_from(parsed as i64).ok();
+                room_number = i32::try_from(parsed as i64).ok().filter(|v| *v >= 0);
             }
         } else if let Some(rest) = labeled(line, "Configuration name") {
             let name = rest.trim();
@@ -236,11 +236,11 @@ pub fn parse_termination_summary_text(text: &str) -> SessionMeta {
             };
         } else if line.starts_with("Spot extent width:") {
             if let Some(parsed) = labeled_number(line, "Spot extent width") {
-                extent_w = Some(parsed);
+                extent_w = (parsed >= 0.0).then_some(parsed);
             }
         } else if line.starts_with("Spot extent height:") {
             if let Some(parsed) = labeled_number(line, "Spot extent height") {
-                extent_h = Some(parsed);
+                extent_h = (parsed >= 0.0).then_some(parsed);
             }
         } else if line.starts_with("Layer delivery:") {
             if let Some(parsed) = parse_layer_delivery(line) {
@@ -343,13 +343,15 @@ fn parse_summary_date(rest: &str) -> Option<SummaryDate> {
     let month = month_index(parts[1])?;
     let day: u32 = parts[2].parse().ok()?;
     let year: i32 = parts[4].parse().ok()?;
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
     let mut clock = parts[3].split(':');
     let hour: u32 = clock.next()?.parse().ok()?;
     let minute: u32 = clock.next()?.parse().ok()?;
     let second: u32 = clock.next()?.parse().ok()?;
     if clock.next().is_some()
         || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
         || hour > 23
         || minute > 59
         || second > 60
@@ -364,6 +366,16 @@ fn parse_summary_date(rest: &str) -> Option<SummaryDate> {
         minute,
         second,
     })
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn weekday_index(name: &str) -> Option<u8> {

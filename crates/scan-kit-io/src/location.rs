@@ -256,7 +256,9 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
             files.swap(2, 3);
         }
         candidates.splice(0..0, files);
-        candidates.insert(5, nested);
+        // Before `base`, mirroring remote_stamp — the container's frozen
+        // mtime would freeze the fingerprint on a growing session.
+        candidates.insert(4, nested);
     } else if !archive_name(&remote.path) {
         candidates.insert(0, format!("{base}/termination_summary.txt"));
     }
@@ -449,6 +451,18 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     let old = parent.join(format!(".{name}.old-{}", std::process::id()));
     if tmp.exists() {
         let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
+    }
+    // Orphan staging dirs from any crashed run (any pid suffix) — they are
+    // never touched again and accumulate forever in the cache dir.
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let stale = entry.file_name().to_string_lossy().into_owned();
+            if stale.starts_with(&format!(".{name}.part-"))
+                || stale.starts_with(&format!(".{name}.old-"))
+            {
+                let _ = fs::remove_dir_all(entry.path()).or_else(|_| fs::remove_file(entry.path()));
+            }
+        }
     }
     if let Err(err) = fs.copy_to(&session.path, &tmp) {
         let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
@@ -1384,7 +1398,10 @@ fn connect_smb(remote: &Remote) -> Result<PathBuf, String> {
 #[cfg(windows)]
 fn unc_path(remote: &Remote) -> Result<PathBuf, String> {
     let path = remote.path.trim_start_matches('/').replace('/', "\\");
-    if remote.host.is_empty() || path.is_empty() {
+    // Every other remote path in this file rejects .. after decoding — UNC
+    // is the one place the client (not the server) does the collapsing, so
+    // smb://h/share/../other would reach a different share.
+    if remote.host.is_empty() || path.is_empty() || path.split('\\').any(|part| part == "..") {
         return Err("the smb URL needs a host and a share".into());
     }
     Ok(PathBuf::from(format!("\\\\{}\\{path}", remote.host)))
@@ -1526,7 +1543,10 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                     let root_path = remote.path.trim_end_matches('/');
                     let rel = child_path
                         .strip_prefix(root_path)
-                        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+                        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+                        // Windows normalizes .. client-side on UNC paths —
+                        // an escape here would probe a different share.
+                        .filter(|rest| !rest.split('/').any(|part| part == ".."));
                     if let Some(rel) = rel {
                         let local = unc.join(rel.trim_start_matches('/'));
                         recorded_parent = local.parent().map(|dir| dir.to_path_buf());
@@ -1543,10 +1563,15 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             // Verify a recorded remote spec too — same dead-spec hazard.
             if let Some(place) = recorded(root, session_id) {
                 if let Some(child) = require_remote(&place).ok().and_then(|child| {
-                    fs.stat(child.path.trim_end_matches('/'))
-                        .ok()
-                        .flatten()
-                        .map(|_| place.clone())
+                    let clean = child.path.trim_end_matches('/');
+                    // A recorded spec carrying .. resolves server-side outside
+                    // the root — probing it returns an undeletable out-of-root
+                    // spec. The delete path already refuses it; don't collect.
+                    if clean.split('/').any(|part| part == "..") {
+                        None
+                    } else {
+                        fs.stat(clean).ok().flatten().map(|_| place.clone())
+                    }
                 }) {
                     found.push(child);
                 }
@@ -1603,7 +1628,12 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     };
     let mut bases = vec![Path::new(&root).to_path_buf()];
     if let Some(parent) = recorded_parent {
-        if parent != bases[0] && parent.starts_with(&bases[0]) {
+        // starts_with is component-wise but .. still escapes — root/.. is a
+        // recorded spec outside the library, not a probe target.
+        let clean = !parent
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir));
+        if parent != bases[0] && parent.starts_with(&bases[0]) && clean {
             bases.push(parent);
         }
     }

@@ -1097,7 +1097,7 @@ fn build_spot(
 ) -> BTreeMap<String, Vec<f32>> {
     let dir = discover::session_directory(root, session);
     let map_path = dir.join("input_map.csv");
-    let map = if map_path.is_file() {
+    let map = if plain_file(&map_path) {
         sheet_all(&map_path, Keep::Map, |_| true)
     } else if let Some(bytes) = discover::read_session_file(root, session, "input_map.csv") {
         Arc::new(read_sheet(&bytes))
@@ -2318,7 +2318,7 @@ fn build_slice_metric(
     frames: &Frames,
 ) -> BTreeMap<String, Vec<f32>> {
     let spot_path = discover::session_directory(root, session).join("spot_data.csv");
-    let spot = if spot_path.is_file() {
+    let spot = if plain_file(&spot_path) {
         Some(sheet_all(&spot_path, Keep::Spot, spot_keep))
     } else {
         discover::read_session_file(root, session, "spot_data.csv")
@@ -3333,7 +3333,7 @@ pub(crate) fn grain_present(root: &Path, session: &str, timeslice: bool) -> bool
         })
         .is_some()
     } else {
-        dir.join("spot_data.csv").is_file()
+        plain_file(&dir.join("spot_data.csv"))
     }
 }
 
@@ -4576,6 +4576,11 @@ fn store_sheet(key: SheetKey, sheet: &Arc<Sheet>) {
 /// Session XML/CSV files get the archive member cap — a directory source
 /// is not inherently safer than a zip member.
 pub(crate) fn capped_text(path: &Path) -> Result<String, String> {
+    // Same gate as read_session_file — a symlinked session file must not
+    // pull outside content into a parse.
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()) {
+        return Err(format!("{} is not a plain file", path.display()));
+    }
     let mut file = std::fs::File::open(path).map_err(|err| err.to_string())?;
     let bytes = discover::read_capped(
         &mut file,

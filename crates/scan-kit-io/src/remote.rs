@@ -55,7 +55,8 @@ const MAX_COPY_BYTES: u64 = 4 << 30;
 /// characters, DOS device stems, and trailing dots/spaces. Skipping mirrors
 /// the separator guard — the alternative is a create that can only fail.
 pub(crate) fn unsafe_local_name(name: &str) -> bool {
-    name.contains(['/', '\\', ':', '?', '*', '"', '<', '>', '|'])
+    name.bytes().any(|byte| byte.is_ascii_control())
+        || name.contains(['/', '\\', ':', '?', '*', '"', '<', '>', '|'])
         || name != name.trim_end_matches(['.', ' '])
         || matches!(
             name.split('.')
@@ -520,6 +521,9 @@ mod net {
     impl Fs for SftpFs {
         fn list(&mut self, path: &str) -> Result<Vec<Item>, String> {
             let sftp = self.sftp()?;
+            // ponytail: ssh2 has no streaming readdir — the cap below trips
+            // only after the full listing is allocated. A hostile server can
+            // still force the allocation the cap was meant to prevent.
             let entries = sftp.readdir(Path::new(path)).map_err(map_sftp)?;
             if entries.len() > MAX_LIST_ENTRIES {
                 return Err(format!(
@@ -580,6 +584,16 @@ mod net {
                 copy_sftp_dir(self, path, dest, 0, &mut 0)
             } else {
                 let bytes = self.read(path)?.ok_or_else(|| format!("missing {path}"))?;
+                // A clean close mid-transfer is indistinguishable from EOF —
+                // under-delivery is corruption and must not stamp the cache.
+                // (< not !=: a still-capturing session legitimately grows.)
+                if (bytes.len() as u64) < stat.size {
+                    return Err(format!(
+                        "{path} truncated: {} of {} bytes",
+                        bytes.len(),
+                        stat.size
+                    ));
+                }
                 copy_file_to(dest, &bytes)
             }
         }
@@ -647,6 +661,13 @@ mod net {
                 let bytes = fs
                     .read(&remote)?
                     .ok_or_else(|| format!("{remote} could not be read during copy"))?;
+                if (bytes.len() as u64) < item.size {
+                    return Err(format!(
+                        "{remote} truncated: {} of {} bytes",
+                        bytes.len(),
+                        item.size
+                    ));
+                }
                 *total = total.saturating_add(bytes.len() as u64);
                 if *total > super::MAX_COPY_BYTES {
                     return Err(format!(
@@ -906,6 +927,16 @@ mod net {
                 copy_ftp_dir(self, path, dest, 0, &mut 0)
             } else {
                 let bytes = self.read(path)?.ok_or_else(|| format!("missing {path}"))?;
+                // A clean close mid-transfer is indistinguishable from EOF —
+                // under-delivery is corruption and must not stamp the cache.
+                // (< not !=: a still-capturing session legitimately grows.)
+                if (bytes.len() as u64) < stat.size {
+                    return Err(format!(
+                        "{path} truncated: {} of {} bytes",
+                        bytes.len(),
+                        stat.size
+                    ));
+                }
                 copy_file_to(dest, &bytes)
             }
         }
@@ -976,6 +1007,13 @@ mod net {
                 let bytes = fs
                     .read(&remote)?
                     .ok_or_else(|| format!("{remote} could not be read during copy"))?;
+                if (bytes.len() as u64) < item.size {
+                    return Err(format!(
+                        "{remote} truncated: {} of {} bytes",
+                        bytes.len(),
+                        item.size
+                    ));
+                }
                 *total = total.saturating_add(bytes.len() as u64);
                 if *total > super::MAX_COPY_BYTES {
                     return Err(format!(
@@ -996,8 +1034,10 @@ mod net {
         // Same wire text and expected reply as ftp.list() — only the read
         // is bounded. finish() always runs so the control channel stays
         // synchronized even when the cap trips mid-line.
-        let (_, mut stream) =
-            ftp.custom_data_command(format!("LIST {path}"), &[suppaftp::Status::AboutToSend])?;
+        let (_, mut stream) = ftp.custom_data_command(
+            format!("LIST {path}"),
+            &[suppaftp::Status::AboutToSend, suppaftp::Status::AlreadyOpen],
+        )?;
         let mut deadline = DeadlineRead {
             inner: &mut stream,
             deadline: Instant::now() + TRANSFER_BUDGET,
@@ -1229,12 +1269,28 @@ mod net {
         own_path: String,
     }
 
+    impl HttpFs {
+        // The connector sees one archive URL: its own path, or an ancestor
+        // probe like  — never a child or sibling that would fabricate.
+        fn owns(&self, path: &str) -> bool {
+            let path = path.trim_end_matches('/');
+            let own = self.own_path.trim_end_matches('/');
+            path.is_empty() || own == path || own.starts_with(&format!("{path}/"))
+        }
+    }
+
     impl Fs for HttpFs {
         fn list(&mut self, _path: &str) -> Result<Vec<Item>, String> {
             Err("an http location is one archive, not a folder".into())
         }
 
-        fn read(&mut self, _path: &str) -> Result<Option<Vec<u8>>, String> {
+        fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+            // Same contract as stat — answering for a sibling/child path
+            // fabricates objects (e.g. a nested-marker gate) that do not
+            // exist. An ancestor probe answers for the archive it roots.
+            if !self.owns(path) {
+                return Ok(None);
+            }
             let bytes = http_get(&self.url, &self.username, &self.password)?;
             Ok(Some(bytes))
         }
@@ -1248,7 +1304,10 @@ mod net {
             Ok(Some(http_stat(&self.url, &self.username, &self.password)?))
         }
 
-        fn copy_to(&mut self, _path: &str, dest: &Path) -> Result<(), String> {
+        fn copy_to(&mut self, path: &str, dest: &Path) -> Result<(), String> {
+            if !self.owns(path) {
+                return Err("an http location can only copy its own archive".into());
+            }
             let bytes = http_get(&self.url, &self.username, &self.password)?;
             copy_file_to(dest, &bytes)
         }
@@ -1395,6 +1454,11 @@ mod net {
         } else {
             format!("{host}:{port}")
         };
+        // ponytail: getaddrinfo has no stdlib timeout — a dead resolver or
+        // VPN drop blocks past connect_timeout, and callers hold the
+        // process-global COPY lock while it stalls. Bounding it needs a
+        // helper thread + recv_timeout; until then every timeout below
+        // starts only after resolution returns.
         let addrs: Vec<_> = text
             .to_socket_addrs()
             .map_err(|err| err.to_string())?

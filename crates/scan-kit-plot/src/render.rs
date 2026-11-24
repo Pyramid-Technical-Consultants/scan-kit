@@ -3030,8 +3030,11 @@ impl Plot {
             .filter(|cloud| cloud.panel == cell.panel && !cloud.crosshair)
         {
             for line in cloud.lines.iter().rev() {
-                let a = project(matrix, line.a, w, h);
-                let b = project(matrix, line.b, w, h);
+                let mut a = project(matrix, line.a, w, h);
+                let mut b = project(matrix, line.b, w, h);
+                // Hit-test the snapped stroke the renderers draw, not the
+                // unsnapped projection.
+                snap_hairline(&mut a, &mut b);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
                     if let Some(series) = hit(line.id) {
                         return Some(series);
@@ -3054,8 +3057,9 @@ impl Plot {
             let start = (*start as usize).min(line_records);
             let end = start.saturating_add(*count as usize).min(line_records);
             for line in self.marks.lines[start..end].iter().rev() {
-                let a = project(matrix, line.a, w, h);
-                let b = project(matrix, line.b, w, h);
+                let mut a = project(matrix, line.a, w, h);
+                let mut b = project(matrix, line.b, w, h);
+                snap_hairline(&mut a, &mut b);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
                     if let Some(series) = hit(line.id) {
                         return Some(series);
@@ -3088,15 +3092,20 @@ impl Plot {
             }
         }
         for (index, _) in batch.heats.iter().rev() {
-            let quad = &self.marks.quads[*index as usize];
+            let Some(quad) = self.marks.quads.get(*index as usize) else {
+                continue;
+            };
             if covers(quad) {
                 if let Some(series) = hit(quad.id) {
                     return Some(series);
                 }
             }
         }
-        let quads = &self.marks.quads
-            [batch.quad_start as usize..(batch.quad_start + batch.quad_count) as usize];
+        // Same stale-batch clamp as the line path — a reuse payload can
+        // carry quad ranges past the suffix buffer.
+        let qstart = (batch.quad_start as usize).min(self.marks.quads.len());
+        let qend = (batch.quad_start + batch.quad_count) as usize;
+        let quads = &self.marks.quads[qstart..qend.min(self.marks.quads.len())];
         quads
             .iter()
             .rev()
@@ -3540,9 +3549,9 @@ impl Plot {
                     );
                 }
             }
-            let solid: Vec<QuadRec> = self.marks.quads
-                [batch.quad_start as usize..(batch.quad_start + batch.quad_count) as usize]
-                .to_vec();
+            let qstart = (batch.quad_start as usize).min(self.marks.quads.len());
+            let qend = ((batch.quad_start + batch.quad_count) as usize).min(self.marks.quads.len());
+            let solid: Vec<QuadRec> = self.marks.quads[qstart..qend].to_vec();
             let heated: Vec<QuadRec> = batch
                 .heats
                 .iter()
@@ -5682,10 +5691,17 @@ fn stroke_workers(count: usize) -> usize {
 
 fn fill_solid(part: &mut [u8], xs: &[f32], ys: &[f32], color: [f32; 4], thickness: f32, id: u32) {
     for (index, word) in part.chunks_mut(LINE_STRIDE as usize).enumerate() {
+        // A duplicated vertex has no direction — NaN out the record so it
+        // is non-drawing and non-picking on every consumer like the GPU.
+        let a = if xs[index] == xs[index + 1] && ys[index] == ys[index + 1] {
+            [f32::NAN, f32::NAN, 0.0]
+        } else {
+            [xs[index], ys[index], 0.0]
+        };
         store_line(
             word,
             &LineRec {
-                a: [xs[index], ys[index], 0.0],
+                a,
                 b: [xs[index + 1], ys[index + 1], 0.0],
                 color,
                 thickness,
@@ -5712,7 +5728,9 @@ fn push_polyline(
             continue;
         }
         let point = [*x, *y, 0.0];
-        if let Some(start) = prev {
+        // A duplicated vertex carries no direction — the GPU pass draws
+        // nothing for it while the CPU path would invent a dot.
+        if let Some(start) = prev.filter(|start| *start != point) {
             lines.push(LineRec {
                 a: start,
                 b: point,
@@ -8000,6 +8018,11 @@ fn fill_quad_cpu(
     let right = p0[0].max(p1[0]);
     let top = p0[1].min(p1[1]);
     let bottom = p0[1].max(p1[1]);
+    // The GPU pass produces no fragments for a zero-area quad — the CPU
+    // coverage math would still paint a sliver at a pixel center.
+    if right == left || bottom == top {
+        return;
+    }
     let span_x = (right - left).max(1.0);
     let span_y = (bottom - top).max(1.0);
     let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
@@ -8015,7 +8038,7 @@ fn fill_quad_cpu(
             if coverage <= 0.0 {
                 continue;
             }
-            let mut color = if let Some(index) = quad.heatmap {
+            let mut color = if let Some(index) = quad.heatmap.filter(|_| quad.heat > 0.5) {
                 // uv interpolates the +1px-grown quad — the same mapping the
                 // shader samples mark_tex with.
                 let u = (x as f32 + 0.5 - left + 1.0) / (span_x + 2.0);

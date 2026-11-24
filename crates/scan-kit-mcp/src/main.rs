@@ -321,25 +321,24 @@ impl ServerHandler for ScanKit {
                 let ct = context.ct;
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let flag = cancel.clone();
-                let watch_ct = ct.clone();
-                let watcher = tokio::spawn(async move {
-                    watch_ct.cancelled().await;
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                });
                 let tool = name.clone();
                 let joined =
                     tokio::task::spawn_blocking(move || dispatch(&name, &input, &cancel));
                 // A blocking task cannot be aborted mid-run, but selecting
-                // frees this request now; cooperative tools also roll back
-                // via the flag instead of finishing in a detached task.
+                // frees this request now. The flag is set HERE, in the arm
+                // — a watcher task needs a separate scheduling slot and
+                // aborting it before it polls would leave flag false, so
+                // the detached task would commit writes after 'cancelled'.
                 let result = tokio::select! {
                     out = joined => match out {
                         Ok(inner) => inner,
                         Err(err) => Err(format!("{tool} failed: {err}")),
                     },
-                    _ = ct.cancelled() => Err("cancelled".to_owned()),
+                    _ = ct.cancelled() => {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Err("cancelled".to_owned())
+                    }
                 };
-                watcher.abort();
                 result
             }
         };

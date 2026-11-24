@@ -1478,6 +1478,10 @@ mod tests {
     // or via upload()) must not overlap.
     static FLAG_LOCK: Mutex<()> = Mutex::new(());
 
+    // Tests that install a Live (or assert on catalog()'s live() view) must
+    // not overlap — a parallel Live leaks connected:true into them.
+    static LIVE_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn http_get_reads_a_content_length_body() {
         use std::net::TcpListener;
@@ -1525,6 +1529,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("scan-kit.sqlite");
+        let _live_guard = LIVE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         *lock() = None;
         with_store(&db, |conn| store::set_runner_host(conn, "192.168.100.184")).unwrap();
         let listed = catalog(&db);
@@ -1968,6 +1973,7 @@ mod tests {
                 drop(stream);
             }
         });
+        let _live_guard = LIVE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let host = format!("127.0.0.1:{port}");
         let socket = dial(&host).unwrap();
         *lock() = Some(Live {
@@ -2021,6 +2027,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         });
+        let _live_guard = LIVE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let host = format!("127.0.0.1:{port}");
         let socket = dial(&host).unwrap();
         *lock() = Some(Live {
