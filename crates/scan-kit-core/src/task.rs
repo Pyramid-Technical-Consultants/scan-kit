@@ -80,6 +80,12 @@ impl Cancel {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
+    /// Share a flag the caller already owns — the MCP server's per-request
+    /// cancel, set by its ct watcher, so a cancelled request stops the drain.
+    pub fn from_arc(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }

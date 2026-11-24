@@ -51,12 +51,12 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
         .cloned()
         .collect();
-    let window = scrub_limits(&options);
     let end = time_end(
         tables
             .iter()
             .filter_map(|table| table.get("time_s").map(Vec::as_slice)),
     );
+    let window = scrub_limits(&options, end);
     // Beam Both and Rank All keep every row, so the trace is the column itself.
     let filter_rows = !keeps_every_row(&trace_segments);
     let masks: Vec<Vec<bool>> = if filter_rows {

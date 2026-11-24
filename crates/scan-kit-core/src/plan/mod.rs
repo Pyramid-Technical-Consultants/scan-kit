@@ -619,6 +619,17 @@ fn validate_energies(params: &Value) -> Vec<String> {
     if list.map(|items| items.is_empty()).unwrap_or(true) {
         return vec!["Select at least one energy layer.".into()];
     }
+    // A value outside the catalog is dropped by selected_energies — a
+    // [good, bogus] selection must error, not silently generate only good.
+    if list.is_some_and(|items| {
+        items.iter().any(|item| {
+            item.as_f64()
+                .map(|energy| !STANDARD_ENERGIES_MEV.contains(&energy))
+                .unwrap_or(true)
+        })
+    }) {
+        return vec!["An energy layer is not in the catalog.".into()];
+    }
     if selected_energies(params).is_empty() {
         return vec!["Select at least one energy layer.".into()];
     }
@@ -626,6 +637,12 @@ fn validate_energies(params: &Value) -> Vec<String> {
 }
 
 fn validate_weights(params: &Value) -> Vec<String> {
+    if params
+        .get("spot_weight_method")
+        .is_some_and(|value| !value.is_string() && !value.is_null())
+    {
+        return vec!["Select a spot weight method.".into()];
+    }
     let method = text(params, "spot_weight_method", "fixed");
     match method.as_str() {
         "fixed" => validate_min_float(params.get("spot_weight_mu"), "Spot Weight (MU)", 0.0001),
@@ -684,6 +701,10 @@ fn validate_weight_range(params: &Value) -> Vec<String> {
 }
 
 fn validate_variance(value: Option<&Value>) -> Vec<String> {
+    // The consumer defaults null, like the bounded floats do.
+    if value.is_some_and(Value::is_null) {
+        return Vec::new();
+    }
     let Some(number) = value.and_then(Value::as_f64) else {
         return vec!["Spot Variance (%) must be a number.".into()];
     };
@@ -701,6 +722,17 @@ fn validate_variance(value: Option<&Value>) -> Vec<String> {
 
 fn validate_spot_order(params: &Value) -> Vec<String> {
     let mut errors = Vec::new();
+    for key in ["spot_order", "fast_axis"] {
+        if params
+            .get(key)
+            .is_some_and(|value| !value.is_string() && !value.is_null())
+        {
+            errors.push(format!("{key} must be a string."));
+        }
+    }
+    if !errors.is_empty() {
+        return errors;
+    }
     let order = text(params, "spot_order", "plan_order");
     if order != "plan_order" && order != "minimize_travel" {
         errors.push("Spot order must be Plan Order or Minimize Travel.".into());
@@ -1487,6 +1519,68 @@ mod tests {
             128,
         );
         assert!(many.contains("E5L_250-210"));
+        #[test]
+        fn non_catalog_energies_are_rejected_not_dropped() {
+            // A [good, bogus] selection used to silently generate only good —
+            // the plan would ship fewer layers than the filename suggests.
+            assert!(!validate_plan(
+                "zero_field",
+                &serde_json::json!({"selected_energies": [100.0, 999.0]})
+            )
+            .is_empty());
+            // A non-numeric entry is also a reject, not a silent skip.
+            assert!(!validate_plan(
+                "zero_field",
+                &serde_json::json!({"selected_energies": [100.0, "100"]})
+            )
+            .is_empty());
+        }
+
+        #[test]
+        fn a_null_variance_uses_the_default_like_the_consumer() {
+            // The consumer defaults null to 10% — validation must not call it
+            // "not a number" while the generator proceeds.
+            let errors = validate_plan(
+                "zero_field",
+                &serde_json::json!({
+                    "selected_energies": [100.0],
+                    "spot_weight_method": "random_total_variance",
+                    "spot_weight_total_mu": 1.0,
+                    "spot_weight_variance_pct": null,
+                }),
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+
+        #[test]
+        fn a_wrong_type_enum_param_errors_instead_of_coercing() {
+            // spot_weight_method: 7 used to coerce to "fixed" everywhere.
+            let errors = validate_plan(
+                "zero_field",
+                &serde_json::json!({
+                    "selected_energies": [100.0],
+                    "spot_weight_method": 7,
+                }),
+            );
+            assert!(!errors.is_empty());
+        }
+
+        #[test]
+        fn the_filename_echoes_the_generators_defaults() {
+            // Null params generate the catalog defaults — the name must say them.
+            let name = suggest_filename("zero_field", &serde_json::json!({}), None, 128);
+            assert!(name.contains("Sp100"), "{name}");
+            let name = suggest_filename(
+                "rectangular_field",
+                &serde_json::json!({"spot_weight_method": "fixed"}),
+                None,
+                128,
+            );
+            assert!(name.contains("Wfix0.02"), "{name}");
+            assert!(name.contains("100x100mm"), "{name}");
+            assert!(name.contains("G33x33"), "{name}");
+        }
+
         let short = suggest_filename(
             "zero_field",
             &json!({"selected_energies": STANDARD_ENERGIES_MEV.to_vec(), "spots_per_layer": 100000, "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),

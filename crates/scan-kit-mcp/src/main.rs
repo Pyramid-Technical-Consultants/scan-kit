@@ -195,17 +195,21 @@ fn schema_for(name: &str) -> Value {
 fn dispatch(
     name: &str,
     input: &Value,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Value, String> {
     if scan_kit_core::tools().iter().any(|tool| tool.name == name) {
         scan_kit_core::invoke(name, input).map_err(|err| err.to_string())
     } else if scan_kit_io::tools().iter().any(|tool| tool.name == name) {
-        scan_kit_io::invoke_flag(name, input, cancel).map_err(|err| err.to_string())
+        scan_kit_io::invoke_flag(name, input, cancel.as_ref()).map_err(|err| err.to_string())
     } else if scan_kit_compute::tools()
         .iter()
         .any(|tool| tool.name == name)
     {
-        scan_kit_compute::invoke(name, input)
+        scan_kit_compute::invoke_flag(
+            name,
+            input,
+            &scan_kit_core::Cancel::from_arc(cancel.clone()),
+        )
     } else if scan_kit_dicom::tools().iter().any(|tool| tool.name == name) {
         scan_kit_dicom::invoke(name, input)
     } else {

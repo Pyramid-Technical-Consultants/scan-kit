@@ -647,7 +647,12 @@ export default function App() {
             event.preventDefault();
             window.clearTimeout(timer);
             try {
-              await persistGeometry();
+              // The store write can wait on a scan's lock for seconds — cap
+              // it or closing the window visibly stalls behind an index.
+              await Promise.race([
+                persistGeometry(),
+                new Promise<void>((resolve) => window.setTimeout(resolve, 1500)),
+              ]);
             } catch {
               // A failed geometry write still lets the window close.
             } finally {

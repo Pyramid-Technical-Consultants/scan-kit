@@ -211,10 +211,13 @@ pub(crate) fn read_remote_session_file(
     }
     let mut fs = crate::remote::connect(&remote, &password_of(&remote)).ok()?;
     let base = remote.path.trim_end_matches('/');
-    let mut candidates = vec![format!("{base}/{filename}")];
+    // Nested first — resolve_container prefers the inner dir when both
+    // layouts exist; a flat-first remote read would diverge from local.
+    let mut candidates = Vec::new();
     if discover::valid_session_id(session_id) {
         candidates.push(format!("{base}/{session_id}/{filename}"));
     }
+    candidates.push(format!("{base}/{filename}"));
     for path in candidates {
         if let Ok(Some(bytes)) = fs.read(&path) {
             return Some(bytes);
@@ -374,16 +377,22 @@ pub(crate) fn fixture_copies(spec: &str) -> u32 {
     crate::remote::fixture_copies(&remote.canonical)
 }
 
-fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
-    // ponytail: one global lock serializes every remote copy — copies are rare
-    // and a per-dest keyed guard is not worth the bookkeeping. Without it two
-    // copies of one session can interleave: the first writes the stamp, the
-    // second overwrites files under a matching stamp, poisoning the cache.
-    static COPY: OnceLock<Mutex<()>> = OnceLock::new();
-    let _copy = COPY
-        .get_or_init(|| Mutex::new(()))
+// ponytail: one global lock serializes every remote copy — copies are rare
+// and a per-dest keyed guard is not worth the bookkeeping. Without it two
+// copies of one session can interleave: the first writes the stamp, the
+// second overwrites files under a matching stamp, poisoning the cache.
+// delete_storage's cache removal takes the same lock so a trashed session
+// cannot be resurrected by an in-flight copy stamping the remains.
+static COPY: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn copy_lock() -> std::sync::MutexGuard<'static, ()> {
+    COPY.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|err| err.into_inner());
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
+    let _copy = copy_lock();
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
     // Only plain relative segments may join the cache — a `..` escapes it, and
@@ -398,7 +407,13 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     let dest = cache_directory(library_canonical).join(&relative);
     let stamp_text = remote_stamp(&session)?;
     let stamp_path = stamp_file(&dest);
-    if dest.exists() && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp_text.as_str())
+    // "0\n0" means the remote could not be stat'ed (a HEAD-less HTTP server,
+    // an FTP dir with no MLST facts, or a deleted session) — it carries no
+    // freshness information, so it must never validate the cache. On those
+    // servers every open re-copies; stale-forever is the worse failure.
+    if stamp_text != "0\n0"
+        && dest.exists()
+        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp_text.as_str())
     {
         return Ok(dest);
     }
@@ -406,25 +421,40 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     let mut fs = crate::remote::connect(&session, &password_of(&session))?;
-    // Files the remote tree lost must not survive in the cache — replace the
-    // copy, never merge over it. A failed clear must error out here: merging
-    // over a surviving tree and then stamping it would pin stale files in
-    // the cache permanently.
-    // The remote's type can flip (a file now sits where a dir was cached) —
-    // remove_dir_all would then error forever and wedge the cache entry.
-    let cleared = if dest.is_dir() {
-        fs::remove_dir_all(&dest)
-    } else {
-        fs::remove_file(&dest)
-    };
-    if let Err(err) = cleared {
-        // A first materialize has nothing to clear; a removal that left any
-        // of the tree behind must not be stamped over.
-        if dest.exists() {
-            return Err(err.to_string());
-        }
+    // Copy into a sibling then swap: a failed download keeps the last good
+    // tree, and a half-written copy is never stamped or served. A leftover
+    // tmp from a killed process is reclaimed on entry; the rename makes the
+    // replace atomic to in-process readers — a peer process mid-read can
+    // still see the swap (the per-dest lockfile is the full fix).
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(".{name}.part-{}", std::process::id()));
+    let old = parent.join(format!(".{name}.old-{}", std::process::id()));
+    if tmp.exists() {
+        let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
     }
-    fs.copy_to(&session.path, &dest)?;
+    if let Err(err) = fs.copy_to(&session.path, &tmp) {
+        let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
+        return Err(err);
+    }
+    if dest.exists() {
+        if old.exists() {
+            let _ = fs::remove_dir_all(&old).or_else(|_| fs::remove_file(&old));
+        }
+        fs::rename(&dest, &old).map_err(|err| {
+            let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
+            format!("could not swap the remote cache: {err}")
+        })?;
+    }
+    if let Err(err) = fs::rename(&tmp, &dest) {
+        // The old tree must come back — the cache is not allowed to go
+        // missing over a rename failure.
+        let _ = fs::rename(&old, &dest);
+        return Err(format!("could not swap the remote cache: {err}"));
+    }
+    if old.exists() {
+        let _ = fs::remove_dir_all(&old).or_else(|_| fs::remove_file(&old));
+    }
     if let Some(parent) = stamp_path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -574,6 +604,11 @@ fn walk_remote(
         {
             continue;
         }
+        // Same staging exclusion the local walk makes — a half-written
+        // tree must not surface as a session.
+        if item.name.starts_with(".session_staging-") {
+            continue;
+        }
         if item.dir {
             dirs.push(item.name);
         } else {
@@ -642,7 +677,12 @@ fn walk_remote(
                 continue;
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(err) => {
+                // remote_exam's keep() cancel is a real abort, not a
+                // skipped directory.
+                if err == "cancelled" {
+                    return Err(err);
+                }
                 *walk_failed = true;
                 skipped.push(child_rel);
                 continue;
@@ -681,6 +721,11 @@ fn remote_exam(
             || item.name == ".."
             || item.name.contains(['/', '\\'])
         {
+            continue;
+        }
+        // Same staging exclusion the local walk makes — a half-written
+        // tree must not surface as a session.
+        if item.name.starts_with(".session_staging-") {
             continue;
         }
         if item.dir {
@@ -1660,6 +1705,11 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                                 .all(|part| matches!(part, std::path::Component::Normal(_)));
                         if safe {
                             let cached = cache_directory(root).join(&relative);
+                            // materialize holds COPY for its whole
+                            // check/clear/copy/stamp — take it here too or
+                            // the copy can re-create and stamp what delete
+                            // removed.
+                            let _copy = copy_lock();
                             let _ = std::fs::remove_dir_all(&cached);
                             let _ = std::fs::remove_file(stamp_file(&cached));
                         }

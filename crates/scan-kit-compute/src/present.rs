@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use scan_kit_core::Cancel;
 use scan_kit_core::{is_session, Series, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
@@ -79,6 +80,12 @@ pub fn tool_input_schema(name: &str) -> Value {
 }
 
 pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
+    invoke_flag(name, input, &Cancel::new())
+}
+
+/// `invoke` with a cooperative cancel — an MCP client's cancelled request
+/// stops the drain instead of finishing detached and still writing the file.
+pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, String> {
     match name {
         "scan_kit_run_view" => {
             let view = text(input, "view")?;
@@ -108,6 +115,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 background,
                 foreground,
                 &palette,
+                cancel,
             )
         }
         "scan_kit_write_dose" | "scan_kit_write_report" => {
@@ -127,7 +135,8 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
             } else {
                 "write_report"
             };
-            let bytes = crate::task::drain_task(view, Path::new(path), &session_ids, &options)?;
+            let bytes =
+                crate::task::drain_task(view, Path::new(path), &session_ids, &options, cancel)?;
             serde_json::from_slice(&bytes).map_err(|err| format!("export result: {err}"))
         }
         _ => Err(format!("unknown tool {name}")),
@@ -145,6 +154,7 @@ pub fn run_view(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
+    cancel: &Cancel,
 ) -> Result<Value, String> {
     let bytes = open_plot(
         view,
@@ -154,6 +164,7 @@ pub fn run_view(
         background,
         foreground,
         palette,
+        cancel,
     )?;
     let header = scan_kit_plot::plot_header(&bytes)?;
     if header.reuses_lines() {
@@ -185,6 +196,7 @@ pub fn open_plot(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
+    cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
     // Task views never produce plot bytes — and ExportStage/CopyStage write files
     // as a side effect, so letting `scan_kit_run_view` (a READ_ONLY MCP tool)
@@ -202,6 +214,7 @@ pub fn open_plot(
         background,
         foreground,
         palette,
+        cancel,
     )
 }
 
@@ -559,6 +572,7 @@ mod tests {
             [0.1, 0.1, 0.1, 1.0],
             [0.9, 0.9, 0.9, 1.0],
             &[[0.8, 0.8, 0.8, 1.0], [0.4, 0.4, 0.4, 1.0]],
+            &Cancel::new(),
         )
         .unwrap();
         assert!(frame["title"].as_str().unwrap().contains("vs"));
@@ -591,6 +605,7 @@ mod tests {
             [0.1, 0.1, 0.1, 1.0],
             [0.9, 0.9, 0.9, 1.0],
             &[[0.8, 0.2, 0.2, 1.0]],
+            &Cancel::new(),
         )
         .unwrap();
         let header = scan_kit_plot::plot_header(&opened).unwrap();

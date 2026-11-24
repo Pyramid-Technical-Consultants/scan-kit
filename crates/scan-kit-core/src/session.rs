@@ -284,7 +284,11 @@ fn parse_layer_delivery(line: &str) -> Option<i32> {
     if let Some((_, planned)) = rest.split_once('/') {
         rest = planned.trim();
     }
-    i32::try_from(leading_number(rest)? as i64).ok()
+    // A non-positive or overflowing count is corrupt text, not geometry —
+    // leaving it None keeps the geom_incomplete seal.
+    i32::try_from(leading_number(rest)? as i64)
+        .ok()
+        .filter(|count| *count > 0)
 }
 
 fn leading_number(text: &str) -> Option<f64> {
@@ -328,7 +332,7 @@ fn leading_number(text: &str) -> Option<f64> {
             index = mantissa;
         }
     }
-    text[..index].parse().ok()
+    text[..index].parse().ok().filter(|v: &f64| v.is_finite())
 }
 
 fn parse_summary_date(rest: &str) -> Option<SummaryDate> {
@@ -497,6 +501,19 @@ Configuration name: working_no_hvttt_new_cal
             parse_termination_summary_text("Layer delivery: 18\n").layer_count,
             Some(18)
         );
+        // A corrupt count is corrupt text, not geometry — leaving it None
+        // keeps the geom_incomplete seal.
+        for bogus in [
+            "Layer delivery: -5\n",
+            "Layer delivery: 0\n",
+            "Layer delivery: 1e999\n",
+        ] {
+            assert_eq!(
+                parse_termination_summary_text(bogus).layer_count,
+                None,
+                "{bogus}"
+            );
+        }
         let no_geom = parse_termination_summary_text("Primary total dose: 1.0\n");
         assert_eq!(no_geom.map_extent_mm, None);
         assert_eq!(no_geom.layer_count, None);

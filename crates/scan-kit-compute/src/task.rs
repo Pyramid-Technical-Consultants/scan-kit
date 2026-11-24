@@ -257,9 +257,14 @@ pub fn poll_task(id: u64, expect_generation: Option<u64>) -> Result<Vec<u8>, Str
             let report = driver
                 .ended_tasks
                 .iter()
-                .find(|report| report.task == id)
+                .find(|report| {
+                    report.task == id
+                        && expect_generation
+                            .map(|want| report.generation == want)
+                            .unwrap_or(true)
+                })
                 .cloned()
-                .unwrap_or_else(|| ended(id, 0, Phase::Cancelled, ""));
+                .unwrap_or_else(|| ended(id, expect_generation.unwrap_or(0), Phase::Cancelled, ""));
             return Ok(encode_poll(&report, None, true));
         };
         let Some(stage) = task.stage.take() else {
@@ -393,6 +398,7 @@ pub(crate) fn drain_plot(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
+    cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
     let mut options = options.clone();
     scan_kit_io::normalize_options(&mut options);
@@ -405,7 +411,7 @@ pub(crate) fn drain_plot(
         // poll_task treats the same call tree as panic-capable — an unwind
         // here would cross invoke() instead of surfacing an Err.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            stage.poll(Duration::MAX, &Cancel::new())
+            stage.poll(Duration::MAX, cancel)
         }));
         match result {
             Ok(Poll::Ready(bytes)) => return Ok(bytes),
@@ -429,8 +435,18 @@ pub(crate) fn drain_task(
     root: &Path,
     sessions: &[String],
     options: &Value,
+    cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
-    drain_plot(view, root, sessions, options, [0.0; 4], [0.0; 4], &[])
+    drain_plot(
+        view,
+        root,
+        sessions,
+        options,
+        [0.0; 4],
+        [0.0; 4],
+        &[],
+        cancel,
+    )
 }
 
 pub(crate) fn slot_of(view: &str) -> Slot {
@@ -1959,6 +1975,9 @@ impl ExportStage {
         if let Some(job) = &self.job {
             keep_runs(std::slice::from_ref(job), std::slice::from_ref(&result));
         }
+        // A run that finished before the first Pending poll never set
+        // total — report 1 of 1 rather than 0 of 0.
+        self.report.total = self.report.total.max(1);
         self.report.done = self.report.total;
         let run = scan_kit_io::patient_view::dose_from_result(inputs, Some(result));
         let gpu = crate::mc::adapter_info();
@@ -3067,6 +3086,7 @@ mod tests {
                 "study": root.join("missing").display().to_string(),
                 "dest": root.join("dose.dcm").display().to_string(),
             }),
+            &Cancel::new(),
         )
         .expect_err("a missing study cannot export");
         assert!(message.contains("missing"), "{message}");
@@ -3077,7 +3097,7 @@ mod tests {
         // The Tauri surface can start an export with no dest — it used to
         // run the whole Monte Carlo and only then fail on an empty path.
         let root = scratch();
-        let message = drain_task("write_dose", &root, &[], &json!({}))
+        let message = drain_task("write_dose", &root, &[], &json!({}), &Cancel::new())
             .expect_err("a missing dest cannot export");
         assert!(message.contains("dest is required"), "{message}");
         let _ = std::fs::remove_dir_all(&root);
@@ -3101,6 +3121,7 @@ mod tests {
                 [0.0; 4],
                 [0.0; 4],
                 &[],
+                &Cancel::new(),
             )
             .expect_err("task views never produce plot bytes");
             assert!(message.contains("not a plot"), "{view}: {message}");
@@ -3232,6 +3253,42 @@ mod tests {
         assert_eq!(report["phase"], "cancelled");
         // The successor's stage is still parked — nothing was consumed.
         assert!(lock().tasks.get(&id).unwrap().stage.is_some());
+    }
+
+    #[test]
+    fn an_ended_task_replay_filters_by_generation() {
+        // A stale-gen poller must not read the successor's terminal report —
+        // it gets cancelled-for-its-ticket, like a missed task.
+        struct Ready;
+        impl Stage for Ready {
+            fn poll(&mut self, _budget: Duration, _cancel: &Cancel) -> Poll<Vec<u8>> {
+                Poll::Ready(b"done".to_vec())
+            }
+            fn report(&self) -> Report {
+                report_at(Phase::Scene, 0, 0)
+            }
+        }
+        let id = {
+            let mut driver = lock();
+            let id = driver.next;
+            driver.next = driver.next.saturating_add(1);
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 2,
+                    cancel: Cancel::new(),
+                    stage: Some(Box::new(Ready)),
+                    last_report: None,
+                },
+            );
+            id
+        };
+        let report = poll_report(&poll_task(id, Some(2)).unwrap());
+        assert_eq!(report["phase"], "done");
+        // gen-1's poll replays cancelled, not the gen-2 done.
+        let report = poll_report(&poll_task(id, Some(1)).unwrap());
+        assert_eq!(report["phase"], "cancelled");
+        assert_eq!(report["generation"], 1);
     }
 
     #[test]

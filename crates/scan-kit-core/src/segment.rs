@@ -166,21 +166,29 @@ fn without_playhead(items: Vec<Segment>) -> Vec<Segment> {
 
 /// `(lo, hi)` of the playhead window, or nothing when the timeline is off.
 /// `before` starts at negative infinity. The one-second window starts one second earlier.
-pub fn scrub_limits(options: &Value) -> Option<(f32, f32)> {
+/// `at` is clamped to the same `[0, end]` the control advertises — a stale
+/// playhead past the end must not keep everything (before) or nothing.
+pub fn scrub_limits(options: &Value, end: f32) -> Option<(f32, f32)> {
     let value = scrub_value(options)?;
     if value.get("on").and_then(Value::as_bool) != Some(true) {
         return None;
     }
     // `on` without a usable playhead is off — fabricating at t=0 would
     // filter nearly every row with no indication why.
-    let at = finite_f32(value.get("at"))?.max(0.0);
+    // max() keeps +INF (the segment path has no end) while normalizing
+    // NaN and negatives to an empty [0, 0] window.
+    let end = end.max(0.0);
+    let at = finite_f32(value.get("at"))?.clamp(0.0, end);
     let before = value.get("window").and_then(Value::as_str) == Some("before");
     let lo = if before { f32::NEG_INFINITY } else { at - 1.0 };
     Some((lo, at))
 }
 
 fn scrub_range(options: &Value) -> Option<Segment> {
-    let (lo, hi) = scrub_limits(options)?;
+    // ponytail: the segment path has no `end` — the control already
+    // advertises `at` clamped to [0, end], so a direct caller past the end
+    // gets the literal window. The timeline path clamps via scrub_limits.
+    let (lo, hi) = scrub_limits(options, f32::INFINITY)?;
     Some(Segment::Range {
         column: "time_s".to_owned(),
         lo,
@@ -379,10 +387,13 @@ pub fn row_mask(
 pub fn apply_mask(table: &mut BTreeMap<String, Vec<f32>>, items: &[Segment], rank_on: &[&str]) {
     let keep = row_mask(table, items, rank_on);
     for (key, values) in table.iter_mut() {
-        if matches!(
-            key.as_str(),
-            "beam_on" | "expected_sigma" | "session_avg_rate"
-        ) {
+        // Guide columns keep their values under the mask — expected_sigma
+        // is emitted per device as expected_sigma_{key} (tables.rs), so the
+        // exemption must be a prefix, not the exact name.
+        if key.as_str() == "beam_on"
+            || key.as_str() == "session_avg_rate"
+            || key.as_str().starts_with("expected_sigma")
+        {
             continue;
         }
         for (value, slot) in values.iter_mut().zip(&keep) {
@@ -566,13 +577,13 @@ mod tests {
     fn a_scrubbed_timeline_without_a_playhead_is_off() {
         // `{"on":true}` used to fabricate at=0 — a [-1, 0] window that
         // filters every row of a session starting after t=0.
-        assert_eq!(scrub_limits(&json!({"scrub": {"on": true}})), None);
+        assert_eq!(scrub_limits(&json!({"scrub": {"on": true}}), 60.0), None);
         assert_eq!(
-            scrub_limits(&json!({"scrub": {"on": true, "at": "soon"}})),
+            scrub_limits(&json!({"scrub": {"on": true, "at": "soon"}}), 60.0),
             None
         );
         assert_eq!(
-            scrub_limits(&json!({"scrub": {"on": true, "at": 30.0}})),
+            scrub_limits(&json!({"scrub": {"on": true, "at": 30.0}}), 60.0),
             Some((29.0, 30.0))
         );
     }
@@ -614,6 +625,30 @@ mod tests {
         );
         assert_eq!(finite(&off), vec![0.0]);
         assert!(off["beam_on"][0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn expected_sigma_guides_survive_the_mask() {
+        // The guides are emitted as expected_sigma_{key} per device — an
+        // exact-name exemption misses them and NaNs the plotted band.
+        let mut table = sample();
+        table.insert("expected_sigma_10x10".to_owned(), vec![7.0; 21]);
+        apply_mask(
+            &mut table,
+            &[Segment::Beam {
+                state: BeamGate::Off,
+            }],
+            &["y"],
+        );
+        assert!(table["expected_sigma_10x10"].iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_stale_playhead_past_the_end_clamps() {
+        // The control advertises at.clamp(0, end) — the filter must apply the
+        // same bound or a stale beyond-end playhead keeps an empty window.
+        let options = serde_json::json!({"scrub": {"on": true, "at": 50.0}});
+        assert_eq!(scrub_limits(&options, 10.0), Some((9.0, 10.0)));
 
         let mut on = sample();
         apply_mask(
@@ -933,7 +968,7 @@ mod tests {
     #[test]
     fn a_negative_playhead_clamps_to_zero() {
         let options = serde_json::json!({ "scrub": "{ \"on\": true, \"at\": -5.0 }" });
-        assert_eq!(scrub_limits(&options), Some((-1.0, 0.0)));
+        assert_eq!(scrub_limits(&options, 60.0), Some((-1.0, 0.0)));
     }
     #[test]
     fn a_real_json_segments_array_is_accepted() {

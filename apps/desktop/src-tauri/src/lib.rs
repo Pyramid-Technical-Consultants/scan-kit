@@ -142,19 +142,22 @@ async fn scan_kit_start(
 
 /// One slice of a task: a progress report and, when this slice drew something, its payload.
 #[tauri::command]
-async fn scan_kit_poll(task: u64, generation: Option<u64>) -> Result<tauri::ipc::Response, String> {
-    let bytes =
-        tauri::async_runtime::spawn_blocking(move || scan_kit_compute::poll_task(task, generation))
-            .await
-            .map_err(|err| err.to_string())??;
+async fn scan_kit_poll(task: u64, generation: u64) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::poll_task(task, Some(generation))
+    })
+    .await
+    .map_err(|err| err.to_string())??;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
-async fn scan_kit_cancel(task: u64, generation: Option<u64>) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::cancel_task(task, generation))
-        .await
-        .map_err(|err| err.to_string())
+async fn scan_kit_cancel(task: u64, generation: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::cancel_task(task, Some(generation))
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -323,7 +326,18 @@ async fn scan_kit_reveal(path: String) -> Result<(), String> {
         }
         #[cfg(not(windows))]
         command.args(reveal_args(&target));
-        command.spawn().map(|_| ()).map_err(|err| err.to_string())
+        command
+            .spawn()
+            .map(|mut child| {
+                // Dropping a Child does not reap it — xdg-open/`open -R`
+                // exit right after handoff and would sit as zombies until
+                // the app exits. explorer.exe persists on Windows, so reap
+                // on a thread instead of waiting inline.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            })
+            .map_err(|err| err.to_string())
     })
     .await
     .map_err(|err| err.to_string())?

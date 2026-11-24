@@ -290,6 +290,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     let mut slices: Vec<_> = ct_slices.into_iter().map(|(_, slice)| slice).collect();
     let mut ct = stack(&mut slices)?;
+    ct.position = ct_position.clone();
     ct.frame = frame.clone();
     ct.patient_id = patient_id;
     ct.patient_name = patient_name;
@@ -301,6 +302,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     } else {
         let mut slices: Vec<_> = dose_slices.into_iter().map(|(_, slice)| slice).collect();
         let mut volume = stack(&mut slices)?;
+        volume.position = ct_position.clone();
         volume.frame = frame.clone();
         volume.dose_type = dose_type;
         volume.summation = summation;
@@ -364,22 +366,40 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
             let size = floats_tag(cp, tag(0x300A, 0x0398));
-            let (size_x, size_y) = if size.len() >= 2 {
-                (size[0], size[1])
-            } else {
-                (f32::NAN, f32::NAN)
-            };
             let limit = n.min(xy.len() / 2);
             // The weights tag must hold one entry per spot position — a
             // short array would silently drop the tail of the beam.
             if has_weights && weights.len() < limit {
                 return Err("meterset weights do not match the spot count".into());
             }
+            // Scan Mode is Type 1C only for MODULATED beams — absent on a
+            // MODULATED beam is the loud error read_plan already makes; on a
+            // UNIFORM beam every spot gets an equal share. An absent/unknown
+            // mode with no weight map cannot pick between them — refuse.
+            if !has_weights && limit > 0 {
+                match text_tag(beam, tag(0x300A, 0x0308)).as_str() {
+                    "UNIFORM" => {}
+                    "MODULATED" => {
+                        return Err("meterset weights are missing".into());
+                    }
+                    _ => return Err("a treatment beam has no scan mode".into()),
+                }
+            }
             for i in 0..limit {
                 let mu = if has_weights {
                     weights.get(i).copied().unwrap_or(f32::NAN)
                 } else {
-                    0.0
+                    // UNIFORM — an equal weight share per spot.
+                    1.0
+                };
+                // ScanningSpotSize is 2·n (x,y) pairs in spot order; a lone
+                // pair applies to every spot.
+                let (size_x, size_y) = if size.len() >= 2 * limit {
+                    (size[2 * i], size[2 * i + 1])
+                } else if size.len() >= 2 {
+                    (size[0], size[1])
+                } else {
+                    (f32::NAN, f32::NAN)
                 };
                 let index = plan_index;
                 plan_index += 1;
@@ -704,11 +724,23 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     let signed = int_tag(elems, tag(0x0028, 0x0103)).unwrap_or(0) == 1;
     // High Bit marks the sign bit of the stored value — a 12-bit signed
     // sample in a 16-bit slot reads as a large positive without extension.
+    // bits - 1 underflows i32 on a corrupt Bits Allocated — clamp first.
     let high_bit = i64::from(
         int_tag(elems, tag(0x0028, 0x0102))
-            .unwrap_or(bits - 1)
+            .unwrap_or_else(|| bits.max(1) - 1)
             .clamp(0, 62),
     );
+    let sample_bytes = if bits == 8 {
+        1
+    } else if bits > 16 {
+        4
+    } else {
+        2
+    };
+    if !pixels.bytes.len().is_multiple_of(sample_bytes) {
+        // A frame ending mid-sample would silently drop the dangling bytes.
+        return Err("pixel data ends inside a sample".into());
+    }
     let stored: Vec<f32> = if bits == 8 {
         pixels
             .bytes
@@ -932,16 +964,26 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
     }
     let mut fractions = 1;
     let mut metersets = Vec::new();
-    // ponytail: beams in later fraction groups share this fraction count.
+    let mut populated_groups = 0;
     for group in seq(elems, tag(0x300A, 0x0070)) {
-        if metersets.is_empty() {
+        let beams_in_group = seq(group, tag(0x300C, 0x0004));
+        if !beams_in_group.is_empty() {
+            // A second populated group's metersets would misattribute via
+            // the first-match find below, and its fraction count may differ
+            // — refuse rather than pick one silently.
+            populated_groups += 1;
+            if populated_groups > 1 {
+                return Err(
+                    "more than one fraction group with beam references is not supported".into(),
+                );
+            }
             fractions = match int_tag(group, tag(0x300A, 0x0078)) {
                 Some(value) if value > 0 => value,
                 Some(_) => return Err("a fraction group has a non-positive fraction count".into()),
                 None => 1,
             };
         }
-        for beam in seq(group, tag(0x300C, 0x0004)) {
+        for beam in beams_in_group {
             metersets.push((
                 int_tag(beam, tag(0x300C, 0x0006)).unwrap_or(0),
                 float_tag(beam, tag(0x300A, 0x0086)).unwrap_or(0.0),
@@ -1096,7 +1138,6 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
-            let spot_size_mm = scanning_spot_mm(cp);
             if n == 0 {
                 continue;
             }
@@ -1121,9 +1162,19 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 ));
             }
             // A modulated beam's weight map is Type 1C — absent, every spot
-            // computes mu = 0 and the beam silently empties.
-            if !has_weights && limit > 0 && text_tag(beam, tag(0x300A, 0x0308)) == "MODULATED" {
-                return Err(format!("beam {number}: meterset weights are missing"));
+            // computes mu = 0 and the beam silently empties. UNIFORM means an
+            // equal meterset share per spot; a missing mode cannot pick
+            // between them, so it errors too.
+            if !has_weights && limit > 0 {
+                match text_tag(beam, tag(0x300A, 0x0308)).as_str() {
+                    "UNIFORM" => {}
+                    "MODULATED" => {
+                        return Err(format!("beam {number}: meterset weights are missing"));
+                    }
+                    _ => {
+                        return Err(format!("beam {number}: scan mode is missing"));
+                    }
+                }
             }
             if in_shifters.len() > 1 {
                 return Err(format!(
@@ -1143,7 +1194,12 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 None => (String::new(), 0.0, f32::NAN),
             };
             for i in 0..limit {
-                let mu = weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight;
+                let mu = if has_weights {
+                    weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight
+                } else {
+                    // UNIFORM — an equal share of the beam meterset.
+                    meterset / limit as f32
+                };
                 let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);
                 let y = xy.get(i * 2 + 1).copied().unwrap_or(f32::NAN);
                 // A non-finite position or meterset reaches the transport
@@ -1157,7 +1213,7 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                         shifter: shifter.clone(),
                         wet_mm,
                         shifter_distance_mm,
-                        spot_size_mm,
+                        spot_size_mm: scanning_spot_mm_at(cp, i, limit),
                     });
                 }
             }
@@ -1219,7 +1275,12 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
             // even-odd test — only closed rings rasterize. A missing tag
             // defaults to closed (Type 3, writers commonly omit it).
             let kind = text_tag(item, tag(0x3006, 0x0042));
-            if !kind.is_empty() && kind.trim() != "CLOSED_PLANAR" {
+            // CLOSEDPLANAR_XOR is retired but still exported — it is a
+            // closed ring, and the even-odd fill already implements XOR.
+            if !kind.is_empty()
+                && kind.trim() != "CLOSED_PLANAR"
+                && kind.trim() != "CLOSEDPLANAR_XOR"
+            {
                 continue;
             }
             let data = floats_tag(item, tag(0x3006, 0x0050));
@@ -1520,7 +1581,11 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
             return Err("undefined-length DICOM sequences are not read".into());
         }
         let start = cursor + header;
-        let end = start + length as usize;
+        // checked_add like element_span — on wasm32 a u32 length could
+        // wrap the add and pass the bounds check.
+        let end = start
+            .checked_add(length as usize)
+            .ok_or("the dataset ends inside an element")?;
         if end > bytes.len() {
             return Err("the dataset ends inside an element".into());
         }
@@ -1599,7 +1664,9 @@ fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>
             return Err("undefined-length DICOM sequences are not read".into());
         }
         let start = cursor + 8;
-        let end = start + length as usize;
+        let end = start
+            .checked_add(length as usize)
+            .ok_or("a sequence item is short")?;
         if end > bytes.len() {
             return Err("a sequence item is short".into());
         }
@@ -1709,6 +1776,21 @@ fn scanning_spot_mm(cp: &[Elem]) -> f32 {
         (size[0] + size[1]) / 2.0
     } else {
         0.0
+    }
+}
+
+/// ScanningSpotSize is a 2·n array of (x,y) FWHM pairs in spot order —
+/// spot `i`'s pair is `size[2i]`/`size[2i+1]`, a lone pair covers all.
+fn scanning_spot_mm_at(cp: &[Elem], i: usize, limit: usize) -> f32 {
+    let size = floats_tag(cp, tag(0x300A, 0x0398));
+    if size.len() >= 2 * limit {
+        let (x, y) = (size[2 * i], size[2 * i + 1]);
+        if x > 0.0 && y > 0.0 && x < 500.0 && y < 500.0 && x.is_finite() && y.is_finite() {
+            return (x + y) / 2.0;
+        }
+        0.0
+    } else {
+        scanning_spot_mm(cp)
     }
 }
 
@@ -3628,5 +3710,137 @@ mod tests {
         bytes.extend_from_slice(&slope);
         ow(&mut bytes, 0x7FE0, 0x0010, &[0]).unwrap();
         assert!(image_slices(&parse_dataset(&bytes).unwrap(), 1.0).is_err());
+    }
+
+    fn uniform_beam_group() -> Vec<u8> {
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        group
+    }
+
+    #[test]
+    fn a_uniform_beam_shares_its_meterset_across_spots() {
+        // No Scan Spot Meterset Weights on a UNIFORM scan is not "every spot
+        // is zero" — the beam meterset divides evenly over the spot map.
+        let group = uniform_beam_group();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0, 2.0, -2.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        cs(&mut beam, 0x300A, 0x0308, "UNIFORM").unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let parsed = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").unwrap();
+        assert_eq!(parsed.beams[0].spots.len(), 2);
+        for spot in &parsed.beams[0].spots {
+            assert!((spot.mu - 5.0).abs() < 1e-4, "{}", spot.mu);
+        }
+    }
+
+    #[test]
+    fn a_beam_without_weights_or_scan_mode_is_an_error() {
+        // Scan Mode is Type 1C — absent with no weight map the loader cannot
+        // pick UNIFORM vs MODULATED and must refuse, not emit a zero beam.
+        let group = uniform_beam_group();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
+        for mode in ["", "MODULATED"] {
+            let mut beam = Vec::new();
+            is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+            if !mode.is_empty() {
+                cs(&mut beam, 0x300A, 0x0308, mode).unwrap();
+            }
+            ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+            is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+            sq(&mut beam, 0x300A, 0x03A8, &[cp.clone()]).unwrap();
+            let mut plan = Vec::new();
+            sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+            sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+            let message = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS")
+                .err()
+                .unwrap_or_default();
+            assert!(
+                message.contains("scan mode") || message.contains("weights"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_populated_fraction_group_is_rejected() {
+        // Metersets pool across groups and first-match wins — a second group
+        // with beam refs would misattribute dose silently.
+        let group = uniform_beam_group();
+        let mut second = Vec::new();
+        is(&mut second, 0x300A, 0x0078, 3).unwrap();
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 9).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[4.0]).unwrap();
+        sq(&mut second, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group, second]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let message = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS")
+            .err()
+            .unwrap_or_default();
+        assert!(message.contains("fraction group"), "{message}");
+    }
+
+    #[test]
+    fn spot_sizes_index_per_spot() {
+        // ScanningSpotSize is 2·n pairs in spot order — spot two must not
+        // inherit spot one's size.
+        let group = uniform_beam_group();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0, 2.0, -2.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0, 1.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0398, &[4.0, 4.0, 8.0, 8.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let parsed = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").unwrap();
+        assert!((parsed.beams[0].spots[0].spot_size_mm - 4.0).abs() < 1e-4);
+        assert!((parsed.beams[0].spots[1].spot_size_mm - 8.0).abs() < 1e-4);
     }
 }
