@@ -1169,16 +1169,17 @@ pub fn sample_mm(volume: &Volume, mm: [f32; 3], filter: u8) -> f32 {
 }
 
 pub fn sample_index(volume: &Volume, x: f32, y: f32, z: f32, filter: u8) -> f32 {
+    // NaN folds to index 0 through `as i32` in every filter branch — a
+    // non-finite coordinate is a miss, not corner-voxel data.
+    if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+        return 0.0;
+    }
     match filter {
         2 => cubic(volume, x, y, z),
         1 => linear(volume, x, y, z),
         _ => {
             // Python nearest is floor(cell), and a miss outside the grid is 0.
             // `x` is cell - 0.5, the same coordinate linear interpolation uses.
-            // NaN folds to index 0 through `as i32` — treat it as a miss too.
-            if !(x.is_finite() && y.is_finite() && z.is_finite()) {
-                return 0.0;
-            }
             let [nx, ny, nz] = volume.shape;
             let ix = (x + 0.5).floor() as i32;
             let iy = (y + 0.5).floor() as i32;

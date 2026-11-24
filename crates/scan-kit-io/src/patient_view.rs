@@ -659,8 +659,10 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             cutoff,
             norm,
         );
+        // Zero scored voxels is "not evaluated", not a 0% fail — the two
+        // sibling gamma paths already report NaN for the same condition.
         let rate = if scored == 0 {
-            0.0
+            f32::NAN
         } else {
             100.0 * passed as f32 / scored as f32
         };
