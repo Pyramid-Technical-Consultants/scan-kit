@@ -214,7 +214,15 @@ pub(crate) fn read_remote_session_file(
     // Nested first — resolve_container prefers the inner dir when both
     // layouts exist; a flat-first remote read would diverge from local.
     let mut candidates = Vec::new();
-    if discover::valid_session_id(session_id) {
+    // The nested candidate must carry the session marker — a stray
+    // {id}/{id}/ dir with no input_map.csv cannot steal the read, the same
+    // way the local session_directory gates nested on marker_file.
+    if discover::valid_session_id(session_id)
+        && matches!(
+            fs.read(&format!("{base}/{session_id}/input_map.csv")),
+            Ok(Some(_))
+        )
+    {
         candidates.push(format!("{base}/{session_id}/{filename}"));
     }
     candidates.push(format!("{base}/{filename}"));

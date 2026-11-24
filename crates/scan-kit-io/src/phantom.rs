@@ -65,14 +65,26 @@ pub fn write(parent: &Path, params: &Value, db: &Path) -> Result<Value, String> 
     // Claim the folder atomically — two writers in the same second used to
     // pass the exists() check together and interleave one study's files.
     let mut folder = parent.join(format!("synthetic_{phantom}_{stamp}"));
+    let mut claimed = false;
     for suffix in 0..10u32 {
         match fs::create_dir(&folder) {
-            Ok(()) => break,
+            Ok(()) => {
+                claimed = true;
+                break;
+            }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                 folder = parent.join(format!("synthetic_{phantom}_{stamp}-{suffix}"));
             }
             Err(err) => return Err(err.to_string()),
         }
+    }
+    // Exhaustion used to fall through and write into the unclaimed -9 —
+    // and its rollback could remove_dir_all a folder another writer owns.
+    if !claimed {
+        return Err(format!(
+            "could not claim a synthetic study folder under {}",
+            parent.display()
+        ));
     }
     let note = match write_phantom_study(&folder, params) {
         Ok(note) => note,

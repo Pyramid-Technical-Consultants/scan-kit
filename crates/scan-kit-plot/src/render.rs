@@ -2598,14 +2598,31 @@ impl Plot {
                 self.persp_fov = previous.persp_fov;
                 self.pan = previous.pan;
             }
-            if previous.turns.len() == self.panels.len() {
-                self.turns.clone_from(&previous.turns);
-            }
-            if previous.integral.len() == self.panels.len() {
-                self.integral.clone_from(&previous.integral);
-            }
-            if previous.profile_integral.len() == self.panels.len() {
-                self.profile_integral.clone_from(&previous.profile_integral);
+            for index in 0..self.panels.len().min(previous.panels.len()) {
+                // These flags only make sense for the same view kind — a
+                // rotated Axial displaced by 3D must not hand its turn to
+                // whatever lands in the slot.
+                if dose_plane(&previous.panels[index].title)
+                    != dose_plane(&self.panels[index].title)
+                {
+                    continue;
+                }
+                if let (Some(at), Some(was)) =
+                    (previous.turns.get(index), self.turns.get_mut(index))
+                {
+                    *was = *at;
+                }
+                if let (Some(at), Some(was)) =
+                    (previous.integral.get(index), self.integral.get_mut(index))
+                {
+                    *was = *at;
+                }
+                if let (Some(at), Some(was)) = (
+                    previous.profile_integral.get(index),
+                    self.profile_integral.get_mut(index),
+                ) {
+                    *was = *at;
+                }
             }
             if previous.profile_window.len() == self.panels.len()
                 && previous.home.len() == self.home.len()

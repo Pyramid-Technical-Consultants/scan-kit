@@ -393,6 +393,7 @@ pub fn volumetric(
         );
         // A partial MC run leaves one engine per cube — recompute the whole
         // session analytically rather than compare MC against analytic.
+        let mut rolled_back = false;
         if index == focus && model == "mc" {
             let attempted = [
                 cloud.pencils.is_empty(),
@@ -410,7 +411,8 @@ pub fn volumetric(
             .into_iter()
             .filter(|(done, tried)| *done && *tried)
             .count();
-            if succeeded > 0 && succeeded < attempted {
+            rolled_back = succeeded > 0 && succeeded < attempted;
+            if rolled_back {
                 (volume, _) = fill(
                     mat,
                     &cloud.pencils,
@@ -464,7 +466,13 @@ pub fn volumetric(
                 ran = None;
             }
         }
-        mc_note = mc_note.or(ran);
+        // Any fill's MC note counts - a plan-only run is still MC - but a
+        // rolled-back session must not keep one (its cubes are analytic).
+        mc_note = mc_note.or(if rolled_back {
+            None
+        } else {
+            ran.or(ran_c).or(ran_p)
+        });
         measured.push(volume);
         companions.push(companion);
         plans.push(plan);
@@ -565,6 +573,11 @@ pub fn volumetric(
         // usize::MAX makes every .get below miss, matching the MC focus.
         Err(_) => usize::MAX,
     };
+    // A hidden or removed focus session still owes the view a panel -
+    // an empty scene leaves the last picture painted like it is live.
+    if has_dose && shown.get(session_at).is_none() {
+        panels.push(note("The selected session is not in this view"));
+    }
     if has_dose {
         if let Some(volume) = shown.get(session_at) {
             let scan = scan_kit_core::scan_volume(volume);
@@ -700,7 +713,11 @@ pub fn volumetric(
             }
             if compare == "gamma" {
                 if let (Some(got), Some(plan)) = (measured.get(session_at), plans.get(session_at)) {
-                    if plan.shape == got.shape && plan.values.len() == got.values.len() {
+                    if plan.shape == got.shape
+                        && plan.values.len() == got.values.len()
+                        && plan.origin == got.origin
+                        && plan.spacing == got.spacing
+                    {
                         let planes = scan_kit_core::projected_gamma(got, plan, dd, dta, cutoff);
                         integral_rates = Some(planes.each_ref().map(|(_, rate)| *rate));
                         mark.integrals = planes.into_iter().map(|(gamma, _)| gamma).collect();

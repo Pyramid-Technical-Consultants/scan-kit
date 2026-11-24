@@ -924,7 +924,7 @@ fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>
         let layers = listed.iter().map(|(index, _)| *index).collect();
         (layers, parse_paths(&listed, kind, keep))
     } else {
-        let listed = discover::read_timeslice_frames(&key.dir);
+        let listed = discover::read_timeslice_frames(&key.dir, session);
         if listed.is_empty() {
             return None;
         }
@@ -1004,9 +1004,15 @@ fn frames_limited(
     }))
 }
 
+/// `is_file()` follows links — session-dir reads use the link's own metadata
+/// so a planted symlink cannot feed a file outside the session tree.
+fn plain_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
 fn map_sheet(root: &Path, session: &str) -> Arc<Sheet> {
     let path = discover::session_directory(root, session).join("input_map.csv");
-    if path.is_file() {
+    if plain_file(&path) {
         return sheet_all(&path, Keep::Map, |_| true);
     }
     Arc::new(
@@ -1104,7 +1110,7 @@ fn build_spot(
     let path = dir.join("spot_data.csv");
     let spot = if let Some(rows) = rows {
         sheet_rows(&path, Keep::Spot, spot_keep, rows)
-    } else if path.is_file() {
+    } else if plain_file(&path) {
         sheet_all(&path, Keep::Spot, spot_keep)
     } else {
         let Some(spot_bytes) = discover::read_session_file(root, session, "spot_data.csv") else {
@@ -2009,6 +2015,7 @@ pub(crate) fn point_time_stamp(dir: &Path) -> u128 {
         .map(|entries| {
             entries
                 .flatten()
+                .filter(|entry| !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
                 .map(|entry| entry.path())
                 .filter(|path| {
                     path.file_name()
@@ -2024,6 +2031,7 @@ pub(crate) fn point_time_stamp(dir: &Path) -> u128 {
             .map(|entries| {
                 entries
                     .flatten()
+                    .filter(|entry| !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
                     .map(|entry| entry.path())
                     .filter(|path| {
                         path.file_name()
@@ -2056,6 +2064,7 @@ fn layer_point_times(dir: &Path) -> HashMap<(u32, u32), f32> {
     };
     let mut layers: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
+        .filter(|entry| !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
@@ -2070,6 +2079,7 @@ fn layer_point_times(dir: &Path) -> HashMap<(u32, u32), f32> {
         };
         let mut runs: Vec<PathBuf> = entries
             .filter_map(|entry| entry.ok())
+            .filter(|entry| !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
             .map(|entry| entry.path())
             .filter(|path| {
                 path.file_name()
@@ -2110,7 +2120,7 @@ fn point_time_file(run: &Path) -> Option<PathBuf> {
         "RCI_spot_data.csv",
     ] {
         let path = run.join(name);
-        if path.is_file() {
+        if plain_file(&path) {
             return Some(path);
         }
     }
@@ -2119,6 +2129,7 @@ fn point_time_file(run: &Path) -> Option<PathBuf> {
     };
     let mut others: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
+        .filter(|entry| !entry.file_type().is_ok_and(|kind| kind.is_symlink()))
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
@@ -4377,6 +4388,9 @@ fn spot_keep(name: &str) -> bool {
 }
 
 fn parse_paths(listed: &[(i64, PathBuf)], kind: Keep, keep: fn(&str) -> bool) -> Vec<Arc<Sheet>> {
+    if listed.is_empty() {
+        return Vec::new();
+    }
     if listed.len() < 2 {
         let _quiet = QuietTail::suppress();
         return vec![sheet_all(&listed[0].1, kind, keep)];

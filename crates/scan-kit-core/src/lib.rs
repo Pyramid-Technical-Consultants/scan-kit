@@ -183,8 +183,12 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
             // remove+rename gap used to leave neither artifact nor payload when
             // the retry failed.
             Err(err)
-                if err.kind() == std::io::ErrorKind::PermissionDenied
-                    || err.kind() == std::io::ErrorKind::AlreadyExists =>
+                if (err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.kind() == std::io::ErrorKind::AlreadyExists)
+                    // A directory named *.csv would rename aside fine and
+                    // then lose to remove_file — silently displaced. Only a
+                    // real file is movable.
+                    && path.is_file() =>
             {
                 let mut bak = path.as_os_str().to_os_string();
                 bak.push(format!(".{}.{}.bak", std::process::id(), seq));
@@ -216,10 +220,14 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
                         let _ = std::fs::remove_file(&part);
                     })
             }
-            Err(err) => Err(err).inspect_err(|_| {
-                let _ = std::fs::remove_file(&part);
-            }),
+            Err(err) => Err(err),
         });
+    // Failures before the rename stage (disk-full write, dead fsync) used to
+    // leak the .part sibling; the inner arms keep their own removes only
+    // where an error message needs them.
+    let write = write.inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    });
     write.map_err(|err| format!("{}: {err}", path.display()))
 }
 

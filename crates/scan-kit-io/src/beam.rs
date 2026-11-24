@@ -55,6 +55,9 @@ impl BeamModel {
         if !model.rows.windows(2).all(|pair| pair[1][0] > pair[0][0]) {
             return Err(format!("{path:?} energy rows must be strictly increasing"));
         }
+        if !model.rows.iter().flatten().all(|value| value.is_finite()) {
+            return Err(format!("{path:?} energy rows must be finite"));
+        }
         // `<= 0.0` alone misses NaN — a literal "NaN" distance must fail too.
         if [model.nozzle, model.smx, model.smy]
             .iter()
@@ -109,7 +112,6 @@ impl BeamModel {
                 let declared = lines
                     .next()
                     .and_then(|line| line.split_whitespace().next()?.parse::<usize>().ok());
-                let _header = lines.next();
                 for line in lines.by_ref() {
                     let text = line.split('#').next().unwrap_or("").trim();
                     let parsed: Option<Vec<f32>> =
@@ -271,6 +273,9 @@ fn fill_spot(
         } else {
             wet_mm
         };
+        if !wet.is_finite() || wet < 0.0 {
+            return Err(format!("range shifter WET {wet} is not usable"));
+        }
         let tables = mc_tables();
         let medium = tables
             .ids
@@ -395,7 +400,9 @@ fn phase(size: f32, divergence: f32, correlation: f32) -> [f32; 6] {
     let b = correlation * size * divergence;
     let disc = ((a - c) * (a - c) + 4.0 * b * b).sqrt();
     let large = 0.5 * (a + c + disc);
-    let small = 0.5 * (a + c - disc);
+    // a ~ mm^2 dwarfs c ~ rad^2, so a + c - disc cancels ~6 digits - the
+    // determinant (det = product of the eigenvalues) is stable in f32.
+    let small = ((a * c - b * b) / large).max(0.0);
     let big = eigen(a, b, c, large);
     let little = eigen(a, b, c, small);
     [
@@ -570,5 +577,100 @@ h
         let model = BeamModel::parse(&text).expect("parses");
         assert_eq!(model.shifter_density, 2.5);
         assert_eq!(model.rows.len(), 2);
+    }
+
+    #[test]
+    fn a_mixed_scale_phase_matrix_keeps_the_small_axis() {
+        // size^2 mm^2 next to divergence^2 rad^2 makes a + c - disc cancel
+        // ~6 digits in f32 - the 210 MeV DN row used to land ~30% off.
+        let out = phase(11.508698, 0.006344, 0.788183);
+        let want = 3.905e-3;
+        assert!(
+            (out[5] - want).abs() / want < 0.05,
+            "sigma_small {} vs {want}",
+            out[5]
+        );
+    }
+
+    #[test]
+    fn a_countless_beam_table_keeps_every_row() {
+        // With no declared count the header line is junk before row 1 - it
+        // must not be consumed as if it were a data row.
+        let row = "100.0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1";
+        let row2 = "200.0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2";
+        let text = format!(
+            "Beam parameters
+hdr
+{row}
+{row2}
+"
+        );
+        let model = BeamModel::parse(&text).expect("parses");
+        assert_eq!(model.rows.len(), 2);
+    }
+
+    #[test]
+    fn a_non_finite_energy_row_is_rejected() {
+        let row = |first: &str| format!("{first} {}", "0 ".repeat(17));
+        let text = format!(
+            "Nozzle exit to Isocenter distance
+100
+ SMX to Isocenter distance
+50
+SMY to Isocenter distance
+50
+Beam parameters
+2
+h
+{}
+{}
+",
+            row("100"),
+            row("inf")
+        );
+        let dir = std::env::temp_dir().join(format!("scan-kit-bdl-inf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("inf.txt");
+        std::fs::write(&file, &text).unwrap();
+        let err = BeamModel::read(&file).err().unwrap();
+        assert!(err.contains("finite"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_negative_library_wet_is_rejected_not_dropped() {
+        // RS_WET <= 0 used to write rec[32] <= 0 - the shader then skips the
+        // shifter the plan asked for, silently.
+        let row = "100.0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1";
+        let row2 = "200.0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2";
+        let text = format!(
+            "Nozzle exit to Isocenter distance
+100
+ SMX to Isocenter distance
+50
+SMY to Isocenter distance
+50
+Range Shifter parameters
+RS_material = 1
+RS_density = 1.0
+RS_WET = -5
+Beam parameters
+2
+h
+{row}
+{row2}
+"
+        );
+        let dir = std::env::temp_dir().join(format!("scan-kit-bdl-wet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("wet.txt");
+        std::fs::write(&file, &text).unwrap();
+        let model = BeamModel::read(&file).unwrap();
+        let err = model
+            .spot_record(100.0, 0.0, 0.0, 0.0, f32::NAN, f32::NAN)
+            .err()
+            .unwrap();
+        assert!(err.contains("WET"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -436,13 +436,19 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     }
     if storage.is_dir() {
         let root = directory_session_root(storage, session_id);
-        return fs::File::open(root.join(filename))
+        // Links are refused the same way the walk refuses them — a planted
+        // spot_data.csv symlink must not read outside the session dir.
+        let path = root.join(filename);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+            return None;
+        }
+        return fs::File::open(path)
             .ok()
             .and_then(|mut file| read_capped(&mut file, filename, MAX_MEMBER_BYTES).ok());
     }
     let primary = format!("{session_id}/{filename}");
     let suffix = format!("/{filename}");
-    let members = archive_members(storage, &|name| {
+    let (members, roots) = archive_members(storage, &|name| {
         let name = normalize_member(name);
         name == primary || name == filename || name.ends_with(&suffix)
     })
@@ -459,16 +465,6 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     // (tars keep the zip filename) still resolves by the inner path suffix —
     // but only when the archive holds one session tree, else the suffix could
     // serve a sibling session's file under this id.
-    let roots: std::collections::BTreeSet<String> = members
-        .iter()
-        .filter_map(|(name, _)| {
-            normalize_member(name)
-                .split('/')
-                .next()
-                .filter(|root| !root.is_empty())
-                .map(str::to_owned)
-        })
-        .collect();
     if roots.len() != 1 {
         return None;
     }
@@ -492,18 +488,8 @@ pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
         found.sort_by_key(|member| timeslice_key(&member.0));
         return found.into_iter().map(|(_, bytes)| bytes).collect();
     }
-    let mut members =
+    let (mut members, roots) =
         archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default();
-    let roots: std::collections::BTreeSet<String> = members
-        .iter()
-        .filter_map(|(name, _)| {
-            normalize_member(name)
-                .split('/')
-                .next()
-                .filter(|root| !root.is_empty())
-                .map(str::to_owned)
-        })
-        .collect();
     if roots.len() != 1 {
         let prefix = format!("{session_id}/");
         members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
@@ -514,13 +500,23 @@ pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
 
 /// Timeslice files in layer/run order. The index is the `layer-N` folder, or
 /// `-1` when the path has no layer folder.
-pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
+pub fn read_timeslice_frames(storage: &Path, session_id: &str) -> Vec<(i64, Vec<u8>)> {
     let mut members = if storage.is_dir() {
         let mut found = Vec::new();
         walk_files(storage, storage, 0, &is_timeslice, &mut found);
         found
     } else {
-        archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default()
+        // The dir branch already walks only the session dir; the archive
+        // branch needs the same rule read_timeslices_for uses — a single
+        // tree, or members under the session's own prefix.
+        let (mut members, roots) =
+            archive_members(storage, &|name| is_timeslice(&normalize_member(name)))
+                .unwrap_or_default();
+        if roots.len() != 1 {
+            let prefix = format!("{session_id}/");
+            members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
+        }
+        members
     };
     members.sort_by_key(|member| timeslice_key(&member.0));
     members
@@ -956,10 +952,17 @@ fn visit_files(
     }
 }
 
-fn archive_members(
-    path: &Path,
-    want: &dyn Fn(&str) -> bool,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
+type Members = (Vec<(String, Vec<u8>)>, std::collections::BTreeSet<String>);
+
+fn member_root(name: &str) -> Option<String> {
+    normalize_member(name)
+        .split('/')
+        .next()
+        .filter(|root| !root.is_empty())
+        .map(str::to_owned)
+}
+
+fn archive_members(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String> {
     let name = file_name(path).unwrap_or_default().to_ascii_lowercase();
     if name.ends_with(".zip") {
         read_zip(path, want)
@@ -968,10 +971,11 @@ fn archive_members(
     }
 }
 
-fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|err| err.to_string())?;
     let mut out = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
     let mut total = 0u64;
     for index in 0..archive.len() {
         // One unsupported-compression or undecodable member must not brick
@@ -985,19 +989,26 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         let Ok(name) = entry.name().map(|name| name.into_owned()) else {
             continue;
         };
+        if let Some(root) = member_root(&name) {
+            roots.insert(root);
+        }
         if !want(&name) {
             continue;
         }
         // Bound the allocation by the remaining aggregate budget — reading a
-        // full member first would spend the cap twice over.
-        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))?;
+        // full member first would spend the cap twice over. A corrupt member
+        // loses only itself; zip entries decode independently.
+        let Ok(bytes) = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))
+        else {
+            continue;
+        };
         total = total.saturating_add(bytes.len() as u64);
         out.push((name.clone(), bytes));
     }
-    Ok(out)
+    Ok((out, roots))
 }
 
-fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let name = file_name(path).unwrap_or_default().to_ascii_lowercase();
     let decoder: Box<dyn Read> = if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
@@ -1011,6 +1022,7 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
     };
     let mut archive = tar::Archive::new(decoder);
     let mut out = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
     let mut total = 0u64;
     let entries = archive.entries().map_err(|err| err.to_string())?;
     for entry in entries {
@@ -1027,14 +1039,22 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
             continue;
         };
         let name = path.to_string_lossy().into_owned();
+        if let Some(root) = member_root(&name) {
+            roots.insert(root);
+        }
         if !want(&name) {
             continue;
         }
-        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))?;
+        // A mid-entry read failure can leave the tar stream desynced —
+        // keep what was read and stop rather than drop the whole archive.
+        let Ok(bytes) = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))
+        else {
+            break;
+        };
         total = total.saturating_add(bytes.len() as u64);
         out.push((name.clone(), bytes));
     }
-    Ok(out)
+    Ok((out, roots))
 }
 
 /// Session members are CSV/XML/JSON — none legitimately approach this. A
@@ -1261,6 +1281,44 @@ mod tests {
     }
 
     #[test]
+    fn a_sibling_tree_in_the_archive_is_not_served_as_this_session() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-ziptwo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        write_zip(
+            &root.join("bundle.zip"),
+            &[
+                (
+                    "sessA/input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "other/spot_data.csv",
+                    b"s
+2
+",
+                ),
+            ],
+        )
+        .unwrap();
+        let storage = root.join("bundle.zip");
+        // The single-tree suffix fallback must count every member's root —
+        // a sibling tree means the archive is multi-session and no file may
+        // resolve across the boundary.
+        assert!(read_session_file(&storage, "sessA", "spot_data.csv").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn traversal_members_do_not_become_the_session_id() {
         let root = std::env::temp_dir().join(format!(
             "scan-kit-ziptrav-{}-{}",
@@ -1356,7 +1414,7 @@ mod tests {
             return;
         };
 
-        let frames = read_timeslice_frames(&session);
+        let frames = read_timeslice_frames(&session, "session");
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].0, 0);
         let _ = fs::remove_dir_all(&root);

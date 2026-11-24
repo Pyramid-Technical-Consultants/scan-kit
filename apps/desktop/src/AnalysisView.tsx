@@ -1184,6 +1184,24 @@ export function AnalysisView({
   const sections = controlSections(controls).filter(
     (section) => viewId !== "volumetric" || (section.title !== "Cell" && section.title !== "Plot"),
   );
+  // Options that name a structure or fraction by position belong to the
+  // study that was open when they were picked - a new study must not
+  // inherit them.
+  const clearStudyOptions = () => {
+    setOptions((current) => {
+      const next = { ...current };
+      for (const key of Object.keys(next)) {
+        if (
+          key.startsWith("roi") ||
+          ["goals", "fraction", "beams", "segment", "scanner"].includes(key)
+        ) {
+          delete next[key];
+        }
+      }
+      optionsRef.current = next;
+      return next;
+    });
+  };
   const apply = (id: string, value: string) => {
     const held = optionsRef.current[id];
     // The control echoes the value already on screen when its header arrives.
@@ -1196,6 +1214,17 @@ export function AnalysisView({
       // describes the first apply's options, not `current` — recompute it.
       const latest = resolveOptions(metaRef.current?.controls ?? [], current);
       const next = applyOption(current, latest, grains.current, id, value);
+      // The backend swaps cells positionally: the first stored "3D" keeps
+      // the slot and the loser's option still says "3D" while drawing the
+      // displaced view. Write the swap through so the select stays true.
+      if (id.startsWith("cell") && value === "3D") {
+        const holder = ["cell0", "cell1", "cell2", "cell3"].find(
+          (cell) => cell !== id && next[cell] === "3D",
+        );
+        if (holder != null) {
+          next[holder] = latest[id] ?? "Axial";
+        }
+      }
       optionsRef.current = next;
       return next;
     });
@@ -1560,6 +1589,7 @@ export function AnalysisView({
                     }
                     setStudyPath(selected);
                     setStudy(opened.report);
+                    clearStudyOptions();
                     setOpening(false);
                   })
                   .catch((reason: unknown) => {
@@ -1584,6 +1614,7 @@ export function AnalysisView({
             onClick={() => {
               setStudyPath(null);
               setStudy(null);
+              clearStudyOptions();
             }}
           >
             Close Study

@@ -156,10 +156,13 @@ fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
     {
         return Err("the plan path must end in .csv".into());
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    // A bare "map.csv" lands in the process CWD and then stores CWD as the
+    // next save's default — the zip-dest check names the same failure.
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
+        _ => return Err("the plan path must name a directory to write into".into()),
     }
     scan_kit_core::atomic_write(path, csv.as_bytes())?;
     if let Some(parent) = path.parent() {
