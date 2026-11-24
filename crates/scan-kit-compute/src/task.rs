@@ -156,6 +156,9 @@ pub fn start_task(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Value, String> {
+    if !options.is_null() && !options.is_object() {
+        return Err("options must be an object".into());
+    }
     let mut normalized = options.clone();
     scan_kit_io::normalize_options(&mut normalized);
     let options = &normalized;
@@ -400,6 +403,9 @@ pub(crate) fn drain_plot(
     palette: &[[f32; 4]],
     cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
+    if !options.is_null() && !options.is_object() {
+        return Err("options must be an object".into());
+    }
     let mut options = options.clone();
     scan_kit_io::normalize_options(&mut options);
     let mut stage = build_stage(
@@ -2889,6 +2895,35 @@ mod tests {
         assert!(!driver.tasks.contains_key(&id));
         drop(driver);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_object_options_is_an_error_not_defaults() {
+        // Every other boundary rejects the same payload — a scalar bag used
+        // to silently render the default scene and report success.
+        let root = scratch();
+        let options = json!("contour");
+        let error = start_task(
+            "distribution",
+            &root,
+            &[],
+            &options,
+            [0.0; 4],
+            [0.0; 4],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("options"), "{error}");
+        assert!(start_task(
+            "distribution",
+            &root,
+            &[],
+            &json!(null),
+            [0.0; 4],
+            [0.0; 4],
+            &[]
+        )
+        .is_ok());
     }
 
     #[test]

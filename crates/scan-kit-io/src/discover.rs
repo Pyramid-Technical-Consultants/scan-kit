@@ -520,7 +520,10 @@ pub fn read_timeslice_frames(storage: &Path, session_id: &str) -> Vec<(i64, Vec<
         .map(|(name, bytes)| {
             let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
             let dir = &name[..dir_end];
-            let index = if dir.contains("layer-") {
+            let index = if dir
+                .split(['/', '\\'])
+                .any(|part| part.starts_with("layer-"))
+            {
                 number_after(dir, "layer-")
             } else {
                 -1
@@ -694,7 +697,10 @@ fn timeslice_key(name: &str) -> (i64, i64, String) {
     let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
     let dir = &name[..dir_end];
     (
-        if dir.contains("layer-") {
+        if dir
+            .split(['/', '\\'])
+            .any(|part| part.starts_with("layer-"))
+        {
             number_after(dir, "layer-")
         } else {
             -1
@@ -705,10 +711,15 @@ fn timeslice_key(name: &str) -> (i64, i64, String) {
 }
 
 pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
-    let Some(index) = path.rfind(marker) else {
+    // Only a path component that starts with the marker counts — a session
+    // named "player-2" or "rerun-3" is not a numbered layer or run.
+    let Some(tail) = path
+        .split(['/', '\\'])
+        .rev()
+        .find_map(|part| part.strip_prefix(marker))
+    else {
         return 0;
     };
-    let tail = &path[index + marker.len()..];
     let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     // "layer-x" / "layer-2b" / a digit overflow is not a numbered layer -
     // collapsing it into 0 merges unrelated folders into layer 0.
@@ -854,7 +865,10 @@ fn refresh_slice(storage: &Path) -> u128 {
         .map(|(name, path, _)| {
             let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
             let dir = &name[..dir_end];
-            let index = if dir.contains("layer-") {
+            let index = if dir
+                .split(['/', '\\'])
+                .any(|part| part.starts_with("layer-"))
+            {
                 number_after(dir, "layer-")
             } else {
                 -1

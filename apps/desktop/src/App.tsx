@@ -325,6 +325,7 @@ export default function App() {
   const noteBusy = useRef(false);
   const trashing = useRef(false);
   const pendingLocations = useRef<string[]>([]);
+  const passwordSubmitted = useRef(false);
   const selectedIds = selectionOrder;
   // Sessions can live in any indexed location — anchor analysis to the
   // first selected row's own library, not locations[0].
@@ -851,6 +852,9 @@ export default function App() {
       return;
     }
     trashing.current = true;
+    // A catalog pull in flight snapshots the row before the backend removes
+    // it — supersede it so the trashed session cannot resurrect.
+    ++catalogEpoch.current;
     setTrashConfirm(null);
     try {
       const result = await invoke<{ removed: number; errors: string[] }>(
@@ -1585,6 +1589,7 @@ export default function App() {
         onOpenChange={(open) => {
           if (!open) {
             pendingLocations.current = [];
+            passwordSubmitted.current = false;
             setPasswordFor(null);
             setPassword("");
           }
@@ -1599,8 +1604,14 @@ export default function App() {
                 return;
               }
               const spec = passwordFor;
+              passwordSubmitted.current = true;
               void invoke("scan_kit_remember_password", { path: spec, password })
                 .then(() => {
+                  // Closing the dialog mid-invoke cleared the pending list —
+                  // indexing now would resurrect a location the user cancelled.
+                  if (!passwordSubmitted.current) {
+                    return;
+                  }
                   setPassword("");
                   setPasswordFor(null);
                   const rest = pendingLocations.current;

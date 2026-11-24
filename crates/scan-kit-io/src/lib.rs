@@ -850,9 +850,10 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
                 conn.execute_batch("BEGIN IMMEDIATE")
                     .map_err(|err| err.to_string())?;
                 let result = (|| {
+                    let key = folder.trim_end_matches(['/', '\\']);
                     let list: Vec<(String, String)> = store::scanners(conn)?
                         .into_iter()
-                        .filter(|(_, existing)| existing != folder)
+                        .filter(|(_, existing)| existing.trim_end_matches(['/', '\\']) != key)
                         .collect();
                     store::set_scanners(conn, &list)?;
                     Ok::<_, String>(list)

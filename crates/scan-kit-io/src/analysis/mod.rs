@@ -259,7 +259,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             session.join("spot_data.csv"),
-            "ic1_total_dose,ic2_total_dose,position_x,position_y\n1.1,1.0,0,0\n1.8,2.1,5,1\n3.2,2.7,10,2\n",
+            "ic1_total_dose,ic2_total_dose,position_x,position_y,ic1_x_spot_position,ic1_y_spot_position,ic2_x_spot_position,ic2_y_spot_position\n1.1,1.0,0,0,0,0,0,0\n1.8,2.1,5,1,5,1,5,1\n3.2,2.7,10,2,10,2,10,2\n",
         )
         .unwrap();
         let mut timeslice = String::from(

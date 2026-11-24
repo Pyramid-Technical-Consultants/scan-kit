@@ -108,6 +108,10 @@ struct Cloud {
     /// The other chamber. Empty for the combined ray, and when only one chamber has spots.
     companion: Vec<Pencil>,
     plan: Vec<Pencil>,
+    /// The chamber positions fell back to the plan's commanded spots — the
+    /// cube is drawn, but gamma/difference against the plan would compare
+    /// the plan to itself and must stay "not evaluated".
+    commanded: bool,
 }
 
 pub fn volumetric(
@@ -485,8 +489,16 @@ pub fn volumetric(
         measured
             .iter()
             .zip(&plans)
-            .map(|(got, plan)| {
-                let (values, passed, scored) = gamma_with(got, plan, dd, dta, cutoff);
+            .enumerate()
+            .map(|(index, (got, plan))| {
+                // A cloud drawn on commanded positions is the plan compared
+                // to itself — always "not evaluated", never a pass.
+                let (values, passed, scored) =
+                    if clouds.get(index).is_some_and(|cloud| cloud.commanded) {
+                        (vec![f32::NAN; got.values.len()], 0, 0)
+                    } else {
+                        gamma_with(got, plan, dd, dta, cutoff)
+                    };
                 // Zero scored voxels is "not evaluated", not a 0% fail —
                 // NaN keeps the verdict text from asserting one.
                 let rate = if scored == 0 {
@@ -504,7 +516,17 @@ pub fn volumetric(
         "difference" => measured
             .iter()
             .zip(&plans)
-            .map(|(got, plan)| difference(got, plan))
+            .enumerate()
+            .map(|(index, (got, plan))| {
+                if clouds.get(index).is_some_and(|cloud| cloud.commanded) {
+                    Volume {
+                        values: vec![f32::NAN; got.values.len()],
+                        ..got.clone()
+                    }
+                } else {
+                    difference(got, plan)
+                }
+            })
             .collect(),
         "gamma" => gamma_fields
             .iter()
@@ -1452,7 +1474,7 @@ fn load_cloud(
     let ic1_dose = col(&table, "ic1_dose");
     let ic2_dose = col(&table, "ic2_dose");
     let xml = devices_xml(root, session);
-    let (ic1_x, ic1_y) = or_plan(&table, "ic1_x", "ic1_y");
+    let (ic1_x, ic1_y, ic1_commanded) = or_plan(&table, "ic1_x", "ic1_y");
     let ic1 = pencils_from(
         &energy,
         &ic1_x,
@@ -1478,6 +1500,10 @@ fn load_cloud(
         false,
     );
     let (cx, cy) = iso_positions(&table);
+    let combined_commanded = {
+        let check = |key: &str| -> bool { col(&table, key).iter().any(|v| v.is_finite()) };
+        !(check("ic1_x") && check("ic1_y") && check("ic2_x") && check("ic2_y"))
+    };
     let combined = pencils_from(
         &energy,
         &cx,
@@ -1553,16 +1579,18 @@ fn load_cloud(
         n,
         plan_sigma == "interlock",
     );
-    let (pencils, companion) = if chambers == "combined" {
-        (combined, Vec::new())
-    } else if ic1.is_empty() {
-        (ic2, Vec::new())
+    let (pencils, companion, commanded) = if chambers == "combined" {
+        (combined, Vec::new(), combined_commanded)
+    } else if ic1.is_empty() || (ic1_commanded && !ic2.is_empty()) {
+        // A real second chamber beats a fabricated first one.
+        (ic2, Vec::new(), false)
     } else {
-        (ic1, ic2)
+        (ic1, ic2, ic1_commanded)
     };
     Cloud {
         pencils,
         companion,
+        commanded,
         plan,
     }
 }
@@ -1683,7 +1711,13 @@ fn corrected(values: &[f32], plan: &[f32]) -> Vec<f32> {
     // The chamber zero offset is median(measured) - median(plan). Subtracting
     // the measured median alone would also erase a genuinely off-axis field,
     // fabricating a displacement between the measured and plan clouds.
-    let offset = finite_median(values) - finite_median(plan);
+    // With no plan reference there is no offset to find — keeping the raw
+    // positions beats re-centering the cloud on a fabricated zero.
+    let offset = if plan.iter().any(|v| v.is_finite()) {
+        finite_median(values) - finite_median(plan)
+    } else {
+        0.0
+    };
     values.iter().map(|value| value - offset).collect()
 }
 
@@ -1742,7 +1776,8 @@ pub(crate) fn iso_positions(
         || !y1.iter().any(|v| v.is_finite())
         || !y2.iter().any(|v| v.is_finite())
     {
-        return or_plan(table, "ic1_x", "ic1_y");
+        let (x, y, _) = or_plan(table, "ic1_x", "ic1_y");
+        return (x, y);
     }
     let px = col(table, "plan_x");
     let py = col(table, "plan_y");
@@ -1795,15 +1830,15 @@ fn or_plan(
     table: &std::collections::BTreeMap<String, Vec<f32>>,
     key_x: &str,
     key_y: &str,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, bool) {
     let x = col(table, key_x);
     let y = col(table, key_y);
     // Fall back as a pair — measured x with planned y fabricates a position
     // that exists in neither record.
     if x.iter().any(|v| v.is_finite()) && y.iter().any(|v| v.is_finite()) {
-        (x, y)
+        (x, y, false)
     } else {
-        (col(table, "plan_x"), col(table, "plan_y"))
+        (col(table, "plan_x"), col(table, "plan_y"), true)
     }
 }
 

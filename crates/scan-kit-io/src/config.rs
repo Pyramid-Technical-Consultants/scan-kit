@@ -277,6 +277,9 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return Err("params must be an object".to_owned());
+    }
     let timeslice = workflow == "position_offset_tuning"
         && params.get("data_source").and_then(Value::as_str) == Some("timeslice");
     let spots = load_spots(root, &found, timeslice, &mut warnings);

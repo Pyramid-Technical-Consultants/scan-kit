@@ -1468,15 +1468,20 @@ fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
         }
     }
     let (seconds, s_scale) = wide_clock(spot, "time_s", "s")?;
-    let (nanos, n_scale) = wide_clock(spot, "time_ns", "ns")?;
-    if seconds.len() < n || nanos.len() < n {
+    if seconds.len() < n {
         return None;
     }
+    let nanos = wide_clock(spot, "time_ns", "ns");
     let time: Vec<f64> = seconds
         .iter()
-        .zip(nanos)
         .take(n)
-        .map(|(seconds, nanos)| seconds * s_scale * 1000.0 + nanos * n_scale / 1e6)
+        .enumerate()
+        .map(|(index, seconds)| {
+            let frac = nanos
+                .and_then(|(values, scale)| values.get(index).map(|v| v * scale / 1e6))
+                .unwrap_or(0.0);
+            seconds * s_scale * 1000.0 + frac
+        })
         .collect();
     time.iter().any(|value| value.is_finite()).then_some(time)
 }
@@ -2279,14 +2284,17 @@ fn wall_time(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
             return Some(stamp.iter().take(n).map(|value| value * scale).collect());
         }
     }
-    if let (Some((seconds, s_scale)), Some((nanos, n_scale))) = (
-        wide_clock(spot, "time_s", "s"),
-        wide_clock(spot, "time_ns", "ns"),
-    ) {
-        let n = n.min(seconds.len()).min(nanos.len());
+    if let Some((seconds, s_scale)) = wide_clock(spot, "time_s", "s") {
+        let nanos = wide_clock(spot, "time_ns", "ns");
+        let n = n.min(seconds.len());
         return Some(
             (0..n)
-                .map(|index| seconds[index] * s_scale + nanos[index] * n_scale)
+                .map(|index| {
+                    let frac = nanos
+                        .and_then(|(values, scale)| values.get(index).map(|v| v * scale))
+                        .unwrap_or(0.0);
+                    seconds[index] * s_scale + frac
+                })
                 .collect(),
         );
     }
@@ -3379,6 +3387,9 @@ fn watch(path: &Path) -> (PathBuf, u128) {
 }
 
 fn header_columns(path: &Path) -> Vec<String> {
+    if !plain_file(path) {
+        return Vec::new();
+    }
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
@@ -4256,7 +4267,8 @@ fn expected_mm(bands: &[Band], device: &str, energy: f64) -> Option<f64> {
         .iter()
         .find(|band| band.device == device && energy >= band.min && energy <= band.max)?;
     let e = energy;
-    Some(band.k[0] + band.k[1] * e + band.k[2] * e * e + band.k[3] * e * e * e)
+    let sigma = band.k[0] + band.k[1] * e + band.k[2] * e * e + band.k[3] * e * e * e;
+    sigma.is_finite().then_some(sigma)
 }
 
 fn xml_attr(tag: &str, name: &str) -> Option<String> {
@@ -5752,7 +5764,7 @@ fn std_num(text: &str) -> Option<f64> {
     match text {
         "true" | "True" | "TRUE" => Some(1.0),
         "false" | "False" | "FALSE" => Some(0.0),
-        _ => text.parse().ok(),
+        _ => text.parse::<f64>().ok().filter(|v| v.is_finite()),
     }
 }
 

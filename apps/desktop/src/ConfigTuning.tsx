@@ -447,7 +447,7 @@ export function ConfigTuning({
     if (typeof selected !== "string") {
       return;
     }
-    if (dirty && !window.confirm("Discard unsaved edits in this file?")) {
+    if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
       return;
     }
     const seq = ++openSeq.current;

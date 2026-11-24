@@ -455,7 +455,10 @@ fn header_index(headers: &[String], raw: &str) -> Option<usize> {
 }
 
 fn header_of(bytes: &[u8]) -> Result<Vec<String>, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .comment(Some(b'#'))
+        .from_reader(bytes);
     let headers = reader.headers().map_err(|err| err.to_string())?;
     Ok(headers.iter().map(clean_header).collect())
 }
@@ -465,7 +468,10 @@ struct IndexedCsv {
 }
 
 fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .comment(Some(b'#'))
+        .from_reader(bytes);
     // The header row is consumed so the records below are data.
     reader.headers().map_err(|err| err.to_string())?;
     let mut columns = vec![Vec::new(); indexes.len()];
@@ -488,7 +494,10 @@ fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
 }
 
 fn count_rows(bytes: &[u8]) -> Result<usize, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .comment(Some(b'#'))
+        .from_reader(bytes);
     let mut rows = 0;
     for record in reader.records() {
         record.map_err(|err| err.to_string())?;

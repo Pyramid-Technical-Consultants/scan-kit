@@ -53,6 +53,9 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("template is required")?;
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return Err("params must be an object".to_owned());
+    }
     let mut errors = scan_kit_core::validate_plan(template, &params);
     if template == "dicom_rt_plan" {
         errors.splice(0..0, dicom_path_errors(&text(&params, "dicom_path")));

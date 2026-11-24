@@ -417,6 +417,7 @@ export function AnalysisView({
   const metaRef = useRef<PlotHeader | null>(null);
   const liveRef = useRef(true);
   const openingRef = useRef(false);
+  const scannerPickRef = useRef(false);
   useEffect(() => {
     liveRef.current = true;
     return () => {
@@ -453,6 +454,10 @@ export function AnalysisView({
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [scanners, setScanners] = useState<{ label: string; folder: string }[]>([]);
+  const exportArgsRef = useRef({ studyPath, scanners, sessions, hidden, folder });
+  useEffect(() => {
+    exportArgsRef.current = { studyPath, scanners, sessions, hidden, folder };
+  });
   const [size, setSize] = useState({ width: 960, height: 640 });
   const shown = (meta?.panels.length ?? 0) > 0;
   const viewRef = useRef(viewId);
@@ -794,15 +799,15 @@ export function AnalysisView({
     void driveTask(
       {
         view,
-        path: folder,
+        path: exportArgsRef.current.folder,
         sessionIds: shownSessionIds(
-          sessions.map((session) => session.id),
-          hidden,
+          exportArgsRef.current.sessions.map((session) => session.id),
+          exportArgsRef.current.hidden,
         ),
         options: {
           ...optionsRef.current,
-          study: studyPath,
-          scanners: JSON.stringify(scanners),
+          study: exportArgsRef.current.studyPath,
+          scanners: JSON.stringify(exportArgsRef.current.scanners),
           dest,
           ...extra,
         },
@@ -1633,8 +1638,12 @@ export function AnalysisView({
           <Button
             variant="outline"
             onClick={() => {
-              void open({ directory: true, title: "MCsquare scanner folder" }).then(
-                (selected) => {
+              if (scannerPickRef.current) {
+                return;
+              }
+              scannerPickRef.current = true;
+              void open({ directory: true, title: "MCsquare scanner folder" })
+                .then((selected) => {
                   if (typeof selected !== "string") {
                     return;
                   }
@@ -1648,9 +1657,11 @@ export function AnalysisView({
                       }
                     })
                     .catch((reason: unknown) => notifyError(reason));
-                },
-              )
-                .catch((reason: unknown) => notifyError(reason));
+                })
+                .catch((reason: unknown) => notifyError(reason))
+                .finally(() => {
+                  scannerPickRef.current = false;
+                });
             }}
           >
             Register scanner

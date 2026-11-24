@@ -291,7 +291,9 @@ pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> 
         return Err("invalid session id".to_owned());
     }
     let lib_id = ensure_library(conn, root)?;
-    import_legacy(conn, lib_id, Path::new(root))?;
+    if !crate::location::is_remote_location(root) {
+        import_legacy(conn, lib_id, Path::new(root))?;
+    }
     // Store the trimmed text — the command response already reports the
     // trimmed form, so the two must agree about what persisted.
     let note = text.trim();
@@ -321,7 +323,9 @@ pub fn set_selected(
         }
     }
     let lib_id = ensure_library(conn, root)?;
-    import_legacy(conn, lib_id, Path::new(root))?;
+    if !crate::location::is_remote_location(root) {
+        import_legacy(conn, lib_id, Path::new(root))?;
+    }
     let encoded = serde_json::to_string(&unique).map_err(|err| err.to_string())?;
     conn.execute(
         "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
@@ -548,7 +552,9 @@ pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Resu
 
 pub fn prepare_library(conn: &Connection, root: &str) -> Result<i64, String> {
     let lib_id = ensure_library(conn, root)?;
-    import_legacy(conn, lib_id, Path::new(root))?;
+    if !crate::location::is_remote_location(root) {
+        import_legacy(conn, lib_id, Path::new(root))?;
+    }
     Ok(lib_id)
 }
 

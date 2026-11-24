@@ -315,8 +315,11 @@ fn fetch_sheet(host: &str, io_root: &str, table: &str) -> Result<Option<Sheet>, 
 }
 
 fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
-    let header = reader
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .comment(Some(b'#'))
+        .from_reader(bytes);
+    let header: Vec<String> = reader
         .headers()
         .ok()?
         .iter()
@@ -341,12 +344,20 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
             truncated = true;
             break;
         };
-        rows.push(
-            record
+        let cells = record
+            .iter()
+            .map(|cell| cell.trim().to_owned())
+            .collect::<Vec<_>>();
+        // A repeated header line is a banner, not a data row — keeping it
+        // keys phantom "layer_id"/"spot_no" rows in every downstream join.
+        let repeated = cells.len() == header.len()
+            && cells
                 .iter()
-                .map(|cell| cell.trim().to_owned())
-                .collect::<Vec<_>>(),
-        );
+                .zip(header.iter())
+                .all(|(cell, name)| cell.eq_ignore_ascii_case(name));
+        if !repeated {
+            rows.push(cells);
+        }
     }
     if rows.is_empty() {
         None
@@ -834,7 +845,7 @@ fn join_timeslices(
                 .and_then(|i| row.get(i))
                 .map(|cell| clean(cell))
                 .unwrap_or_default();
-            if !raw_spot.is_empty() {
+            if !raw_spot.is_empty() && !raw_spot.eq_ignore_ascii_case("spot_no") {
                 eff_spot = raw_spot.to_owned();
             }
             let key = (join_key(&eff_layer), join_key(&eff_spot), join_key(key));
