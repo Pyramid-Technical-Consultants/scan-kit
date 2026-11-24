@@ -237,8 +237,10 @@ pub fn projected_gamma(
             spacing[plane],
             cutoff_pct,
         );
+        // Zero scored voxels is "not evaluated", not a 0% fail — NaN
+        // keeps the readout from asserting a verdict.
         let rate = if scored == 0 {
-            0.0
+            f32::NAN
         } else {
             100.0 * passed as f32 / scored as f32
         };

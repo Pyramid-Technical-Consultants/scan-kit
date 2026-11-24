@@ -260,6 +260,7 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
         PlotKind::Gamma => {
             let (title, series) = gamma_panel(space);
             let y_label = match space.gamma {
+                Some((_, rate)) if rate.is_nan() => "Voxels · —".into(),
                 Some((_, rate)) => {
                     format!("Voxels · {:.0}% {}", rate.floor(), gamma_verdict(rate))
                 }
@@ -305,6 +306,11 @@ fn gamma_verdict(rate: f32) -> &'static str {
 }
 
 fn gamma_heading(rate: f32) -> String {
+    // Zero scored voxels is "not evaluated" — TG-218 pass/fail asserts a
+    // comparison happened, and there was none.
+    if rate.is_nan() {
+        return "Gamma Histogram  —".into();
+    }
     // Truncate — 94.6% rounding up to "95" would cross the action boundary
     // the verdict itself cites.
     format!(
@@ -645,6 +651,9 @@ pub(crate) fn overlay_sessions(
     volumes: &[Volume],
     at: [f32; 3],
     gamma: &[Volume],
+    // Under compare:gamma|difference `volumes` is a residual field — DVH
+    // needs the measured cubes.
+    measured: &[Volume],
 ) {
     if volumes.len() < 2 {
         return;
@@ -657,7 +666,7 @@ pub(crate) fn overlay_sessions(
         panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("dvh") {
-        panel.series = volumes.iter().map(dvh_line).collect();
+        panel.series = measured.iter().map(dvh_line).collect();
         fit_panel(panel);
     } else if title.starts_with("gamma") && gamma.len() <= 1 {
         // No gamma metric (analytic run, no TPS dose, beam filter) - the
@@ -764,7 +773,8 @@ mod tests {
             x_labels: Vec::new(),
             equal: false,
         };
-        overlay_sessions(&mut panel, &[low, high], [0.5, 0.5, 0.5], &[]);
+        let volumes = [low, high];
+        overlay_sessions(&mut panel, &volumes, [0.5, 0.5, 0.5], &[], &volumes);
         assert_eq!(panel.series.len(), 2);
         assert!(panel.ymax >= 8.0, "{}", panel.ymax);
     }

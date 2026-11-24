@@ -487,8 +487,10 @@ pub fn volumetric(
             .zip(&plans)
             .map(|(got, plan)| {
                 let (values, passed, scored) = gamma_with(got, plan, dd, dta, cutoff);
+                // Zero scored voxels is "not evaluated", not a 0% fail —
+                // NaN keeps the verdict text from asserting one.
                 let rate = if scored == 0 {
-                    0.0
+                    f32::NAN
                 } else {
                     100.0 * passed as f32 / scored as f32
                 };
@@ -578,8 +580,20 @@ pub fn volumetric(
     if has_dose && shown.get(session_at).is_none() {
         panels.push(note("The selected session is not in this view"));
     }
+    // The entry exists but its cloud produced no pencils — a [0,0,0] cube
+    // paints six dead panels indistinguishable from a render bug.
+    if has_dose
+        && shown
+            .get(session_at)
+            .is_some_and(|volume| volume.values.is_empty())
+    {
+        panels.push(note("The selected session has no dose"));
+    }
     if has_dose {
-        if let Some(volume) = shown.get(session_at) {
+        if let Some(volume) = shown
+            .get(session_at)
+            .filter(|volume| !volume.values.is_empty())
+        {
             let scan = scan_kit_core::scan_volume(volume);
             let [ix, iy, iz] = scan.peak_at;
             let cells = crate::workspace::cells_from(&[
@@ -589,8 +603,13 @@ pub fn volumetric(
                 options.get("cell3").and_then(Value::as_str),
             ]);
             let mut dvh_lines = Vec::new();
+            // `volume` is the displayed cube — under compare:gamma or
+            // difference it is a residual field, not dose. DVH needs the
+            // measured one.
             if plots.contains(&crate::workspace::PlotKind::Dvh) {
-                push_dvh(&mut dvh_lines, volume);
+                if let Some(dose) = measured.get(session_at) {
+                    push_dvh(&mut dvh_lines, dose);
+                }
             }
             let gamma = plots
                 .contains(&crate::workspace::PlotKind::Gamma)
@@ -647,9 +666,9 @@ pub fn volumetric(
             {
                 view.x_label = depth_axis_title(medium_key);
             }
-            if let Some(depth) = panels
+            for depth in panels
                 .iter_mut()
-                .find(|panel| panel.title.starts_with("Depth"))
+                .filter(|panel| panel.title.starts_with("Depth"))
             {
                 if let Some(result) = &mc_note {
                     let incident = result.ledger[0];
@@ -679,7 +698,13 @@ pub fn volumetric(
                     .map(|(volume, _)| volume.clone())
                     .collect();
                 for panel in &mut panels {
-                    crate::workspace::overlay_sessions(panel, &shown, at, &gamma_volumes);
+                    crate::workspace::overlay_sessions(
+                        panel,
+                        &shown,
+                        at,
+                        &gamma_volumes,
+                        &measured,
+                    );
                 }
                 mark.session_focus = session_at as u32;
                 mark.sessions = shown
@@ -951,10 +976,22 @@ pub fn volumetric(
             wash.level.as_ref(),
         );
         if let Some([axial, coronal, sagittal]) = integral_rates {
+            let rate_text = |rate: f32| {
+                if rate.is_nan() {
+                    "—".to_owned()
+                } else {
+                    format!("{rate:.0}%")
+                }
+            };
             controls.push(crate::workspace::readout(
                 "Integral",
                 "gamma_integral",
-                &format!("Axial {axial:.0}% · Coronal {coronal:.0}% · Sagittal {sagittal:.0}%"),
+                &format!(
+                    "Axial {} · Coronal {} · Sagittal {}",
+                    rate_text(axial),
+                    rate_text(coronal),
+                    rate_text(sagittal)
+                ),
                 "Gamma",
             ));
         }
@@ -982,7 +1019,12 @@ pub fn volumetric(
 pub fn voxel_spacing(options: &Value) -> f32 {
     let raw = options.get("voxel").and_then(Value::as_str).unwrap_or("1");
     let text = raw.trim().trim_end_matches("mm").trim();
-    let value = text.parse::<f32>().unwrap_or(1.0);
+    // "2 cm"-style input: a leading number still parses — jumping to 1.0
+    // would build a grid 20x finer than the user typed.
+    let value = text
+        .parse::<f32>()
+        .or_else(|_| text.split_whitespace().next().unwrap_or("").parse())
+        .unwrap_or(1.0);
     if !value.is_finite() {
         return 1.0;
     }
@@ -1456,19 +1498,19 @@ fn load_cloud(
         n,
         false,
     );
-    let donor = if plan_sigma == "reference" {
+    let (donor, donor_is_self) = if plan_sigma == "reference" {
         let id = if sessions.iter().any(|item| item == sigma_ref) {
             sigma_ref
         } else {
             sessions.first().map(String::as_str).unwrap_or(session)
         };
-        spot_table(root, id)
+        (spot_table(root, id), id == session)
     } else {
-        table.clone()
+        (table.clone(), false)
     };
     let (psx, psy) = if plan_sigma == "interlock" {
         (Vec::new(), Vec::new())
-    } else if plan_sigma == "reference" {
+    } else if plan_sigma == "reference" && !donor_is_self {
         // The donor is a different session — its spot list can order or
         // filter differently, so join sigmas on energy, not row index.
         join_donor_sigmas(
