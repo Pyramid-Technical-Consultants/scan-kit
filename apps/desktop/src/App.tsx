@@ -1049,7 +1049,13 @@ export default function App() {
   }
 
   async function applyNote(edit: NoteEdit, note: string) {
-    await writeNote(edit.sessionId, edit.library, note);
+    // Same chain commitNote uses — an undo must not race an in-flight
+    // commit or the persisted text and the stacks diverge.
+    const run = noteChain.current.then(() =>
+      writeNote(edit.sessionId, edit.library, note),
+    );
+    noteChain.current = run.catch(() => undefined);
+    await run;
   }
 
   function undoNote() {

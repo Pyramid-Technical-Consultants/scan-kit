@@ -56,6 +56,7 @@ static UPLOAD_BUSY: AtomicBool = AtomicBool::new(false);
 /// the open phase runs unlocked for seconds, so a no-op disconnect that the
 /// install then overwrites leaves a session nobody asked for.
 static CONNECT_BUSY: AtomicBool = AtomicBool::new(false);
+static DOWNLOAD_BUSY: AtomicBool = AtomicBool::new(false);
 static DISCONNECTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn catalog(db: &Path) -> Value {
@@ -387,6 +388,9 @@ pub fn download_with(
     dest: &str,
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<Value, String> {
+    // Two concurrent downloads to the same dest can each publish a zip —
+    // the loser's post-cancel remove would delete the winner's artifact.
+    let _download = acquire(&DOWNLOAD_BUSY, "a download is already in progress")?;
     let (host, status, plan_path) = {
         let guard = lock();
         let live = guard
@@ -536,6 +540,9 @@ fn read_paths(
             .collect::<Vec<_>>(),
         timeout,
     )?;
+    if updates.is_empty() {
+        return Err("no status update within the poll deadline".into());
+    }
     let mut status = Map::new();
     for path in paths {
         if let Some(value) = updates.get(&field_subscribe_key(path)) {
@@ -876,7 +883,13 @@ fn unwrap_update(value: &rmpv::Value) -> rmpv::Value {
     }
     if let rmpv::Value::Array(inner) = &items[0] {
         let Some(rmpv::Value::Array(last)) = items.last() else {
-            return decoded;
+            // An array value followed by a scalar timestamp — unwrap to the
+            // value like a scalar-led pair does.
+            return if items.len() >= 2 {
+                items[0].clone()
+            } else {
+                decoded
+            };
         };
         if let Some(first) = last.first() {
             return first.clone();

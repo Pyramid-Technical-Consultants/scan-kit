@@ -932,6 +932,9 @@ export function AnalysisView({
             return;
           }
           const parsed = parsePoll(bytesOf(raw));
+          if (parsed.report == null || typeof parsed.report !== "object") {
+            throw new Error("bad poll frame");
+          }
           if (!acceptReport(parsed.report, started.task, started.generation)) {
             // A removed task comes back under another generation. Polling it
             // again fills memory and the bar never settles.

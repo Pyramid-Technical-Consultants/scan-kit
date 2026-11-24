@@ -64,6 +64,11 @@ export async function driveTask(
     try {
       const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task, generation: started.generation });
       parsed = parsePoll(bytesOf(raw));
+      // A malformed frame must throw inside the cancel guard — dereferencing
+      // a bad report outside it leaves the backend task running unpolled.
+      if (parsed.report == null || typeof parsed.report !== "object") {
+        throw new Error("bad poll frame");
+      }
     } catch (reason) {
       // The backend task keeps running without a poller — cancel it, then propagate.
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation }).catch(() => {});

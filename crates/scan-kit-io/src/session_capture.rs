@@ -188,6 +188,24 @@ fn devices(
             warnings.push(format!("{client} has no device address — skipped"));
             continue;
         }
+        // The device map is remote-supplied: its host drives real fetches
+        // and its path lands in the request line. An IP literal only, and
+        // no .. or query steering — a hostile map must not proxy internal
+        // reads into the session zip.
+        let host_ip = host
+            .trim()
+            .rsplit_once(':')
+            .map(|(head, _)| head)
+            .unwrap_or_else(|| host.trim());
+        if host_ip.parse::<std::net::IpAddr>().is_err()
+            || io_root.split('/').any(|seg| seg == "..")
+            || io_root.contains(['?', '#'])
+        {
+            warnings.push(format!(
+                "{client} has an untrusted device address — skipped"
+            ));
+            continue;
+        }
         // The name lands in capture file paths (x_spot_data.csv, x.log, the
         // nozzle folder) — a device client key is untrusted text, so keep it
         // to filename characters only.
@@ -204,11 +222,21 @@ fn devices(
             ));
             continue;
         }
+        // config_target is fetched from the RCI itself — a poisoned
+        // target just loses that one file, not the whole device.
+        let config_target = field("configuration_upload/target");
+        let config_target = if config_target.split('/').any(|seg| seg == "..")
+            || config_target.contains(['?', '#'])
+        {
+            String::new()
+        } else {
+            config_target
+        };
         out.push(CaptureDevice {
             name,
             io_root,
             host,
-            config_target: field("configuration_upload/target"),
+            config_target,
         });
     }
     Ok(out)
@@ -363,7 +391,10 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
         } else {
             cell.map(|id| join_key(clean(id)))
         };
-        if row > 0 && (row == sheet.rows.len() || id != prev_eff) {
+        if row > 0
+            && (row == sheet.rows.len() || id != prev_eff)
+            && (prev_eff.is_some() || row == sheet.rows.len())
+        {
             // A leading ragged run has no previous id — it belongs to the
             // layer that opens it, not a phantom "" layer.
             let prev_id = prev_eff.clone().or_else(|| id.clone()).unwrap_or_default();
@@ -762,6 +793,20 @@ fn join_timeslices(
             rows: HashMap::new(),
             order: Vec::new(),
         };
+        // Ragged meta cells inherit the running value like blocks() and
+        // join_spot_data() — an empty layer or spot cell must not file the
+        // row under "" and split it from its siblings.
+        let mut eff_layer = sheet
+            .rows
+            .iter()
+            .find_map(|row| {
+                layer_i.and_then(|i| row.get(i)).and_then(|cell| {
+                    let raw = clean(cell);
+                    (!raw.is_empty()).then(|| raw.to_owned())
+                })
+            })
+            .unwrap_or_default();
+        let mut eff_spot = String::new();
         for row in &sheet.rows {
             let Some(raw) = row.get(ts_i) else { continue };
             let key = clean(raw);
@@ -772,17 +817,21 @@ fn join_timeslices(
             // than the whole delivery — per spot or per layer — would
             // overwrite earlier rows under a timesliceNumber-only key.
             // Missing meta columns degrade to the old single key.
-            let key = (
-                layer_i
-                    .and_then(|i| row.get(i))
-                    .map(|cell| join_key(clean(cell)))
-                    .unwrap_or_default(),
-                spot_i
-                    .and_then(|i| row.get(i))
-                    .map(|cell| join_key(clean(cell)))
-                    .unwrap_or_default(),
-                join_key(key),
-            );
+            let raw_layer = layer_i
+                .and_then(|i| row.get(i))
+                .map(|cell| clean(cell))
+                .unwrap_or_default();
+            if !raw_layer.is_empty() {
+                eff_layer = raw_layer.to_owned();
+            }
+            let raw_spot = spot_i
+                .and_then(|i| row.get(i))
+                .map(|cell| clean(cell))
+                .unwrap_or_default();
+            if !raw_spot.is_empty() {
+                eff_spot = raw_spot.to_owned();
+            }
+            let key = (join_key(&eff_layer), join_key(&eff_spot), join_key(key));
             if !part.rows.contains_key(&key) {
                 part.order.push(key.clone());
             }
@@ -2083,8 +2132,8 @@ mod tests {
 
     #[test]
     fn a_leading_ragged_row_joins_the_next_layer() {
-        // Row 0 has no layer_id cell — there is no previous run to inherit,
-        // so the empty leading block must not consume a "" layer ordinal.
+        // Row 0 has no layer_id cell — it folds into the run its real
+        // layer opens, not a separate one-row run of its own.
         let table = sheet("spot_no,layer_id\n1\n2,9\n3,9\n");
         let mut layers = HashMap::new();
         let got = blocks(&table, &mut layers);
@@ -2093,7 +2142,7 @@ mod tests {
             got.iter()
                 .map(|block| (block.layer, block.run, block.start, block.end))
                 .collect::<Vec<_>>(),
-            vec![(0, 0, 0, 1), (0, 1, 1, 3)]
+            vec![(0, 0, 0, 3)]
         );
     }
 
