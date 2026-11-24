@@ -391,6 +391,12 @@ fn rows_from_import(spots: &[ImportSpot], params: &Value) -> Result<Vec<Row>, St
     if spots.is_empty() {
         return Err("No planned spots with positive MU found in plan file".into());
     }
+    // Same budget validate_spot_budget applies to generated templates — a
+    // dense import would otherwise hang in layer grouping and produce an
+    // unbounded document.
+    if spots.len() > 1_000_000 {
+        return Err("Plan file declares more than 1,000,000 spots.".into());
+    }
     let order = text(params, "spot_order", "plan_order");
     let axis = text(params, "fast_axis", "x");
     let ordered = order_within_layers(spots, &order, &axis);
@@ -485,7 +491,13 @@ fn csv_num(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
-    trim_zeros(&format!("{value:.12}"))
+    let fixed = trim_zeros(&format!("{value:.12}"));
+    // A nonzero sub-1e-12 magnitude would emit a literal "0" — a positive
+    // charge silently becoming a zero-charge row in the uploaded map.
+    if fixed.parse::<f64>() == Ok(0.0) {
+        return format!("{value:e}");
+    }
+    fixed
 }
 
 fn trim_float(value: f64) -> String {
@@ -528,13 +540,10 @@ fn format_summary(rows: &[Row], cap: usize) -> String {
 }
 
 fn unique_energies(rows: &[Row]) -> usize {
-    let mut seen = Vec::new();
-    for row in rows {
-        if !seen.contains(&row.energy) {
-            seen.push(row.energy);
-        }
-    }
-    seen.len()
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .filter(|row| seen.insert(row.energy.to_bits()))
+        .count()
 }
 
 fn format_delivery(seconds: f64) -> String {
@@ -645,17 +654,24 @@ fn validate_weights(params: &Value) -> Vec<String> {
     }
     let method = text(params, "spot_weight_method", "fixed");
     match method.as_str() {
-        "fixed" => validate_min_float(params.get("spot_weight_mu"), "Spot Weight (MU)", 0.0001),
-        "even_total" => validate_min_float(
+        "fixed" => validate_bounded_float(
+            params.get("spot_weight_mu"),
+            "Spot Weight (MU)",
+            0.0001,
+            10_000.0,
+        ),
+        "even_total" => validate_bounded_float(
             params.get("spot_weight_total_mu"),
             "Target Total Weight (MU)",
             0.0001,
+            1_000_000.0,
         ),
         "random_total_variance" => {
-            let mut errors = validate_min_float(
+            let mut errors = validate_bounded_float(
                 params.get("spot_weight_total_mu"),
                 "Target Total Weight (MU)",
                 0.0001,
+                1_000_000.0,
             );
             if !errors.is_empty() {
                 return errors;
@@ -679,15 +695,17 @@ fn validate_weights(params: &Value) -> Vec<String> {
 }
 
 fn validate_weight_range(params: &Value) -> Vec<String> {
-    let mut errors = validate_min_float(
+    let mut errors = validate_bounded_float(
         params.get("spot_weight_min_mu"),
         "Minimum Weight (MU)",
         0.0001,
+        10_000.0,
     );
-    errors.extend(validate_min_float(
+    errors.extend(validate_bounded_float(
         params.get("spot_weight_max_mu"),
         "Maximum Weight (MU)",
         0.0001,
+        10_000.0,
     ));
     if !errors.is_empty() {
         return errors;
@@ -761,22 +779,6 @@ fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64
     // center, so the edges themselves must pass.
     if number < min || number > max {
         return vec![format!("{label} must be at least {min} and at most {max}.")];
-    }
-    Vec::new()
-}
-
-fn validate_min_float(value: Option<&Value>, label: &str, min: f64) -> Vec<String> {
-    if value.is_some_and(Value::is_null) {
-        return Vec::new();
-    }
-    let Some(number) = value.and_then(Value::as_f64) else {
-        return vec![format!("{label} must be a number.")];
-    };
-    if !number.is_finite() {
-        return vec![format!("{label} must be a finite number.")];
-    }
-    if number < min {
-        return vec![format!("{label} must be at least {min}.")];
     }
     Vec::new()
 }

@@ -525,8 +525,8 @@ fn modified_z(values: &[f32]) -> Vec<f32> {
     let med = median(&finite);
     let devs: Vec<f32> = finite.iter().map(|value| (value - med).abs()).collect();
     let mad = median(&devs);
-    let mean = finite.iter().sum::<f32>() / finite.len() as f32;
-    let mean_ad = devs.iter().sum::<f32>() / devs.len() as f32;
+    let mean = (finite.iter().map(|v| f64::from(*v)).sum::<f64>() / finite.len() as f64) as f32;
+    let mean_ad = (devs.iter().map(|v| f64::from(*v)).sum::<f64>() / devs.len() as f64) as f32;
     for (slot, value) in out.iter_mut().zip(values) {
         if !value.is_finite() {
             continue;

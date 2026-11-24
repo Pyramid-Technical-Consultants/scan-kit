@@ -446,7 +446,7 @@ fn a_short_column_matches_the_cpu_reduction() {
     assert_eq!(check.min, want.min);
     assert_eq!(check.max, want.max);
     let scale = want.sum.abs().max(1.0);
-    assert!((check.sum - want.sum).abs() / scale < 1.0e-4);
+    assert!((f64::from(check.sum) - want.sum).abs() / scale < 1.0e-4);
 }
 
 #[test]
@@ -478,7 +478,7 @@ fn stats_cpu_vs_gpu_reduction() {
         assert_eq!(check.min, want.min, "n={n}");
         assert_eq!(check.max, want.max, "n={n}");
         let scale = want.sum.abs().max(1.0);
-        let sum_ratio = (check.sum - want.sum).abs() / scale;
+        let sum_ratio = (f64::from(check.sum) - want.sum).abs() / scale;
         assert!(
             sum_ratio < 1.0e-2,
             "n={n} gpu sum {} cpu {}",

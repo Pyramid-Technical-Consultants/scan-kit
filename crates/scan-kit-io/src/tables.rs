@@ -3992,7 +3992,7 @@ fn plateau_mean(values: &[f32], gate: Option<&[f32]>) -> f32 {
     if kept.len() < 3 {
         f32::NAN
     } else {
-        kept.iter().sum::<f32>() / kept.len() as f32
+        (kept.iter().map(|v| f64::from(*v)).sum::<f64>() / kept.len() as f64) as f32
     }
 }
 

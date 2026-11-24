@@ -20,7 +20,9 @@
 pub struct FiniteReduce {
     pub min: f32,
     pub max: f32,
-    pub sum: f32,
+    /// f64: sequential f32 accumulation stalls once ulp(sum) exceeds each
+    /// term — 1e7 ones would pin at 2^24 and report a wrong mean.
+    pub sum: f64,
     pub count: u32,
 }
 
@@ -43,7 +45,7 @@ pub fn reduce_finite(samples: &[f32]) -> FiniteReduce {
             out.min = out.min.min(value);
             out.max = out.max.max(value);
         }
-        out.sum += value;
+        out.sum += f64::from(value);
         out.count += 1;
     }
     out
@@ -58,7 +60,7 @@ pub fn finite_minmax(samples: &[f32]) -> Option<(f32, f32)> {
 /// Mean of the finite samples. `None` when no sample is finite.
 pub fn mean_finite(samples: &[f32]) -> Option<f32> {
     let reduced = reduce_finite(samples);
-    (reduced.count > 0).then_some(reduced.sum / reduced.count as f32)
+    (reduced.count > 0).then_some((reduced.sum / f64::from(reduced.count)) as f32)
 }
 
 fn cmp_f32(left: &f32, right: &f32) -> std::cmp::Ordering {
@@ -252,5 +254,14 @@ mod tests {
         assert_eq!(median_unstable(&mut values), 3e38);
         let mut values = [-3e38f32, -3e38];
         assert_eq!(median_unstable(&mut values), -3e38);
+    }
+
+    #[test]
+    fn a_long_run_of_ones_means_one() {
+        // Sequential f32 accumulation stalls once ulp(sum) exceeds each
+        // term: 1e7 ones used to pin at 2^24 and report ~1.68.
+        let samples = vec![1.0f32; 10_000_000];
+        assert_eq!(mean_finite(&samples), Some(1.0));
+        assert_eq!(reduce_finite(&samples).sum, 10_000_000.0);
     }
 }

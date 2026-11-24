@@ -91,7 +91,12 @@ pub fn write(parent: &Path, params: &Value, db: &Path) -> Result<Value, String> 
         Err(err) => {
             // Claimed above, so this can only drop this call's partial
             // study — a plausible-looking half-written one must not stay.
-            let _ = fs::remove_dir_all(&folder);
+            if let Err(cleanup) = fs::remove_dir_all(&folder) {
+                return Err(format!(
+                    "{err} (also failed to remove the partial study {}: {cleanup})",
+                    folder.display()
+                ));
+            }
             return Err(err);
         }
     };

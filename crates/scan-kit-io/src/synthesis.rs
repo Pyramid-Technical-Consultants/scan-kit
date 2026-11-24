@@ -193,10 +193,9 @@ fn dicom_path_errors(path: &str) -> Vec<String> {
     if !file.is_file() {
         return vec![format!("DICOM plan file not found: {text}")];
     }
-    match file.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("dcm") => Vec::new(),
-        _ => vec!["Plan file must have a .dcm extension.".into()],
-    }
+    // No extension check: PACS exports routinely name files by UID.
+    // read_ion_plan verifies the DICM preamble and RT-Ion SOP class.
+    Vec::new()
 }
 
 fn pld_path_errors(path: &str) -> Vec<String> {

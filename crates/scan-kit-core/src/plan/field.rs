@@ -66,21 +66,31 @@ pub(super) fn order_within_layers(
     order: &str,
     axis: &str,
 ) -> Vec<ImportSpot> {
+    // Single pass: `contains` + per-energy `filter` is O(spots x distinct
+    // energies) — a dense import with many energies would hang.
     let mut energies = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut by_energy: std::collections::HashMap<u64, Vec<ImportSpot>> =
+        std::collections::HashMap::new();
     for spot in spots {
         // A NaN energy forms an unreachable layer (`==` never matches); a
         // NaN coordinate formats the literal "NaN" into the plan CSV.
-        if spot.energy.is_finite() && !energies.contains(&spot.energy) {
+        if !spot.energy.is_finite() {
+            continue;
+        }
+        if seen.insert(spot.energy.to_bits()) {
             energies.push(spot.energy);
+        }
+        if spot.x.is_finite() && spot.y.is_finite() {
+            by_energy
+                .entry(spot.energy.to_bits())
+                .or_default()
+                .push(spot.clone());
         }
     }
     let mut ordered = Vec::with_capacity(spots.len());
     for energy in energies {
-        let layer: Vec<ImportSpot> = spots
-            .iter()
-            .filter(|spot| spot.energy == energy && spot.x.is_finite() && spot.y.is_finite())
-            .cloned()
-            .collect();
+        let layer = by_energy.remove(&energy.to_bits()).unwrap_or_default();
         let indices = if order == "minimize_travel" {
             serpentine_indices(
                 &layer.iter().map(|spot| spot.x).collect::<Vec<_>>(),

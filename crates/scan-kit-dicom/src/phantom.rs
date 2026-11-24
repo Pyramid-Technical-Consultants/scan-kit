@@ -498,13 +498,18 @@ fn square(x0: f64, x1: f64, y0: f64, y1: f64, z: f64) -> Vec<f32> {
 }
 
 fn parse(params: &Value) -> Result<Request, String> {
-    let phantom = text(params, "phantom", "slabs");
+    // Every field has a default — a non-object params would silently write
+    // a full default study and report success.
+    if !params.is_object() {
+        return Err("params must be an object".into());
+    }
+    let phantom = text(params, "phantom", "slabs")?;
     if !matches!(phantom.as_str(), "slabs" | "bone" | "lung" | "water") {
         return Err(format!(
             "unknown phantom '{phantom}'; choose from slabs, bone, lung, water"
         ));
     }
-    let position = text(params, "position", "HFS");
+    let position = text(params, "position", "HFS")?;
     if !matches!(position.as_str(), "HFS" | "HFP" | "FFS" | "FFP") {
         return Err(format!("unknown position '{position}'"));
     }
@@ -715,13 +720,18 @@ fn stored_hu(hu: f32) -> u16 {
     (hu + 1024.0).round().clamp(0.0, 4095.0) as u16
 }
 
-fn text(params: &Value, key: &str, default: &str) -> String {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .unwrap_or(default)
-        .to_owned()
+fn text(params: &Value, key: &str, default: &str) -> Result<String, String> {
+    match params.get(key) {
+        None | Some(Value::Null) | Some(Value::String(_)) => Ok(params
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .unwrap_or(default)
+            .to_owned()),
+        // Present but not a string: error like number() does rather than
+        // silently writing the default phantom.
+        Some(_) => Err(format!("{key} must be a string")),
+    }
 }
 
 fn number(params: &Value, key: &str, default: f64) -> Result<f64, String> {
