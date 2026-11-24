@@ -94,6 +94,7 @@ export function PlanRunner() {
   const [dest, setDest] = useState("");
   const [view, setView] = useState<RunnerView>(IDLE);
   const [busy, setBusy] = useState(false);
+  const browseRef = useRef(false);
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyReport, setCopyReport] = useState<Report | null>(null);
   const copying = copyBusy || (copyReport != null && !copyReport.finished);
@@ -220,19 +221,30 @@ export function PlanRunner() {
     await run(async () => {
       const next = await invoke<Catalog>("scan_kit_runner_disconnect");
       statusFailures.current = 0;
+      setFileDir(next.file_dir);
       setView(next.view);
     });
   }
 
   async function browsePlan() {
+    // The busy flag arms after the dialog resolves — a second click would
+    // stack a racing dialog and the last-resolved remember wins.
+    if (browseRef.current) {
+      return;
+    }
+    browseRef.current = true;
     const selected = await open({
       title: "input_map.csv",
       defaultPath: fileDir ?? undefined,
       filters: [{ name: "CSV", extensions: ["csv"] }],
-    }).catch((reason: unknown) => {
-      notifyError(reason);
-      return null;
-    });
+    })
+      .catch((reason: unknown) => {
+        notifyError(reason);
+        return null;
+      })
+      .finally(() => {
+        browseRef.current = false;
+      });
     if (typeof selected !== "string") {
       return;
     }
@@ -266,16 +278,24 @@ export function PlanRunner() {
   }
 
   async function browseZip() {
+    if (browseRef.current) {
+      return;
+    }
+    browseRef.current = true;
     const stem = view.session_id && view.session_id.length > 0 ? view.session_id : "session";
     const fallback = fileDir != null ? `${fileDir}/${stem}.zip` : `${stem}.zip`;
     const selected = await save({
       title: "Session zip",
       defaultPath: dest || fallback,
       filters: [{ name: "Zip", extensions: ["zip"] }],
-    }).catch((reason: unknown) => {
-      notifyError(reason);
-      return null;
-    });
+    })
+      .catch((reason: unknown) => {
+        notifyError(reason);
+        return null;
+      })
+      .finally(() => {
+        browseRef.current = false;
+      });
     if (typeof selected !== "string") {
       return;
     }

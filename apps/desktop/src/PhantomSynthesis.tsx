@@ -42,6 +42,9 @@ export function PhantomSynthesis() {
   const [status, setStatus] = useState(IDLE);
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(true);
+  // catalog.save_dir is a mount-time value — a successful write moves the
+  // remembered dir and the next dialog should follow.
+  const [writtenDir, setWrittenDir] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const writeBusy = useRef(false);
   const paramsRef = useRef(params);
@@ -126,7 +129,7 @@ export function PhantomSynthesis() {
     const selectedDir = await open({
       directory: true,
       title: "Folder for the synthetic study",
-      defaultPath: parentDir(catalog?.save_dir ?? null),
+      defaultPath: parentDir(writtenDir ?? catalog?.save_dir ?? null),
     }).catch((reason: unknown) => {
       notifyError(reason);
       return null;
@@ -144,6 +147,7 @@ export function PhantomSynthesis() {
         params: paramsRef.current,
       });
       setStatus(written.status);
+      setWrittenDir(parentDir(written.folder) ?? null);
       notifySaved(written.folder, { title: "Study written", folder: true });
     } catch (reason: unknown) {
       notifyError(reason);

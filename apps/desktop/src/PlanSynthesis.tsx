@@ -303,6 +303,11 @@ export function PlanSynthesis() {
   }
 
   async function browse(param: Param) {
+    // Same frame double-click would stack two dialogs; last-resolved wins.
+    if (browseRef.current) {
+      return;
+    }
+    browseRef.current = true;
     const selected = await open({
       multiple: false,
       title: param.label,
@@ -310,14 +315,20 @@ export function PlanSynthesis() {
         param.key === "pld_path"
           ? [{ name: "IBA PLD", extensions: ["pld"] }]
           : [{ name: "RT Ion DICOM", extensions: ["dcm"] }],
-    }).catch((reason: unknown) => {
-      notifyError(reason);
-      return null;
-    });
+    })
+      .catch((reason: unknown) => {
+        notifyError(reason);
+        return null;
+      })
+      .finally(() => {
+        browseRef.current = false;
+      });
     if (typeof selected === "string") {
       setValue(param.key, selected);
     }
   }
+
+  const browseRef = useRef(false);
 
   async function savePlan() {
     if (busyRef.current || plan == null || template == null) {
