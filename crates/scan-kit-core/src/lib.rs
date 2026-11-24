@@ -462,10 +462,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let values = f32_array(input, "values")?;
             let bins = match input.get("bins") {
                 None | Some(Value::Null) => 8,
-                Some(value) => value
-                    .as_u64()
-                    .ok_or_else(|| InvokeError::Message("bins must be an integer".into()))?
-                    as usize,
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    InvokeError::Message("bins must be a non-negative integer".into())
+                })? as usize,
             };
             json!({ "edges": quantile_edges(&values, bins) })
         }
@@ -473,10 +472,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let values = f32_array(input, "values")?;
             let bins = match input.get("bins") {
                 None | Some(Value::Null) => 16,
-                Some(value) => value
-                    .as_u64()
-                    .ok_or_else(|| InvokeError::Message("bins must be an integer".into()))?
-                    as usize,
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    InvokeError::Message("bins must be a non-negative integer".into())
+                })? as usize,
             };
             let (edges, counts) = histogram(&values, bins);
             json!({ "edges": edges, "counts": counts })
