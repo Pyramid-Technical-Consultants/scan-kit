@@ -391,31 +391,27 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
         return crate::location::remote_fingerprint(&text, session_id);
     }
     let target = if storage.is_dir() {
+        // Stat the file the reader serves — session_directory resolves the
+        // nested root when its marker holds, so the served summary is
+        // probed first and a rewrite always invalidates the cache.
+        let root = session_directory(storage, session_id);
+        let served = root.join("termination_summary.txt");
         let outer = storage.join("termination_summary.txt");
-        let inner = if valid_session_id(session_id) {
-            storage.join(session_id).join("termination_summary.txt")
-        } else {
-            storage.join("termination_summary.txt")
-        };
         // The inner dir's mtime freezes once the layer/run dirs exist —
         // input_map.csv moves on every row write, so probe it too.
+        let served_rows = root.join("input_map.csv");
         let outer_rows = storage.join("input_map.csv");
-        let inner_rows = if valid_session_id(session_id) {
-            storage.join(session_id).join("input_map.csv")
-        } else {
-            storage.join("input_map.csv")
-        };
-        if outer.is_file() {
+        if served.is_file() {
+            served
+        } else if outer.is_file() {
             outer
-        } else if inner.is_file() {
-            inner
+        } else if served_rows.is_file() {
+            served_rows
         } else if outer_rows.is_file() {
             outer_rows
-        } else if inner_rows.is_file() {
-            inner_rows
         } else {
             // Still capturing: the inner session dir changes, the outer does not.
-            session_directory(storage, session_id)
+            root
         }
     } else {
         storage.to_path_buf()

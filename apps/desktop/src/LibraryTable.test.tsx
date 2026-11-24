@@ -179,7 +179,7 @@ it("draws checks and forwards clicks, notes, and the menu", async () => {
         onHeaderCheck={() => {
           header += 1;
         }}
-        onCommitNote={(edit) => notes.push(edit.after)}
+        onCommitNote={(edit) => { notes.push(edit.after); return Promise.resolve(true); }}
         onOpenMenu={(menu) => menus.push(menu.x)}
       />,
     );

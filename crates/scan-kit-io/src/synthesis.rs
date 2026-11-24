@@ -31,15 +31,10 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
             Some(text) => Some(text.to_owned()),
         },
     };
-    // Every write lands through write_csv — fail a bad extension before
-    // the parse, not after it.
+    // Every write lands through write_csv — fail a bad path before the
+    // document build, not after a 64-256 MiB plan parse.
     if let Some(path) = &path {
-        if !Path::new(path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
-        {
-            return Err("the plan path must end in .csv".into());
-        }
+        validate_csv_path(Path::new(path))?;
     }
     if let Some(csv_value) = input.get("csv") {
         let Some(csv) = csv_value.as_str() else {
@@ -147,9 +142,7 @@ fn document_json(document: &PlanDocument, written: Option<String>) -> Value {
     })
 }
 
-fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
-    // The csv+path pair crosses the invoke boundary — confine the write to
-    // a .csv name or any text becomes an arbitrary file-write primitive.
+fn validate_csv_path(path: &Path) -> Result<(), String> {
     if !path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
@@ -157,13 +150,28 @@ fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
         return Err("the plan path must end in .csv".into());
     }
     // A bare "map.csv" lands in the process CWD and then stores CWD as the
-    // next save's default — the zip-dest check names the same failure.
+    // next save's default — the zip-dest check names the same failure. A
+    // Prefix-only "C:" parent is the same ambient-CWD destination.
     match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        Some(parent)
+            if parent
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Prefix(_))) =>
+        {
+            Ok(())
         }
-        _ => return Err("the plan path must name a directory to write into".into()),
+        _ => Err("the plan path must name a directory to write into".into()),
     }
+}
+
+fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
+    // The csv+path pair crosses the invoke boundary — confine the write to
+    // a .csv name or any text becomes an arbitrary file-write primitive.
+    validate_csv_path(path)?;
+    let Some(parent) = path.parent() else {
+        return Err("the plan path must name a directory to write into".into());
+    };
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     scan_kit_core::atomic_write(path, csv.as_bytes())?;
     if let Some(parent) = path.parent() {
         // Store the resolved directory - a bare "." or a relative parent is

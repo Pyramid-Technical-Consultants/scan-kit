@@ -98,6 +98,8 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         resolve_concept_column(&headers, "energy").map(|name| header_index(&headers, name));
     let x = resolve_concept_column(&headers, "x_position").map(|name| header_index(&headers, name));
     let y = resolve_concept_column(&headers, "y_position").map(|name| header_index(&headers, name));
+    let layer_id =
+        resolve_concept_column(&headers, "layer_id").map(|name| header_index(&headers, name));
     let mut indexes = Vec::new();
     if let Some(Some(index)) = energy {
         indexes.push(index);
@@ -106,6 +108,9 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         indexes.push(index);
     }
     if let Some(Some(index)) = y {
+        indexes.push(index);
+    }
+    if let Some(Some(index)) = layer_id {
         indexes.push(index);
     }
     if indexes.is_empty() {
@@ -129,12 +134,21 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         None
     };
     let y_values = if y.and_then(|index| index).is_some() {
+        let values = columns.get(slot).cloned();
+        slot += 1;
+        values
+    } else {
+        None
+    };
+    let layer_ids = if layer_id.and_then(|index| index).is_some() {
         columns.get(slot).cloned()
     } else {
         None
     };
     let _ = slot;
-    let layers = energies.as_ref().and_then(|values| {
+    // layer_id is the identity the rest of the pipeline counts — a
+    // same-energy multi-layer plan undercounts under an energy tally.
+    let distinct = |values: &[Option<f64>]| -> Option<i32> {
         let mut seen = HashSet::new();
         for value in values.iter().flatten() {
             if value.is_finite() {
@@ -147,7 +161,11 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         } else {
             i32::try_from(seen.len()).ok()
         }
-    });
+    };
+    let layers = layer_ids
+        .as_deref()
+        .and_then(distinct)
+        .or_else(|| energies.as_deref().and_then(distinct));
     let mut spans = Vec::new();
     for values in [x_values, y_values].into_iter().flatten() {
         let finite: Vec<f64> = values

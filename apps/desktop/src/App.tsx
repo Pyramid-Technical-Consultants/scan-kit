@@ -418,9 +418,18 @@ export default function App() {
     }
   }, []);
 
-  const pullCatalog = useCallback(async () => {
-    applyCatalog(await invoke<CatalogPayload>("scan_kit_read_catalog"));
-  }, [applyCatalog]);
+  const pullCatalog = useCallback(
+    async (epoch?: number) => {
+      const payload = await invoke<CatalogPayload>("scan_kit_read_catalog");
+      // A superseding open/indexMany that started during this pull — even
+      // one that later failed — must not lose to this stale snapshot.
+      if (epoch != null && catalogEpoch.current !== epoch) {
+        return;
+      }
+      applyCatalog(payload);
+    },
+    [applyCatalog],
+  );
 
   const indexLocation = useCallback(
     async (path: string): Promise<"ok" | "auth" | "error"> => {
@@ -454,7 +463,7 @@ export default function App() {
           return;
         }
         try {
-          await pullCatalog();
+          await pullCatalog(epoch);
           setUndo([]);
           setRedo([]);
           setLocationDraft("");
@@ -491,7 +500,7 @@ export default function App() {
         if (catalogEpoch.current === epoch) {
           pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
           try {
-            await pullCatalog();
+            await pullCatalog(epoch);
             dismissNotice();
             setUndo([]);
             setRedo([]);
@@ -992,15 +1001,26 @@ export default function App() {
     );
   }, [rows]);
 
+  // Two rapid edits must push undo entries in user order — invoke
+    // completion order is not guaranteed.
+  const noteChain = useRef<Promise<unknown>>(Promise.resolve());
   const commitNote = useCallback(
-    (edit: NoteEdit) => {
-      void writeNote(edit.sessionId, edit.library, edit.after)
+    (edit: NoteEdit): Promise<boolean> => {
+      const run = noteChain.current.then(() =>
+        writeNote(edit.sessionId, edit.library, edit.after),
+      );
+      noteChain.current = run.catch(() => undefined);
+      return run
         .then(() => {
           setUndo((stack) => [...stack, edit]);
           setRedo([]);
           dismissNotice();
+          return true;
         })
-        .catch((error: unknown) => notifyError(error));
+        .catch((error: unknown) => {
+          notifyError(error);
+          return false;
+        });
     },
     [writeNote],
   );

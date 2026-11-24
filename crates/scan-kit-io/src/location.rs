@@ -239,17 +239,26 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
     let mut fs = crate::remote::connect(&remote, &password_of(&remote)).ok()?;
     let base = remote.path.trim_end_matches('/');
     let mut candidates = vec![base.to_owned()];
-    if !archive_name(&remote.path) {
-        candidates.insert(0, format!("{base}/termination_summary.txt"));
-        if discover::valid_session_id(session_id) {
-            candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
-            // Still-capturing sessions have no summary and their inner dir's
-            // mtime freezes once the layer/run dirs exist — input_map.csv
-            // moves on every row write (same probes as remote_stamp).
-            candidates.insert(2, format!("{base}/input_map.csv"));
-            candidates.insert(3, format!("{base}/{session_id}/input_map.csv"));
-            candidates.insert(4, format!("{base}/{session_id}"));
+    if !archive_name(&remote.path) && discover::valid_session_id(session_id) {
+        let nested = format!("{base}/{session_id}");
+        // Reads serve the nested file only when the nested marker exists —
+        // probe in the order the reader resolves so the fingerprint
+        // certifies the file that is actually read.
+        let inner_first = matches!(fs.stat(&format!("{nested}/input_map.csv")), Ok(Some(_)));
+        let mut files = [
+            format!("{nested}/termination_summary.txt"),
+            format!("{base}/termination_summary.txt"),
+            format!("{nested}/input_map.csv"),
+            format!("{base}/input_map.csv"),
+        ];
+        if !inner_first {
+            files.swap(0, 1);
+            files.swap(2, 3);
         }
+        candidates.splice(0..0, files);
+        candidates.insert(5, nested);
+    } else if !archive_name(&remote.path) {
+        candidates.insert(0, format!("{base}/termination_summary.txt"));
     }
     let mut dir_stat = None;
     for path in candidates {
@@ -479,17 +488,26 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
     let base = session.path.trim_end_matches('/');
     let leaf = base.rsplit('/').next().unwrap_or(base);
     let mut dir_stat = None;
-    // Flat markers first, mirroring remote_fingerprint and the local
-    // storage_fingerprint — disagreeing orders would record one stat at
-    // fingerprint time and another at materialize time, a perpetual re-copy.
-    for marker in [
-        format!("{base}/termination_summary.txt"),
+    // Same resolved order remote_fingerprint and the local
+    // storage_fingerprint use — the nested files first when the nested
+    // marker exists, because that is the file the reader serves.
+    let inner_first = matches!(
+        fs.stat(&format!("{base}/{leaf}/input_map.csv")),
+        Ok(Some(_))
+    );
+    let mut markers = [
         format!("{base}/{leaf}/termination_summary.txt"),
-        format!("{base}/input_map.csv"),
+        format!("{base}/termination_summary.txt"),
         format!("{base}/{leaf}/input_map.csv"),
+        format!("{base}/input_map.csv"),
         format!("{base}/{leaf}"),
         base.to_owned(),
-    ] {
+    ];
+    if !inner_first {
+        markers.swap(0, 1);
+        markers.swap(2, 3);
+    }
+    for marker in markers {
         let Some(stat) = fs.stat(&marker)? else {
             continue;
         };
@@ -2201,9 +2219,9 @@ mod tests {
         )
         .unwrap();
         let (mtime, size) = remote_fingerprint(&canonical, "sess").unwrap();
-        assert_eq!((mtime, size), (1_000_000_000, 5)); // "flat\n"
+        assert_eq!((mtime, size), (1_000_000_000, 14)); // "nested-marker\n"
         let remote = require_remote(&canonical).unwrap();
-        assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n5");
+        assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n14");
     }
 
     #[test]
