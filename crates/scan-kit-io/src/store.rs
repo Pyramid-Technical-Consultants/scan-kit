@@ -454,6 +454,26 @@ pub fn record_meta(
     // UPDATE only — the row exists by the time meta lands (sync_entry made
     // it inside the committed tx). An INSERT would resurrect a row deleted
     // in the autocommit window with hydrated meta and a stale fingerprint.
+    if checked == 0 {
+        // Meta read from newer bytes than the stamp certifies must not be
+        // written under the old fingerprint — keep the path current and
+        // leave the row retryable for a certifying hydrate.
+        conn.execute(
+            "UPDATE sessions SET storage_path = ?3, kind = ?4, map_geom_checked = 0
+             WHERE library_id = ?1 AND session_id = ?2
+               AND size IS ?5 AND mtime_ns IS ?6",
+            params![
+                lib_id,
+                entry.session_id,
+                path,
+                entry.kind,
+                fp_size,
+                fp_mtime
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
     conn.execute(
         "UPDATE sessions SET
             storage_path = ?3,
@@ -608,11 +628,18 @@ pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
     // Fill only while the pref is still absent - an unconditional write
     // could resurrect a directory a peer just forgot mid-scan.
     let raw = serde_json::to_string(&json!(dirs)).map_err(|err| err.to_string())?;
-    conn.execute(
-        "INSERT INTO prefs(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
-        params![PREF_DATA_DIRS, raw],
-    )
-    .map_err(|err| err.to_string())?;
+    // The fill is a one-time migration — a pure-read caller must not fail
+    // on a busy store for it; the fallback is returned and the fill lands
+    // on the next uncontended call.
+    if conn
+        .execute(
+            "INSERT INTO prefs(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![PREF_DATA_DIRS, raw],
+        )
+        .is_err()
+    {
+        return Ok(dirs);
+    }
     // A peer may have committed the real list between our read and the
     // insert — return what is stored, not our one-item fallback.
     if let Some(value) = prefs_get(conn, PREF_DATA_DIRS)?.filter(|value| value.is_array()) {
@@ -925,6 +952,20 @@ fn migrate_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> 
 }
 
 pub(crate) fn ensure_library(conn: &Connection, root: &str) -> Result<i64, String> {
+    // SELECT first: INSERT OR IGNORE only ignores when the UNIQUE
+    // constraint exists — a table that predates version stamping may lack
+    // it, and then every call leaks a duplicate row.
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM libraries WHERE root_path = ?1",
+            params![root],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+    {
+        return Ok(id);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO libraries(root_path) VALUES (?1)",
         params![root],
@@ -1125,11 +1166,17 @@ pub(crate) fn delete_missing(
     for session_id in &gone {
         // A case-only rename on a case-insensitive filesystem yields a new
         // id for the same file - rekey the row instead of losing the note.
-        if let Some(renamed) = found
+        // Two same-case-insensitive ids can legitimately coexist on a
+        // case-sensitive filesystem — rekeying on an arbitrary match could
+        // attach this row's note to the wrong survivor.
+        let mut matches = found
             .iter()
-            .find(|id| id.eq_ignore_ascii_case(session_id))
-            .cloned()
-        {
+            .filter(|id| id.eq_ignore_ascii_case(session_id));
+        let renamed = match (matches.next(), matches.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        };
+        if let Some(renamed) = renamed {
             let survives: bool = conn
                 .query_row(
                     "SELECT EXISTS(

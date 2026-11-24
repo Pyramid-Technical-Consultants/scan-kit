@@ -277,6 +277,12 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
             continue;
         };
         if archive_name(&remote.path) || !stat.dir {
+            // mtime 0 means the protocol stat couldn't certify the file
+            // (SFTP without mtime, FTP LIST without a modify fact) — an
+            // unverifiable fingerprint must not seal stale meta.
+            if stat.mtime_ns == 0 {
+                return None;
+            }
             return Some((stat.mtime_ns, i64::try_from(stat.size).ok()?));
         }
         // First dir hit wins: the inner session dir tracks a live capture's
@@ -288,6 +294,9 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
     // A still-capturing session has no summary yet — its own directory's
     // metadata still distinguishes it from nothing.
     let stat = dir_stat?;
+    if stat.mtime_ns == 0 {
+        return None;
+    }
     Some((stat.mtime_ns, i64::try_from(stat.size).ok()?))
 }
 

@@ -328,7 +328,9 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "csv": { "type": "string" },
                 "db_path": { "type": "string" }
             },
-            "required": ["template", "params"],
+            // The csv+path write mode needs neither template nor params —
+            // the handler errors per-branch ("template is required").
+            "required": [],
             "additionalProperties": false
         }),
         "scan_kit_config_catalog" => json!({
@@ -765,11 +767,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             Ok(runner::catalog(&db))
         }
         "scan_kit_runner_status" => {
-            let has_plan = input
-                .get("has_plan")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let dest = input.get("dest").and_then(Value::as_str).unwrap_or("");
+            let has_plan = match input.get("has_plan") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err(InvokeError::Message("has_plan must be a boolean".into())),
+            };
+            let dest = optional_str(input, "dest")?.unwrap_or("");
             runner::read_status(has_plan, dest).map_err(InvokeError::Message)
         }
         "scan_kit_runner_upload" => {
@@ -1222,7 +1225,9 @@ fn hydrate(entry: &Discovered, stamped: Option<(i64, i64)>) -> (Option<SessionMe
     // Meta hydrated after the fingerprint stat can describe newer bytes than
     // the row certifies — a moved file stays retryable instead of sealing
     // stale meta under the old fingerprint.
-    let readable = (meta.is_some() || fresh.is_some()) && fresh == stamped;
+    // A NULL-stamped row sealing on another failed stat (None == None)
+    // certifies no bytes at all — only a real fingerprint may seal.
+    let readable = stamped.is_some() && fresh == stamped;
     (meta, readable)
 }
 
