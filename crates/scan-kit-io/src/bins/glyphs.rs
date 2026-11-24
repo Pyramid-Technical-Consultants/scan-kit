@@ -1024,4 +1024,35 @@ mod tests {
             .iter()
             .all(|item| matches!(item, Series::Guide { .. })));
     }
+    #[test]
+    fn sigma_bands_only_draw_for_a_single_session() {
+        // expected_sigma_* is per-session devices.xml — over pooled
+        // categories one session's band on another's points is wrong.
+        let table: BTreeMap<String, Vec<f32>> = BTreeMap::from([(
+            "expected_sigma_ic1_x".to_string(),
+            vec![70.0, 2.0, 90.0, 3.0],
+        )]);
+        let guides = interlock_guides(
+            &[table.clone(), table.clone()],
+            &[70.0, 90.0],
+            "sigma",
+            "ic1_x",
+            "energy",
+            "band",
+            0.0,
+            1.0,
+        );
+        assert!(guides.is_empty());
+        let guides = interlock_guides(
+            &[table],
+            &[70.0, 90.0],
+            "sigma",
+            "ic1_x",
+            "energy",
+            "band",
+            0.0,
+            1.0,
+        );
+        assert!(!guides.is_empty());
+    }
 }

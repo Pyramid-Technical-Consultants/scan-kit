@@ -13483,4 +13483,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_crafted_pattern_word_quantizes_to_the_shader_thresholds() {
+        // Word 3 is a free f32 on the wire — decode must land it on the same
+        // solid/dash/dot thresholds the WGSL uses or CPU paint, GPU paint,
+        // and pick disagree on a crafted payload.
+        let rec = LineRec {
+            a: [0.0; 3],
+            b: [1.0, 0.0, 0.0],
+            color: [0.0; 4],
+            thickness: 1.0,
+            id: 0,
+            pattern: LINE_SOLID,
+            phase: 0.0,
+        };
+        let mut bytes = encode_lines(&[rec]);
+        for (crafted, want) in [
+            (0.0f32, LINE_SOLID),
+            (0.49, LINE_SOLID),
+            (0.5, LINE_DASH),
+            (1.5, LINE_DASH),
+            (1.51, LINE_DOT),
+            (3.0, LINE_DOT),
+            (f32::NAN, LINE_DASH),
+            (f32::INFINITY, LINE_DOT),
+        ] {
+            bytes[12..16].copy_from_slice(&crafted.to_le_bytes());
+            assert_eq!(decode_lines(&bytes)[0].pattern, want, "{crafted}");
+        }
+    }
 }

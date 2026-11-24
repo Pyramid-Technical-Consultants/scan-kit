@@ -1538,4 +1538,14 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn a_narrow_real_span_keeps_its_data_window() {
+        // The old absolute 1e-4 collapsed a real sub-100um spread into a
+        // ~1-unit window - the column became an invisible point.
+        let (lo, hi) = span(&[1.0e-5, 2.0e-5]);
+        assert!((lo, hi) == (1.0e-5, 2.0e-5), "{lo} {hi}");
+        // A true constant still gets a proportional window.
+        let (lo, hi) = span(&[70.0, 70.0]);
+        assert!(lo < 70.0 && hi > 70.0, "{lo} {hi}");
+    }
 }
