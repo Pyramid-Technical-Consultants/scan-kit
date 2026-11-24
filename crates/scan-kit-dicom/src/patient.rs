@@ -156,7 +156,10 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         // encodings this reader deliberately rejects, and skipping is cheaper.
         if let Some(class) = crate::meta_sop_class(&bytes) {
             let wanted = [crate::CT, crate::RT_STRUCT, crate::RT_PLAN, crate::RT_DOSE];
-            if !wanted.iter().any(|uid| class.contains(uid)) {
+            // Exact match — RTDOSE ...481.2 is a substring of the
+            // second-generation RT UIDs (...481.20-481.25), which this
+            // reader deliberately rejects inside.
+            if !wanted.contains(&class.as_str()) {
                 continue;
             }
         }
@@ -193,7 +196,8 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             if structures_uid.is_empty() {
                 structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
                 structures_frame = frame.clone();
-                structures = read_structures(&elems);
+                structures =
+                    read_structures(&elems).map_err(|err| format!("{}: {err}", file.display()))?;
             }
         } else if class == "1.2.840.10008.5.1.4.1.1.481.2" {
             if dose_seen {
@@ -799,7 +803,9 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     if rows == 0 || cols == 0 {
         return Err("missing pixel dimensions".into());
     }
-    let plane = rows * cols;
+    let Some(plane) = rows.checked_mul(cols).filter(|plane| *plane > 0) else {
+        return Err("pixel plane overflows".into());
+    };
     if stored.len() < plane {
         return Err("pixel data is short".into());
     }
@@ -1264,7 +1270,7 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
     })
 }
 
-fn read_structures(elems: &[Elem]) -> Vec<Structure> {
+fn read_structures(elems: &[Elem]) -> Result<Vec<Structure>, String> {
     let mut names = Vec::new();
     for roi in seq(elems, tag(0x3006, 0x0020)) {
         names.push((
@@ -1295,6 +1301,12 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
                 continue;
             }
             let data = floats_tag(item, tag(0x3006, 0x0050));
+            // floats_tag is all-or-nothing — one corrupt component in the
+            // DS yields empty and the whole contour slice would vanish
+            // silently, shrinking the ROI in every downstream metric.
+            if data.is_empty() && elem(item, tag(0x3006, 0x0050)).is_some() {
+                return Err("corrupt ContourData — one bad value drops the slice".into());
+            }
             let plane: Vec<[f32; 3]> = data
                 .chunks(3)
                 .filter(|point| point.len() == 3)
@@ -1308,7 +1320,7 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
             structures.push(Structure { name, contour });
         }
     }
-    structures
+    Ok(structures)
 }
 
 /// True when the voxel center is inside the structure's axial contour.

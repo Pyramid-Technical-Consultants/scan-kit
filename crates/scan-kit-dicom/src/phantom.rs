@@ -410,7 +410,14 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     patient::sq(&mut cp, 0x300A, 0x0360, &[setting])?;
                 }
             } else {
-                patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
+                // Same cumulative-through-this-point semantics — the
+                // trailing zero-weight cp contributes nothing.
+                patient::ds(
+                    &mut cp,
+                    0x300A,
+                    0x0134,
+                    &[weight + if last { 0.0 } else { n as f32 }],
+                )?;
             }
             patient::sh(&mut cp, 0x300A, 0x0390, "3.0")?;
             patient::is(&mut cp, 0x300A, 0x0392, n as i32)?;
