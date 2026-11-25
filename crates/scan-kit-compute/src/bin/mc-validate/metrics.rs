@@ -6,6 +6,7 @@ use crate::cases::{Case, MEV_TO_J, SIGMA_DEPTHS};
 /// Laterally integrated dose, surface first.
 pub fn depth_dose(vol: &[f32], nz: usize, ny: usize, nx: usize) -> Vec<f64> {
     let plane = ny * nx;
+    let nz = vol.len().checked_div(plane).unwrap_or(0).min(nz);
     (0..nz)
         .map(|i| {
             let z = nz - 1 - i;
@@ -62,6 +63,7 @@ pub fn fwhm_sigma(profile: &[f64]) -> f64 {
 /// Sigma of the x-lateral profile at each depth (mm, surface first).
 pub fn lateral_sigmas(vol: &[f32], nz: usize, ny: usize, nx: usize, depths: &[f64]) -> Vec<f64> {
     let plane = ny * nx;
+    let nz = vol.len().checked_div(plane).unwrap_or(0).min(nz);
     depths
         .iter()
         .map(|d| {

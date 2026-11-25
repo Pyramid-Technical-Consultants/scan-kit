@@ -643,7 +643,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                     storage.display()
                 )));
             }
-            if !discover::session_directory(storage, session_id).is_dir() {
+            if !discover::session_directory(storage, session_id).exists() {
                 return Err(InvokeError::Message(format!(
                     "no session {session_id} under {path}"
                 )));
@@ -660,7 +660,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                     storage.display()
                 )));
             }
-            if !discover::session_directory(storage, session_id).is_dir() {
+            if !discover::session_directory(storage, session_id).exists() {
                 return Err(InvokeError::Message(format!(
                     "no session {session_id} under {path}"
                 )));
@@ -742,10 +742,14 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_config_hide" => {
             let db = database_path(input)?;
-            let hide = input
-                .get("hide_unused")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| InvokeError::Message("hide_unused is required".into()))?;
+            let hide = match input.get("hide_unused") {
+                None | Some(Value::Null) => {
+                    return Err(InvokeError::Message("hide_unused is required".into()));
+                }
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| InvokeError::Message("hide_unused must be a bool".into()))?,
+            };
             config::set_hide_unused(&db, hide).map_err(InvokeError::Message)
         }
         "scan_kit_phantom_catalog" => {
@@ -866,6 +870,9 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
         }
         "remove" => {
             let folder = folder.ok_or("scanner folder required")?;
+            if folder.trim().is_empty() {
+                return Err("scanner folder required".into());
+            }
             store::with_store(db, |conn| {
                 conn.execute_batch("BEGIN IMMEDIATE")
                     .map_err(|err| err.to_string())?;

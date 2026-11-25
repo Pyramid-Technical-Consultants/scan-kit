@@ -3627,6 +3627,11 @@ impl Plot {
                     .collect::<Vec<_>>()
             };
             for (start, count, timed) in runs {
+                // Match visible_draws — a stale range clamps to the records
+                // that exist rather than dropping the run.
+                let total = self.marks.points.len() as u32;
+                let start = start.min(total);
+                let count = count.min(total - start);
                 let Some(points) = self
                     .marks
                     .points
@@ -3938,9 +3943,9 @@ impl Plot {
                     pass.draw(0..6, 0..batch_count as u32);
                 }
                 for (start, texture) in &batch.heats {
-                    let start = u64::from(*start).min(quad_records.saturating_sub(1));
-                    if quad_records == 0 {
-                        break;
+                    let start = u64::from(*start);
+                    if start >= quad_records {
+                        continue;
                     }
                     pass.set_bind_group(1, &marks.heats[*texture].group, &[]);
                     pass.set_vertex_buffer(0, marks.quads.slice(start * QUAD_STRIDE..));
@@ -6919,6 +6924,10 @@ fn labels_for(
             color,
         );
     }
+    if cell.plot.w <= 0.0 || cell.plot.h <= 0.0 {
+        // Every data-anchored glyph would project onto the same pixel.
+        return out;
+    }
     // A rotated dose slice shows source-Y on the x edge (and vice versa)
     // for odd turns; for turns=2 the x edge runs mirrored. Tick the SOURCE
     // millimetre range and map each value to its display position, or the
@@ -7963,6 +7972,11 @@ fn scissor(plot: PlotRect, width: u32, height: u32) -> (u32, u32, u32, u32) {
     // `snap_plot` makes this an exact pixel range. Truncation is that range.
     let x = (plot.x.max(0.0) as u32).min(width.saturating_sub(1));
     let y = (plot.y.max(0.0) as u32).min(height.saturating_sub(1));
+    if plot.w <= 0.0 || plot.h <= 0.0 {
+        // A dead cell owns no pixels — a forced 1-px scissor still paints
+        // the collapsed mark dot into the neighbor's gutter.
+        return (x, y, 0, 0);
+    }
     let w = (plot.w.max(1.0) as u32).min(width.saturating_sub(x)).max(1);
     let h = (plot.h.max(1.0) as u32)
         .min(height.saturating_sub(y))
@@ -8373,6 +8387,11 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
     } else {
         [glyph.anchor[0], glyph.anchor[1]]
     };
+    if !origin[0].is_finite() || !origin[1].is_finite() {
+        // NaN as i32 is 0 — an unprojectable anchor would stamp the
+        // glyph's pixels at the frame corner.
+        return;
+    }
     let font = atlas();
     let (sin_t, cos_t) = glyph.anchor[2].sin_cos();
     let turned = glyph.anchor[3] < 0.5 && glyph.anchor[2] > 0.5;

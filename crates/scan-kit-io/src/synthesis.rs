@@ -48,10 +48,11 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
         return Ok(json!({ "written": path }));
     }
 
-    let template = input
-        .get("template")
-        .and_then(Value::as_str)
-        .ok_or("template is required")?;
+    let template = match input.get("template") {
+        None | Some(Value::Null) => return Err("template is required".into()),
+        Some(value) if !value.is_string() => return Err("template must be a string".into()),
+        Some(value) => value.as_str().unwrap_or(""),
+    };
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
     if !params.is_object() {
         return Err("params must be an object".to_owned());

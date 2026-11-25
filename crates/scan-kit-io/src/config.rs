@@ -63,6 +63,10 @@ pub fn open_folder(
     if data_dir.is_some() != session_id.is_some() {
         return Err("data_dir and session_id must come together".into());
     }
+    // Both named — the answer cannot be one folder's files or the other's.
+    if explicit.is_some() && data_dir.is_some() {
+        return Err("path and data_dir/session_id are alternatives".into());
+    }
     // Asked for a session's config and it isn't there — the remembered
     // fallback must not report a different folder's files as the answer.
     if data_dir.is_some() && session_id.is_some() && from_session.is_none() && explicit.is_none() {
@@ -344,7 +348,11 @@ pub fn diff(input: &Value) -> Result<Value, String> {
             loaded_dir.display()
         ));
     }
-    let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
+    let data_dir = match input.get("data_dir") {
+        None | Some(Value::Null) => String::new(),
+        Some(value) if !value.is_string() => return Err("data_dir must be a string".into()),
+        Some(value) => value.as_str().unwrap_or("").trim().to_owned(),
+    };
     let session_ids = strings(input, "session_ids")?;
     if session_ids.is_empty() {
         return Err("Select at least one session.".into());

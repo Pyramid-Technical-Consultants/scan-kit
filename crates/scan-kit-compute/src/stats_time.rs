@@ -309,7 +309,10 @@ impl Reducer {
                 timeout: Some(std::time::Duration::from_millis(50)),
             }) {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
-                Err(err) => return Err(err.to_string()),
+                Err(err) => {
+                    job.staging.unmap();
+                    return Err(err.to_string());
+                }
             }
             match receiver.try_recv() {
                 Ok(result) => {
@@ -317,9 +320,13 @@ impl Reducer {
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(err) => return Err(err.to_string()),
+                Err(err) => {
+                    job.staging.unmap();
+                    return Err(err.to_string());
+                }
             }
             if started.elapsed() > std::time::Duration::from_secs(30) {
+                job.staging.unmap();
                 return Err("GPU readback timed out".into());
             }
         }
