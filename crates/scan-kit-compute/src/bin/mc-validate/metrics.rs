@@ -143,6 +143,8 @@ pub struct Diff {
     pub sigma: f64,
     pub energy: f64,
     pub centroid: f64,
+    /// Per-depth sigma diffs — the folded `sigma` hides which depth failed.
+    pub sigma_each: Vec<f64>,
 }
 
 /// Relative / absolute differences of `gpu` from `ref` summaries.
@@ -174,6 +176,7 @@ pub fn compare(ref_: &Summary, gpu: &Summary) -> Diff {
         } else {
             f64::NAN
         },
+        sigma_each: sig,
         energy: gpu.energy / ref_.energy - 1.0,
         centroid: gpu
             .centroid

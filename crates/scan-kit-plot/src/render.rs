@@ -143,7 +143,9 @@ fn px_to_clip(px: vec2<f32>) -> vec4<f32> {
 
 fn shade(rgb: vec3<f32>, alpha: f32, coverage: f32) -> vec4<f32> {
     let a = alpha * coverage;
-    if (a < 0.004) {
+    // a < 0.004 is false for NaN — write the gate NaN-safe so a crafted
+    // mark can't push NaN premultiplied into the target.
+    if (!(a >= 0.004)) {
         discard;
     }
     return vec4<f32>(rgb * a, a);
@@ -3392,9 +3394,10 @@ impl Plot {
                 };
                 // `chrome` is a band the shell reserved inside one shared canvas.
                 let top = top.max(self.chrome);
-                let mut plot = if cell.w <= 0.0 || cell.h <= 0.0 {
-                    // A zero-weight cell has no room — a forced 8 px plot
-                    // would smear this panel into the neighbor's gutter.
+                let mut plot = if cell.w - left - right <= 0.0 || cell.h - top - bottom <= 0.0 {
+                    // A cell with no room inside its chrome has no plot — a
+                    // forced 8 px rect would smear this panel into the
+                    // neighbor's gutter.
                     PlotRect {
                         x: cell.x,
                         y: cell.y,
@@ -3409,7 +3412,7 @@ impl Plot {
                         h: (cell.h - top - bottom).max(8.0),
                     })
                 };
-                if cell.w > 0.0 && plane.is_some_and(|plane| plane < 3) {
+                if plot.w > 0.0 && plane.is_some_and(|plane| plane < 3) {
                     let turns = self.turns.get(index).copied().unwrap_or(0);
                     let fitted = fit_domain(camera, &plot, turns);
                     let wider = axis_name_width(&panel.y_label) + y_tick_width(&fitted) + 8.0;
@@ -8436,12 +8439,19 @@ fn blend(
         return;
     }
     let alpha = color[3].clamp(0.0, 1.0);
-    if alpha < 0.004 {
+    // clamp propagates NaN — a NaN alpha passes the gate below and a NaN
+    // rgb writes 0 into the destination: a crafted mark could erase pixels.
+    if !alpha.is_finite() || alpha < 0.004 {
         return;
     }
     let pixel = index * 4;
     for channel in 0..3 {
-        let src = color[channel].clamp(0.0, 1.0) * alpha * 255.0;
+        let rgb = if color[channel].is_finite() {
+            color[channel].clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let src = rgb * alpha * 255.0;
         let dst = frame[pixel + channel] as f32;
         frame[pixel + channel] = (src + dst * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
     }
@@ -11903,12 +11913,12 @@ mod tests {
             hi: 1.0,
         }];
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.9, 0.9, 0.9, 1.0]);
-        let layout = plot.layout(64, 64);
-        let frame = plot.paint_cpu(64, 64, &layout);
+        let layout = plot.layout(256, 256);
+        let frame = plot.paint_cpu(256, 256, &layout);
         let rect = layout[0].plot;
         let x = (rect.x + rect.w * 0.5) as u32;
         let y = (rect.y + rect.h * 0.5) as u32;
-        let pixel = (y * 64 + x) as usize * 4;
+        let pixel = (y * 256 + x) as usize * 4;
         assert_eq!(&frame[pixel..pixel + 3], &[255, 255, 255]);
     }
 

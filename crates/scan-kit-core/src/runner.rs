@@ -361,6 +361,7 @@ pub fn session_zip_dest(dest: &str) -> Option<String> {
         || dest.starts_with("/root/")
         || !dest.to_ascii_lowercase().ends_with(".zip")
         || no_dir
+        || !std::path::Path::new(dest).is_absolute()
     {
         return None;
     }

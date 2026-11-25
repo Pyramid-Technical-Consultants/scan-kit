@@ -58,6 +58,11 @@ pub fn open_folder(
         (Some(dir), Some(id)) => session_config_dir(dir, id),
         _ => None,
     };
+    // Asked for a session's config and it isn't there — the remembered
+    // fallback must not report a different folder's files as the answer.
+    if data_dir.is_some() && session_id.is_some() && from_session.is_none() {
+        return Err("that session has no configuration folder".into());
+    }
     let chosen = explicit
         .or(from_session)
         .or_else(|| remembered_dir.map(PathBuf::from));
@@ -250,7 +255,14 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
     if let Some(form) = input.get("form") {
         xml = apply_form(&xml, form)?;
     }
-    let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
+    let data_dir = match input.get("data_dir") {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value
+            .as_str()
+            .ok_or("data_dir must be a string")?
+            .trim()
+            .to_owned(),
+    };
     let session_ids = strings(input, "session_ids")?;
     if session_ids.is_empty() {
         return Err("Select at least one session.".into());
@@ -300,7 +312,10 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
 /// Read-only whole-tree diff: the loaded config folder vs each selected
 /// session's `config/` tree (map2map, dcs, nozzle), one column per session.
 pub fn diff(input: &Value) -> Result<Value, String> {
-    let config_dir = text(input, "config_dir").unwrap_or("").trim();
+    let config_dir = match input.get("config_dir") {
+        None | Some(Value::Null) => "",
+        Some(value) => value.as_str().ok_or("config_dir must be a string")?.trim(),
+    };
     if config_dir.is_empty() {
         return Err("Open a configuration folder.".into());
     }

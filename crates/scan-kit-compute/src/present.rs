@@ -127,8 +127,11 @@ pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, 
         "scan_kit_write_dose" | "scan_kit_write_report" => {
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
+            if session_ids.len() > 5 {
+                return Err("at most five sessions can be selected".into());
+            }
+            let dest = text(input, "dest")?;
             let mut options = object_arg(input, "options")?;
-            options["dest"] = json!(text(input, "dest")?);
             if name == "scan_kit_write_dose" {
                 let description = match input.get("description") {
                     None | Some(Value::Null) => "scan-kit MC",
@@ -136,6 +139,18 @@ pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, 
                 };
                 options["description"] = json!(description);
             }
+            // A write tool's dest is a file-write primitive — confine it to
+            // the tool's own extension inside a real directory, like the
+            // plan .csv and session .zip checks.
+            let ext = if name == "scan_kit_write_dose" {
+                ".dcm"
+            } else {
+                ".pdf"
+            };
+            if !dest.to_ascii_lowercase().ends_with(ext) || !Path::new(dest).is_absolute() {
+                return Err(format!("dest must be an absolute {ext} path"));
+            }
+            options["dest"] = json!(dest);
             let view = if name == "scan_kit_write_dose" {
                 "write_dose"
             } else {

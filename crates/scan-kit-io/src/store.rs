@@ -316,6 +316,9 @@ pub fn set_selected(
 ) -> Result<Vec<String>, String> {
     let mut unique = Vec::new();
     for session_id in session_ids {
+        if !scan_kit_core::valid_session_id(session_id) {
+            return Err(format!("invalid session id: {session_id}"));
+        }
         if !unique.contains(session_id) {
             unique.push(session_id.clone());
             if unique.len() > 5 {

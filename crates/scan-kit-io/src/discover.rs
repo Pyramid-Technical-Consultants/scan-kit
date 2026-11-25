@@ -116,6 +116,9 @@ fn walk_local(
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<(), String> {
     if depth >= crate::location::NEST_DEPTH {
+        // An unvisited subtree is not an empty one — flag it like an
+        // unreadable dir so delete_missing can't prune below the cap.
+        *walk_failed = true;
         return Ok(());
     }
     // The remote walk honours keep at every recursion — a slow local share
@@ -449,20 +452,22 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
         name == primary || name == filename || name.ends_with(&suffix)
     })
     .ok()?;
-    for want in [&primary, &filename.to_owned()] {
-        if let Some((_, bytes)) = members
-            .iter()
-            .find(|(name, _)| normalize_member(name) == **want)
-        {
-            return Some(bytes.clone());
-        }
+    if let Some((_, bytes)) = members
+        .iter()
+        .find(|(name, _)| normalize_member(name) == primary)
+    {
+        return Some(bytes.clone());
     }
-    // A wrapped archive whose folder name was not picked up as the session id
-    // (tars keep the zip filename) still resolves by the inner path suffix —
-    // but only when the archive holds one session tree, else the suffix could
-    // serve a sibling session's file under this id.
+    // Bare-name and suffix matches are only safe when the archive holds one
+    // session tree — a stray root-level file can't stand in for a sibling's.
     if roots.len() != 1 {
         return None;
+    }
+    if let Some((_, bytes)) = members
+        .iter()
+        .find(|(name, _)| normalize_member(name) == filename)
+    {
+        return Some(bytes.clone());
     }
     members
         .into_iter()
@@ -498,8 +503,11 @@ pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
 /// `-1` when the path has no layer folder.
 pub fn read_timeslice_frames(storage: &Path, session_id: &str) -> Vec<(i64, Vec<u8>)> {
     let mut members = if storage.is_dir() {
+        // Resolve the same way read_timeslices_for does — a library root +
+        // id must not merge sibling sessions' timeslices under one id.
+        let root = session_directory(storage, session_id);
         let mut found = Vec::new();
-        walk_files(storage, storage, 0, &is_timeslice, &mut found);
+        walk_files(&root, &root, 0, &is_timeslice, &mut found);
         found
     } else {
         // The dir branch already walks only the session dir; the archive
@@ -652,6 +660,7 @@ fn zip_session_dir(path: &Path) -> Option<String> {
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let mut tops = std::collections::HashSet::new();
     let mut markers = std::collections::HashSet::new();
+    let mut flat = false;
     for index in 0..archive.len() {
         let Ok(entry) = archive.by_index(index) else {
             continue;
@@ -661,6 +670,7 @@ fn zip_session_dir(path: &Path) -> Option<String> {
         };
         let name = normalize_member(&name);
         let Some((top, _)) = name.split_once('/') else {
+            flat = true;
             continue;
         };
         if !valid_session_id(top) {
@@ -674,7 +684,10 @@ fn zip_session_dir(path: &Path) -> Option<String> {
     if markers.len() == 1 {
         return markers.into_iter().next();
     }
-    if tops.len() == 1 {
+    // The single-top heuristic means "the session was wrapped in a folder".
+    // Root-level files alongside the dir mean a flat-layout archive instead —
+    // the lone dir is layer-N, not a session id.
+    if tops.len() == 1 && !flat {
         return tops.into_iter().next();
     }
     None

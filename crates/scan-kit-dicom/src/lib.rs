@@ -158,13 +158,16 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 .ok_or("goal must be a finite number")?;
             // Optional — but a mistyped value must not silently default.
             let min_volume = match input.get("min_volume") {
+                None | Some(Value::Null) => 0.95,
                 Some(value) => value
                     .as_f64()
                     .map(|n| n as f32)
                     .filter(|n| n.is_finite())
                     .ok_or("min_volume must be a finite number")?,
-                None => 0.95,
             };
+            if !(0.0..=1.0).contains(&min_volume) {
+                return Err("min_volume must be from 0 to 1".into());
+            }
             let result = clinical_goal(&dose, goal, min_volume);
             Ok(json!(result))
         }

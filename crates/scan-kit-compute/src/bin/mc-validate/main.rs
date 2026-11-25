@@ -227,6 +227,14 @@ fn load_golden(case: &Case) -> Result<Golden, String> {
     if lo.iter().zip(&hi).any(|(lo, hi)| lo > hi) {
         return Err(format!("{}: bad crop", case.name));
     }
+    let need: usize = lo.iter().zip(&hi).map(|(l, h)| h - l).product();
+    if dose.len() != need {
+        return Err(format!(
+            "{}: dose length {} doesn't match the crop volume {need}",
+            case.name,
+            dose.len()
+        ));
+    }
     let nan = f64::NAN;
     Ok(Golden {
         dose,
@@ -236,7 +244,9 @@ fn load_golden(case: &Case) -> Result<Golden, String> {
             r80: get("r80")?.scalar_f64()?,
             r90: get("r90")?.scalar_f64()?,
             sigma_depths: get("sigma_depths")?.f64s()?,
-            sigmas: get("sigmas")?.f64s().unwrap_or_else(|_| vec![nan; 3]),
+            sigmas: get("sigmas")?
+                .f64s()
+                .map_err(|err| format!("{}: sigmas: {err}", case.name))?,
             energy: get("energy")?.scalar_f64()?,
             centroid: {
                 let c = get("centroid")?.f64s()?;
@@ -285,8 +295,9 @@ fn gamma_rate(
     dta_mm: f32,
     cutoff_pct: f32,
 ) -> f64 {
+    let norm = reference.iter().copied().fold(0.0f32, f32::max);
     let (_map, passed, scored) = gamma_index_norm(
-        reference, evaluated, shape, dose_pct, dta_mm, spacing, cutoff_pct, 0.0,
+        reference, evaluated, shape, dose_pct, dta_mm, spacing, cutoff_pct, norm,
     );
     if scored == 0 {
         f64::NAN
@@ -295,15 +306,17 @@ fn gamma_rate(
     }
 }
 
-fn passes(diff: &metrics::Diff, gamma: f64, tol: &Tolerances, ref_sigma_nan: bool) -> bool {
+fn passes(diff: &metrics::Diff, gamma: f64, tol: &Tolerances, ref_sigmas: &[f64]) -> bool {
     let ok = diff.idd.abs() <= tol.idd
         && diff.r80.abs() <= tol.r80
         && diff.energy.abs() <= tol.energy
         && diff.centroid.abs() <= tol.centroid;
-    // A NaN sigma is excused only when the reference was NaN too (fields);
-    // a NaN GPU sigma against a finite reference is a regression.
-    let ok = ok && (diff.sigma <= tol.sigma || (diff.sigma.is_nan() && ref_sigma_nan));
-    ok && gamma >= tol.gamma
+    // A NaN sigma is excused only at a depth where the reference was NaN
+    // too — one NaN in the golden must not excuse failures at other depths.
+    let sigma_ok = diff.sigma_each.iter().enumerate().all(|(i, s)| {
+        s.abs() <= tol.sigma || (s.is_nan() && ref_sigmas.get(i).is_some_and(|r| r.is_nan()))
+    });
+    ok && sigma_ok && gamma >= tol.gamma
 }
 
 // ---- suites
@@ -388,12 +401,7 @@ fn main_slab(args: &Args) -> Result<i32, String> {
             1.0,
             10.0,
         );
-        let ok = passes(
-            &diff,
-            gamma,
-            &tol,
-            gold.summary.sigmas.iter().any(|sigma| sigma.is_nan()),
-        );
+        let ok = passes(&diff, gamma, &tol, &gold.summary.sigmas);
         if !ok {
             failed.push(case.name.clone());
         }
@@ -485,8 +493,8 @@ fn main_patient(args: &Args) -> Result<i32, String> {
 
     println!("patient suite: GPU {histories:.0e} histories per case against cached MCsquare\n");
     println!(
-        "{:24} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}  GPU s",
-        "case", "gamma", "Dmean", "D95", "D2", "LETd", "closure"
+        "{:24} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}  GPU s",
+        "case", "gamma", "Dmean", "D95", "D2", "LETd", "Dtot", "closure"
     );
     let mut failed = Vec::new();
     for case in &suite_cases {
@@ -505,7 +513,7 @@ fn main_patient(args: &Args) -> Result<i32, String> {
     println!(
         "\nTolerances: gamma {:.0}%/{:.0}mm (10% cutoff, density >= {}) >= {:.0}%, \
          Dmean {:.0}%, D95 {:.0}%, D2 {:.0}%, dose-weighted LETd {:.0}% over the \
-         >= {:.0}% region",
+         >= {:.0}% region, Dtot at Dmean tolerance, ledger closure {:.0}%",
         tol.gamma_pct,
         tol.gamma_mm,
         LOW_DENSITY,
@@ -514,7 +522,8 @@ fn main_patient(args: &Args) -> Result<i32, String> {
         100.0 * tol.d95,
         100.0 * tol.d2,
         100.0 * tol.let_tol,
-        100.0 * TARGET_FRAC
+        100.0 * TARGET_FRAC,
+        100.0 * tol.closure
     );
     if !failed.is_empty() {
         println!("FAILED: {}", failed.join(", "));
@@ -618,18 +627,31 @@ fn check_patient(
     } else {
         (incident - ledger[1..].iter().map(|&v| f64::from(v)).sum::<f64>()) / incident
     };
+    // Whole-crop integral: a deposit the body mask drops (air, edges)
+    // still moves the total, and the ledger counts energy in every voxel —
+    // both were printed-or-invisible before either gated.
+    let ref_total: f64 = gold
+        .dose
+        .iter()
+        .map(|&d| f64::from(d) * gold.dose_scale)
+        .sum();
+    let gpu_total: f64 = core_dose.iter().map(|&d| f64::from(d)).sum();
+    let d_total = gpu_total / ref_total - 1.0;
     let ok = gamma >= tol.gamma
         && d_mean.abs() <= tol.dmean
         && d_d95.abs() <= tol.d95
         && d_d2.abs() <= tol.d2
-        && d_let.abs() <= tol.let_tol;
+        && d_let.abs() <= tol.let_tol
+        && d_total.abs() <= tol.dmean
+        && closure.abs() <= tol.closure;
     let line = format!(
-        "{:6.2}% {:+6.2}% {:+6.2}% {:+6.2}% {:+6.2}% {:+.0e} {:5.1}",
+        "{:6.2}% {:+6.2}% {:+6.2}% {:+6.2}% {:+6.2}% {:+6.2}% {:+.0e} {:5.1}",
         100.0 * gamma,
         100.0 * d_mean,
         100.0 * d_d95,
         100.0 * d_d2,
         100.0 * d_let,
+        100.0 * d_total,
         closure,
         seconds
     );

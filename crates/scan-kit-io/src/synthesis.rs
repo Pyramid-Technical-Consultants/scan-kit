@@ -72,17 +72,21 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
             if plan.spots.is_empty() {
                 return Err("No planned spots with positive MU found in DICOM plan".into());
             }
-            let use_dicom = params
-                .get("use_dicom_beam_size")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            let use_dicom = match params.get("use_dicom_beam_size") {
+                None | Some(Value::Null) => true,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err("use_dicom_beam_size must be a boolean".into()),
+            };
             let fallback = if use_dicom {
                 3.61
             } else {
-                params
-                    .get("beam_size_override_mm")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(3.61)
+                match params.get("beam_size_override_mm") {
+                    None | Some(Value::Null) => 3.61,
+                    Some(value) => value
+                        .as_f64()
+                        .filter(|v| v.is_finite())
+                        .ok_or("beam_size_override_mm must be a finite number")?,
+                }
             };
             let spots: Vec<ImportSpot> = plan
                 .spots
@@ -146,11 +150,22 @@ fn document_json(document: &PlanDocument, written: Option<String>) -> Value {
 }
 
 fn validate_csv_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("the plan path must be absolute".into());
+    }
     if !path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
     {
         return Err("the plan path must end in .csv".into());
+    }
+    // Windows refuses DOS device stems even with an extension — writing
+    // NUL.csv would discard into the device, not a file.
+    if !path
+        .file_name()
+        .is_some_and(|name| scan_kit_core::valid_session_id(&name.to_string_lossy()))
+    {
+        return Err("the plan filename is reserved or invalid".into());
     }
     // A bare "map.csv" lands in the process CWD and then stores CWD as the
     // next save's default — the zip-dest check names the same failure. A

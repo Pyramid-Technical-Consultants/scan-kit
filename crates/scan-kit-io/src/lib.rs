@@ -700,7 +700,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_config_apply" => {
             let xml = required_str(input, "xml")?;
-            let form = input.get("form").cloned().unwrap_or_else(|| json!({}));
+            let form = object_arg(input, "form")?;
             config::apply(xml, &form).map_err(InvokeError::Message)
         }
         "scan_kit_config_save" => {
