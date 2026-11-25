@@ -393,11 +393,19 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
     if crate::location::is_remote_location(&text) {
         return crate::location::remote_fingerprint(&text, session_id);
     }
+    // The files hydrate reads (input_map.csv, spot_data.csv) feed the
+    // sealed geom — xor their stamps in so a rewrite of either still
+    // invalidates the row once the summary's mtime is the primary probe.
+    let mut extras: Vec<PathBuf> = Vec::new();
     let target = if storage.is_dir() {
         // Stat the file the reader serves — session_directory resolves the
         // nested root when its marker holds, so the served summary is
         // probed first and a rewrite always invalidates the cache.
         let root = session_directory(storage, session_id);
+        for base in [&root, &storage.to_path_buf()] {
+            extras.push(base.join("input_map.csv"));
+            extras.push(base.join("spot_data.csv"));
+        }
         let served = root.join("termination_summary.txt");
         let outer = storage.join("termination_summary.txt");
         // The inner dir's mtime freezes once the layer/run dirs exist —
@@ -421,11 +429,28 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
     };
     let meta = fs::metadata(&target).ok()?;
     let modified = meta.modified().ok()?;
-    let nanos = modified
+    let mut nanos = modified
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_nanos();
-    Some((i64::try_from(nanos).ok()?, i64::try_from(meta.len()).ok()?))
+    let mut size = meta.len();
+    for probe in extras {
+        // Xor rather than max: a rewrite that does not take the newest mtime
+        // still moves the fingerprint.
+        if probe != target {
+            if let Ok(meta) = fs::metadata(&probe) {
+                if let Some(extra) = meta
+                    .modified()
+                    .ok()
+                    .and_then(|stamp| stamp.duration_since(std::time::UNIX_EPOCH).ok())
+                {
+                    nanos ^= extra.as_nanos();
+                    size ^= meta.len();
+                }
+            }
+        }
+    }
+    Some((i64::try_from(nanos).ok()?, i64::try_from(size).ok()?))
 }
 
 pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Option<Vec<u8>> {
@@ -797,6 +822,7 @@ fn walk_files(
     // ponytail: a tree over the cap drops the rest silently (the archive path
     // errors instead) — a tail-truncated session still parses as complete.
     let mut total = 0u64;
+    let mut failed = false;
     visit_files(
         root,
         dir,
@@ -815,6 +841,7 @@ fn walk_files(
             }
         },
         &mut |_| {},
+        &mut failed,
     );
 }
 
@@ -881,6 +908,7 @@ fn refresh_slice(storage: &Path) -> u128 {
         }
     }
     let mut found = Vec::new();
+    let mut failed = false;
     let mut dirs = vec![(storage.to_path_buf(), meta_stamp(storage))];
     // Stamp every directory the walk visits, not just ancestors of matches —
     // a layer dir created after a poll must itself bump the stamp or a
@@ -898,6 +926,7 @@ fn refresh_slice(storage: &Path) -> u128 {
                 dirs.push((dir.to_path_buf(), meta_stamp(dir)));
             }
         },
+        &mut failed,
     );
     found.sort_by_key(|item| timeslice_key(&item.0));
     let paths = found
@@ -927,6 +956,12 @@ fn refresh_slice(storage: &Path) -> u128 {
         stamp ^= file_stamp.wrapping_mul(count | 1);
     }
     stamp ^= count.rotate_left(17);
+    // A partial listing is a wrong answer, not a stable one — caching it
+    // would freeze the missing subtree out until the recorded paths change,
+    // and for a finished session they never do.
+    if failed {
+        return stamp;
+    }
     let mut cache = slice_watches()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -967,20 +1002,29 @@ fn visit_files(
     want: &dyn Fn(&str) -> bool,
     visit: &mut dyn FnMut(&str, &Path),
     dirs: &mut dyn FnMut(&Path),
+    failed: &mut bool,
 ) {
     if depth > 6 {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
+        *failed = true;
         return;
     };
-    let mut children: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    let mut children = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => children.push(entry),
+            Err(_) => *failed = true,
+        }
+    }
     children.sort_by_key(|entry| entry.file_name());
     for child in children {
         let path = child.path();
         // `is_dir`/`is_file` follow links; the library walk does not. A session
         // symlink must not pull timeslice files in from outside the session.
         let Ok(kind) = child.file_type() else {
+            *failed = true;
             continue;
         };
         if kind.is_symlink() {
@@ -988,7 +1032,7 @@ fn visit_files(
         }
         if kind.is_dir() {
             dirs(&path);
-            visit_files(root, &path, depth + 1, want, visit, dirs);
+            visit_files(root, &path, depth + 1, want, visit, dirs, failed);
         } else if kind.is_file() {
             let name = path
                 .strip_prefix(root)

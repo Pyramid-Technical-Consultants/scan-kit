@@ -188,24 +188,27 @@ fn schema_object(value: Value) -> Arc<Map<String, Value>> {
     }
 }
 
-fn catalog_specs() -> Vec<scan_kit_core::ToolSpec> {
-    let mut specs = scan_kit_core::tools().to_vec();
-    specs.extend_from_slice(scan_kit_io::tools());
-    specs.extend_from_slice(scan_kit_compute::tools());
-    specs.extend_from_slice(scan_kit_dicom::tools());
-    // A name collision across catalogs would shadow the later tool.
-    // Release too — a duplicate name would list a tool the first-match
-    // dispatch can never reach.
-    assert_eq!(
+fn catalog_specs() -> &'static [scan_kit_core::ToolSpec] {
+    static SPECS: std::sync::OnceLock<Vec<scan_kit_core::ToolSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        let mut specs = scan_kit_core::tools().to_vec();
+        specs.extend_from_slice(scan_kit_io::tools());
+        specs.extend_from_slice(scan_kit_compute::tools());
+        specs.extend_from_slice(scan_kit_dicom::tools());
+        // A name collision across catalogs would shadow the later tool.
+        // Panics at startup — inside a spawned handler task a panic hangs
+        // the client, since rmcp never joins the task.
+        assert_eq!(
+            specs
+                .iter()
+                .map(|tool| tool.name)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            specs.len(),
+            "duplicate tool names across catalogs"
+        );
         specs
-            .iter()
-            .map(|tool| tool.name)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        specs.len(),
-        "duplicate tool names across catalogs"
-    );
-    specs
+    })
 }
 
 fn schema_for(name: &str) -> Value {
@@ -250,7 +253,7 @@ fn dispatch(
 
 fn catalog_tools(server: &ScanKit) -> Vec<Tool> {
     catalog_specs()
-        .into_iter()
+        .iter()
         .filter(|spec| server.allows(spec.name))
         .map(|spec| {
             Tool::new_with_raw(
@@ -306,13 +309,22 @@ impl ServerHandler for ScanKit {
                         None,
                     ));
                 }
+                let ct = context.ct;
                 // rmcp spawns one task per request; cap in-flight
                 // dispatches so a flood can't queue unbounded blocking work.
+                // The acquire itself races the ct — a request cancelled while
+                // queued frees immediately instead of parking its (up to
+                // 16 MiB) parsed args behind the 8 live dispatches.
                 static DISPATCH_LIMIT: tokio::sync::Semaphore =
                     tokio::sync::Semaphore::const_new(8);
-                let _permit = DISPATCH_LIMIT.acquire().await.map_err(|_| {
-                    McpError::internal_error("dispatch limiter closed", None)
-                })?;
+                let _permit = tokio::select! {
+                    permit = DISPATCH_LIMIT.acquire() => permit.map_err(|_| {
+                        McpError::internal_error("dispatch limiter closed", None)
+                    })?,
+                    _ = ct.cancelled() => {
+                        return Err(McpError::internal_error("cancelled", None));
+                    }
+                };
                 // The advertised schema is the contract — a typo'd arg
                 // must not silently default (e.g. `db_pth` writes the
                 // default index, `dest` drops a save). db_path is exempt:
@@ -341,7 +353,7 @@ impl ServerHandler for ScanKit {
                                 && schema
                                     .get("properties")
                                     .and_then(Value::as_object)
-                                    .is_some_and(|props| !props.contains_key(*key))
+                                    .is_none_or(|props| !props.contains_key(*key))
                         })
                     }) {
                         return Err(McpError::invalid_params(
@@ -356,8 +368,7 @@ impl ServerHandler for ScanKit {
                 // this request immediately, and the flag makes cooperative
                 // tools (index scans) roll back instead of running to
                 // completion in a detached task.
-                let ct = context.ct;
-                // Cancelled while queued on the semaphore or mid-validation —
+                // Cancelled mid-validation —
                 // do not spawn work the client already abandoned.
                 if ct.is_cancelled() {
                     return Err(McpError::internal_error("cancelled", None));
@@ -433,6 +444,9 @@ impl ServerHandler for ScanKit {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let effects = std::env::args().any(|arg| arg == "--allow-effects");
+    // Init the memoized catalog now — a duplicate tool name must fail at
+    // startup, not inside a spawned handler task rmcp never joins.
+    catalog_specs();
     let server = ScanKit { effects }.serve(stdio()).await?;
     server.waiting().await?;
     // A detached spawn_blocking task (e.g. a cancelled core/dicom read)

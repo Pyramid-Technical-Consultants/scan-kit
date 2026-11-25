@@ -330,7 +330,7 @@ export function PlanRunner() {
       // the toast must point at the file it actually wrote.
       let savedPath: string | null = null;
       let savedMessage: string | null = null;
-      await driveTask(
+      const ran = await driveTask(
         {
           view: "runner_copy",
           path: dest,
@@ -365,6 +365,12 @@ export function PlanRunner() {
           setCopyReport(null);
         }
       });
+      // A superseded start never ran the copy — do not toast a file that
+      // was never written.
+      if (!ran) {
+        notify("Another task is already running");
+        return;
+      }
       if (copyToken.current !== mine) {
         return;
       }

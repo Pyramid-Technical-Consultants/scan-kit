@@ -646,6 +646,9 @@ fn walk_remote(
         return Err("cancelled".into());
     }
     if depth >= NEST_DEPTH {
+        // An unvisited subtree is not an empty one — flag it like the local
+        // walk so delete_missing can't prune below the cap.
+        *walk_failed = true;
         return Ok(());
     }
     let mut dirs = Vec::new();

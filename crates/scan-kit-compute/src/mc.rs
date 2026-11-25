@@ -249,10 +249,13 @@ impl McRun {
         let Some(live) = self.live.as_mut() else {
             return false;
         };
+        // Saturating_mul can land on u32::MAX — not a per_batch multiple,
+        // so its tail batch would never fold in-flight.
         let target = histories
             .div_ceil(live.per_batch)
             .max(1)
-            .saturating_mul(live.per_batch);
+            .min(u32::MAX / live.per_batch)
+            * live.per_batch;
         if target < live.next {
             return false;
         }
@@ -330,7 +333,7 @@ struct Live {
     /// Transport submissions queued but not yet known retired. A step only
     /// waits on the oldest once the window fills, so the GPU keeps a few
     /// chunks deep — the shared queue never drains dry between worker polls.
-    inflight: VecDeque<wgpu::SubmissionIndex>,
+    inflight: VecDeque<(wgpu::SubmissionIndex, u32)>,
     /// A preview copy already submitted. Its map lands whenever the copy
     /// retires — collecting it never blocks a step.
     pending_read: Option<ReadTicket>,
@@ -833,7 +836,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let per_batch = (histories / 10).clamp(1, 100_000);
     // Round up, not down: satisfied must reach the requested target when the
     // run finishes — a floored count leaves paint_progress Pending forever.
-    let histories = histories.div_ceil(per_batch).saturating_mul(per_batch);
+    let histories = histories.div_ceil(per_batch).min(u32::MAX / per_batch) * per_batch;
     let volume_cm3 = f64::from(launch.spacing_cm[0])
         * f64::from(launch.spacing_cm[1])
         * f64::from(launch.spacing_cm[2]);
@@ -912,7 +915,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         shape,
         origin: launch.origin_mm,
         spacing: launch.spacing_cm.map(|cm| cm * 10.0),
-        inflight: VecDeque::new(),
+        inflight: VecDeque::<(wgpu::SubmissionIndex, u32)>::new(),
         pending_read: None,
         finished: false,
         previews: 0,
@@ -929,9 +932,15 @@ impl Live {
         let uncertainty = self.cached_uncertainty;
         // `next` counts submitted histories — the bar used to run up to
         // MAX_INFLIGHT chunks ahead of GPU truth.
-        let done = self
-            .next
-            .saturating_sub(self.inflight.len() as u32 * self.per_batch);
+        // Entries retire chunk-by-chunk, not per_batch-by-per_batch —
+        // subtracting len()*per_batch over-counts by up to the full window.
+        let queued = self
+            .inflight
+            .iter()
+            .map(|&(_, count)| u64::from(count))
+            .sum::<u64>()
+            .min(u64::from(u32::MAX)) as u32;
+        let done = self.next.saturating_sub(queued);
         Report {
             task: 0,
             generation: 0,
@@ -973,6 +982,10 @@ impl Live {
                 return Err(ComputeError::Message("cancelled".into()));
             }
         }
+        // finish()'s staged copy sits behind every queued chunk — its map
+        // landing certifies all transport retired; stale indices would only
+        // pollute report() and extend() bookkeeping.
+        self.inflight.clear();
         self.finish(cancel)
     }
 
@@ -1132,7 +1145,7 @@ impl Live {
             }
             let index = self.queue.submit(Some(encoder.finish()));
             record_submit(&self.gpu, &index);
-            self.inflight.push_back(index);
+            self.inflight.push_back((index, count));
             self.next += count;
         }
     }
@@ -1140,7 +1153,7 @@ impl Live {
     /// Wait on the oldest in-flight submission and pop it. Callers bound the
     /// window before calling, so the queue keeps the rest of the chunks.
     fn wait_fence(&mut self, cancel: &Cancel) -> Result<Duration, ComputeError> {
-        let Some(index) = self.inflight.pop_front() else {
+        let Some((index, _)) = self.inflight.pop_front() else {
             return Ok(Duration::ZERO);
         };
         let mut started = Instant::now();

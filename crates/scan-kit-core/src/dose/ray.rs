@@ -116,7 +116,9 @@ fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan
     let pairs = [nx.checked_mul(ny), nx.checked_mul(nz), ny.checked_mul(nz)];
     let voxels = pairs[0]
         .and_then(|plane| plane.checked_mul(nz))
-        .filter(|voxels| pairs.iter().all(Option::is_some) && *voxels <= values.len());
+        .filter(|voxels| {
+            pairs.iter().all(Option::is_some) && *voxels <= values.len() && *voxels > 0
+        });
     let Some(voxels) = voxels else {
         return VolumeScan {
             bricks: Vec::new(),
@@ -336,7 +338,7 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
     if nx
         .checked_mul(ny)
         .and_then(|plane| plane.checked_mul(nz))
-        .is_none_or(|voxels| voxels > values.len())
+        .is_none_or(|voxels| voxels > values.len() || voxels == 0)
     {
         return VolumeScan {
             bricks: Vec::new(),

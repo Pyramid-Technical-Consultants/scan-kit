@@ -116,3 +116,44 @@ it("the hairline sweeps when the length is unknown and fills a fraction", () => 
   expect(hairlineFraction(1, 4)).toBe(0.25);
   expect(hairlineFraction(9, 4)).toBe(1);
 });
+
+it("a superseded start resolves false without polling", async () => {
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "scan_kit_start") {
+      return { task: 0, generation: 0, superseded: true };
+    }
+    throw new Error(`unexpected invoke ${command}`);
+  });
+  await expect(driveTask({ view: "x" }, () => {}, () => false)).resolves.toBe(false);
+});
+
+it("a stale generation report is skipped and the task still resolves", async () => {
+  let polls = 0;
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command !== "scan_kit_poll") {
+      throw new Error(`unexpected invoke ${command}`);
+    }
+    polls += 1;
+    return frame(report(polls === 1 ? 2 : 1, polls > 1), null);
+  });
+  await expect(driveTask({ view: "x" }, () => {}, () => false)).resolves.toBe(true);
+  expect(polls).toBe(2);
+});
+
+it("a stale finished report rejects rather than settling", async () => {
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command === "scan_kit_poll") {
+      return frame(report(2, true), null);
+    }
+    throw new Error(`unexpected invoke ${command}`);
+  });
+  await expect(driveTask({ view: "x" }, () => {}, () => false)).rejects.toThrow(
+    "cancelled or superseded",
+  );
+});

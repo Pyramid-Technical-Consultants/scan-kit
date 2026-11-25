@@ -769,6 +769,11 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     let (column_sign, row_sign) = axial_signs(elems)?;
     let normal_sign = column_sign * row_sign;
     let bits = int_tag(elems, tag(0x0028, 0x0100)).unwrap_or(16);
+    // A corrupt width silently decodes with a guessed sample size — a 0-bit
+    // file would read every pixel as its LSB rather than error.
+    if !matches!(bits, 8 | 16 | 32) {
+        return Err(format!("unsupported bits allocated {bits}"));
+    }
     // Pixel Representation 1 stores two's-complement samples. Reading those as
     // unsigned turns a negative HU into a huge positive one.
     let signed = int_tag(elems, tag(0x0028, 0x0103)).unwrap_or(0) == 1;
@@ -817,7 +822,7 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .iter()
             .map(|chunk| {
                 let raw = if signed {
-                    sign_extend(i64::from(u32::from_le_bytes(*chunk)), high_bit) as f64
+                    sign_extend(i64::from(u32::from_le_bytes(*chunk)), high_bit.min(31)) as f64
                 } else {
                     let mask = (1u64 << (high_bit.min(31) + 1)) - 1;
                     (u32::from_le_bytes(*chunk) as u64 & mask) as f64
@@ -833,7 +838,7 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .iter()
             .map(|chunk| {
                 let raw = if signed {
-                    sign_extend(i64::from(u16::from_le_bytes(*chunk)), high_bit) as f32
+                    sign_extend(i64::from(u16::from_le_bytes(*chunk)), high_bit.min(15)) as f32
                 } else {
                     let mask = (1u32 << (high_bit.min(15) + 1)) - 1;
                     (u16::from_le_bytes(*chunk) as u32 & mask) as f32
@@ -1721,7 +1726,7 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
             (parse_items(value, false, depth + 1)?, true)
         } else if (implicit || vr == *b"UN")
             && tag(group, element) != tag(0x7FE0, 0x0010)
-            && looks_like_items(value)
+            && looks_like_items(value)?
         {
             (parse_items(value, implicit, depth + 1)?, true)
         } else {
@@ -1753,12 +1758,17 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
 /// start with those same four bytes (e.g. two stored values 0xFFFE/0xE000)
 /// — requiring the first item's length to fit inside the value shrinks the
 /// false-positive window to near zero.
-fn looks_like_items(value: &[u8]) -> bool {
+fn looks_like_items(value: &[u8]) -> Result<bool, String> {
     if value.len() < 8 || value[..4] != [0xFE, 0xFF, 0x00, 0xE0] {
-        return false;
+        return Ok(false);
     }
     let item_len = u32::from_le_bytes([value[4], value[5], value[6], value[7]]) as usize;
-    item_len == u32::MAX as usize || item_len <= value.len() - 8
+    if item_len != u32::MAX as usize && item_len > value.len() - 8 {
+        // The marker is present but the declared item cannot fit — a corrupt
+        // sequence. Demoting it to bytes would silently empty the SQ.
+        return Err("a sequence item extends past its sequence".into());
+    }
+    Ok(true)
 }
 
 fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>>, String> {
@@ -3707,10 +3717,10 @@ mod tests {
         let mut value = vec![0xFE, 0xFF, 0x00, 0xE0];
         value.extend_from_slice(&100u32.to_le_bytes());
         value.extend_from_slice(&[0; 8]);
-        assert!(!looks_like_items(&value));
+        assert!(looks_like_items(&value).is_err());
         let mut value = vec![0xFE, 0xFF, 0x00, 0xE0];
         value.extend_from_slice(&0u32.to_le_bytes());
-        assert!(looks_like_items(&value));
+        assert_eq!(looks_like_items(&value), Ok(true));
     }
 
     #[test]

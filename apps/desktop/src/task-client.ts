@@ -40,7 +40,7 @@ export async function driveTask(
   args: Record<string, unknown>,
   onUpdate: (report: Report, payload: Uint8Array | null) => void,
   stop: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
   const started = await invoke<{ task: number; generation: number; superseded?: boolean }>(
     "scan_kit_start",
     args,
@@ -48,17 +48,17 @@ export async function driveTask(
   // A superseded ticket belongs to another view's task — polling it would
   // settle this view on unrelated work, and it is not ours to cancel.
   if (started.superseded) {
-    return;
+    return false;
   }
   if (stop()) {
     await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
-    return;
+    return true;
   }
   let misses = 0;
   for (;;) {
     if (stop()) {
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
-      return;
+      return true;
     }
     let parsed;
     try {
@@ -85,7 +85,7 @@ export async function driveTask(
     misses = 0;
     if (stop()) {
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
-      return;
+      return true;
     }
     try {
       onUpdate(parsed.report, parsed.payload);
@@ -101,7 +101,7 @@ export async function driveTask(
       if (parsed.report.phase !== "done") {
         throw new Error(`the task ended ${parsed.report.phase}`);
       }
-      return;
+      return true;
     }
     // An unpaced loop spins thousands of IPC round-trips per second for the
     // task's whole duration — each one serializes a report and schedules a

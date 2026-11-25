@@ -855,9 +855,9 @@ export function AnalysisView({
       // finishes even if the view unmounts; liveRef suppresses the toasts.
       () => false,
     )
-      .then(() => {
+      .then((ran) => {
         setExportReport(null);
-        if (liveRef.current) {
+        if (liveRef.current && ran) {
           notifySaved(dest, { title: view === "write_dose" ? "Dose exported" : "Report exported" });
         }
       })
@@ -1114,7 +1114,7 @@ export function AnalysisView({
     if (node == null) {
       return;
     }
-    let dragging = false;
+    let dragId: number | null = null;
     const locate = (event: { clientX: number; clientY: number }) => {
       const rect = node.getBoundingClientRect();
       const sx = rect.width > 0 ? node.width / rect.width : 1;
@@ -1133,18 +1133,20 @@ export function AnalysisView({
       requestDraw();
     };
     const onDown = (event: PointerEvent) => {
-      if (event.button !== 0) {
+      if (event.button !== 0 || dragId !== null) {
         return;
       }
-      dragging = true;
+      dragId = event.pointerId;
       node.setPointerCapture(event.pointerId);
       node.focus({ preventScroll: true });
     };
-    const onUp = () => {
-      dragging = false;
+    const onUp = (event: PointerEvent) => {
+      if (event.pointerId === dragId) {
+        dragId = null;
+      }
     };
     const onMove = (event: PointerEvent) => {
-      if (!dragging) {
+      if (event.pointerId !== dragId) {
         return;
       }
       const point = locate(event);
