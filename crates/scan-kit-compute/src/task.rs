@@ -928,6 +928,9 @@ impl Stage for SessionStage {
             scan_kit_io::SliceTake::Spot { rows }
         };
         scan_kit_io::bind_slice(&self.root, &session.id, take);
+        // The `self.view == "volumetric"` early return above makes `preview`
+        // always false today; the coarse-preview path stays for when that arm
+        // is narrowed back to progressive volumetric loads.
         let preview = self.view == "volumetric" && self.lattice == 0 && !unlimited;
         if preview {
             self.lattice = 1;

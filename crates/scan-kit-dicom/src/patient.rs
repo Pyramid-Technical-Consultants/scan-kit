@@ -207,7 +207,14 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             if !structures_taken {
                 structures_taken = true;
                 structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
-                structures_frame = frame.clone();
+                // RTSTRUCT carries its frame inside the Referenced Frame of
+                // Reference Sequence — top-level (0020,0052) exists only in
+                // non-IOD files like our own synthetic fixture.
+                structures_frame = seq(&elems, tag(0x3006, 0x0010))
+                    .iter()
+                    .map(|item| text_tag(item, tag(0x0020, 0x0052)))
+                    .find(|f| !f.is_empty())
+                    .unwrap_or_else(|| frame.clone());
                 structures =
                     read_structures(&elems).map_err(|err| format!("{}: {err}", file.display()))?;
             }
@@ -234,8 +241,8 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             }
             // A RELATIVE dose would read its scaled counts as absolute Gy.
             let units = text_tag(&elems, tag(0x3004, 0x0002));
-            if !units.is_empty() && !units.eq_ignore_ascii_case("GY") {
-                return Err(format!("dose units {units} are not GY"));
+            if !units.eq_ignore_ascii_case("GY") {
+                return Err(format!("dose units {units:?} are not GY"));
             }
             for slice in image_slices(&elems, scale)? {
                 dose_slices.push((frame.clone(), slice));
@@ -451,10 +458,12 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 if !energy.is_finite() || energy <= 0.0 {
                     return Err("a treatment beam has no nominal energy".into());
                 }
-                if (has_weights && (!mu.is_finite() || mu <= 0.0))
-                    || !x.is_finite()
-                    || !y.is_finite()
-                {
+                // read_plan's ruling: a negative or non-finite weight is
+                // corrupt input, zero is the legal end-of-segment marker.
+                if has_weights && (!mu.is_finite() || mu < 0.0) {
+                    return Err("a treatment beam carries a corrupt meterset weight".into());
+                }
+                if mu <= 0.0 || !x.is_finite() || !y.is_finite() {
                     continue;
                 }
                 spots.push(IonPlanSpot {
@@ -715,6 +724,9 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     us(&mut dose, 0x0028, 0x0010, 4)?;
     us(&mut dose, 0x0028, 0x0011, 4)?;
     ds(&mut dose, 0x0028, 0x0030, &[1.0, 1.0])?;
+    cs(&mut dose, 0x3004, 0x0002, "GY")?;
+    cs(&mut dose, 0x3004, 0x0004, "PHYSICAL")?;
+    cs(&mut dose, 0x3004, 0x000A, "FRACTION")?;
     ds(&mut dose, 0x3004, 0x000C, &[0.0, 1.0])?;
     ds(&mut dose, 0x3004, 0x000E, &[0.01])?;
     ow(&mut dose, 0x7FE0, 0x0010, &[100u16; 32])?;
@@ -907,7 +919,8 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // equal to the slice origin z with identity orientation). Reading
     // absolute values as relative shifts every frame by the origin z.
     let absolute_z = !offsets.is_empty() && offsets[0] != 0.0;
-    if absolute_z && (offsets[0] != origin[2] || column_sign < 0.0 || row_sign < 0.0) {
+    if absolute_z && ((offsets[0] - origin[2]).abs() > 0.01 || column_sign < 0.0 || row_sign < 0.0)
+    {
         return Err("frame offsets are neither relative nor absolute z".into());
     }
     let mut slices = Vec::new();
@@ -2370,6 +2383,7 @@ pub fn write_rtdose(
     // Patient names and ids arrive as UTF-8 from the source CT — declare the
     // repertoire or a non-ASCII name writes undecodable bytes.
     cs(&mut bytes, 0x0008, 0x0005, "ISO_IR 192")?;
+    cs(&mut bytes, 0x0008, 0x0008, r"DERIVED\SECONDARY")?;
     push_elem(&mut bytes, 0x0008, 0x0012, b"DA", &even(&date))?;
     push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time))?;
     ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS)?;

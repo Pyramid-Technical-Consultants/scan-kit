@@ -263,13 +263,21 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
   return {
     title: text(parsed.title),
     controls: Array.isArray(parsed.controls) ? parsed.controls.map(viewControl) : [],
-    table:
-      parsed.table != null &&
-      typeof parsed.table === "object" &&
-      Array.isArray((parsed.table as { columns?: unknown }).columns) &&
-      Array.isArray((parsed.table as { rows?: unknown }).rows)
-        ? parsed.table
-        : null,
+    table: (() => {
+      const shape = parsed.table as { columns?: unknown; rows?: unknown } | null;
+      if (shape == null || !Array.isArray(shape.columns) || !Array.isArray(shape.rows)) {
+        return null;
+      }
+      // Glide cells are typed strings — coerce anything else like text()
+      // does for the other header fields.
+      const cell = (v: unknown) => (typeof v === "string" ? v : String(v ?? ""));
+      return {
+        columns: shape.columns.map(cell),
+        rows: shape.rows.map((row) =>
+          Array.isArray(row) ? row.map(cell) : [],
+        ),
+      };
+    })(),
     panels: Array.isArray(parsed.panels) ? parsed.panels : [],
     quality: quality.length > 0 ? quality : "final",
     lineToken: text(parsed.line_token),

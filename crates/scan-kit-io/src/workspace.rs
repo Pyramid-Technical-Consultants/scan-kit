@@ -538,12 +538,16 @@ fn span(series: &[Series]) -> (f32, f32, f32, f32) {
             }
             Series::Bars { edges, counts, .. } => {
                 for edge in edges {
-                    xmin = xmin.min(*edge);
-                    xmax = xmax.max(*edge);
+                    if edge.is_finite() {
+                        xmin = xmin.min(*edge);
+                        xmax = xmax.max(*edge);
+                    }
                 }
                 for count in counts {
-                    ymin = ymin.min(0.0);
-                    ymax = ymax.max(*count);
+                    if count.is_finite() {
+                        ymin = ymin.min(0.0);
+                        ymax = ymax.max(*count);
+                    }
                 }
             }
             _ => {}
@@ -657,6 +661,9 @@ pub(crate) fn overlay_sessions(
     // Under compare:gamma|difference `volumes` is a residual field — DVH
     // needs the measured cubes.
     measured: &[Volume],
+    // The gamma-to-lateral fallback retitles the panel; the dose label is
+    // not derivable from the cubes.
+    dose_label: &str,
 ) {
     if volumes.len() < 2 {
         return;
@@ -671,11 +678,18 @@ pub(crate) fn overlay_sessions(
     } else if title.starts_with("dvh") {
         panel.series = measured.iter().map(dvh_line).collect();
         fit_panel(panel);
-    } else if title.starts_with("gamma") && gamma.len() <= 1 {
-        // No gamma metric (analytic run, no TPS dose, beam filter) - the
-        // second default cell would otherwise be a permanently blank panel.
+    } else if title.starts_with("gamma")
+        && gamma
+            .iter()
+            .all(|v| !v.values.iter().any(|x| x.is_finite()))
+    {
+        // No scored gamma (analytic run, no TPS dose, beam filter) - the
+        // second default cell would otherwise draw flat zero "curves" that
+        // read as a passing gamma.
         panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
         panel.title = "Lateral".into();
+        panel.y_label = dose_label.into();
+        panel.x_label = "Across the beam from the crosshair (mm)".into();
         fit_panel(panel);
     } else if title.starts_with("gamma") {
         panel.series = gamma_lines(gamma);
@@ -777,7 +791,7 @@ mod tests {
             equal: false,
         };
         let volumes = [low, high];
-        overlay_sessions(&mut panel, &volumes, [0.5, 0.5, 0.5], &[], &volumes);
+        overlay_sessions(&mut panel, &volumes, [0.5, 0.5, 0.5], &[], &volumes, "Dose");
         assert_eq!(panel.series.len(), 2);
         assert!(panel.ymax >= 8.0, "{}", panel.ymax);
     }

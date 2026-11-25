@@ -88,6 +88,10 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         let mut ymax = f32::MIN;
         for (table_index, table) in tables.iter().enumerate() {
             let Some(samples) = table.get(series.key) else {
+                // Series are colored positionally per session — an empty
+                // stroke keeps this session's palette slot so a missing
+                // column can't paint the next session this one's color.
+                drawn.push(stroke(Vec::new(), Vec::new(), false));
                 continue;
             };
             let keep = filter_rows.then(|| masks[table_index].as_slice());
@@ -120,8 +124,11 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
             let columns: Vec<Vec<f32>> = tables
                 .iter()
                 .zip(&fft_masks)
-                .filter_map(|(table, keep)| {
-                    table.get(series.key).map(|samples| gated(samples, keep))
+                .map(|(table, keep)| {
+                    table
+                        .get(series.key)
+                        .map(|samples| gated(samples, keep))
+                        .unwrap_or_default()
                 })
                 .collect();
             panels.push(spectrum_panel(&columns));
@@ -369,7 +376,7 @@ fn trace_span(
             });
         xs.push(t);
         ys.push(*value);
-        if !value.is_finite() || !inside(t, window) {
+        if !value.is_finite() || !t.is_finite() || !inside(t, window) {
             continue;
         }
         x_lo = x_lo.min(t);
@@ -561,6 +568,9 @@ fn spectrum_panel(columns: &[Vec<f32>]) -> Panel {
             .filter(|value| value.is_finite())
             .collect();
         if kept.len() < 16 {
+            // Keep the palette slot — a short or missing column draws
+            // nothing but must not shift a later session's color.
+            series.push(stroke(Vec::new(), Vec::new(), false));
             continue;
         }
         let (freqs, psd) = welch_psd(&kept, 1.0 / SAMPLE_S, 4096, 0.5);

@@ -726,6 +726,7 @@ pub fn volumetric(
                         at,
                         &gamma_volumes,
                         &measured,
+                        y_name(quantity),
                     );
                 }
                 mark.session_focus = session_at as u32;

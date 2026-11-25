@@ -117,6 +117,9 @@ pub fn percentile_linear(values: &mut [f32], q: f64) -> f32 {
     let hi = pos.ceil().min((values.len() - 1) as f64) as usize;
     let frac = (pos - lo as f64) as f32;
     let (low, high) = select_ranks(values, lo, hi);
+    if lo == hi {
+        return low;
+    }
     low * (1.0 - frac) + high * frac
 }
 
@@ -154,6 +157,9 @@ pub fn quantiles_at(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
             let lo = (pos.floor() as usize).min(last);
             let hi = (pos.ceil() as usize).min(last);
             let frac = (pos - lo as f64) as f32;
+            if lo == hi {
+                return values[lo];
+            }
             values[lo] * (1.0 - frac) + values[hi] * frac
         })
         .collect()
