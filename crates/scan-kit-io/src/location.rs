@@ -1588,6 +1588,8 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             // sibling archives like other remotes do.
             if let Some(place) = recorded(root, session_id) {
                 if let Ok(child) = require_remote(&place) {
+                    // An index written before smb opened locally may still
+                    // carry the remote spec — map it onto the UNC tree.
                     let child_path = child.path.trim_end_matches('/');
                     let root_path = remote.path.trim_end_matches('/');
                     let rel = child_path
@@ -1601,6 +1603,19 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                         recorded_parent = local.parent().map(|dir| dir.to_path_buf());
                         if local.exists() {
                             found.push(local.to_string_lossy().into_owned());
+                        }
+                    }
+                } else {
+                    // Current indexes store the local UNC path — verify it
+                    // under the opened share like the local branch above.
+                    let unc_str = unc.to_string_lossy();
+                    let proven = Path::new(&place).is_dir()
+                        || discover::archive_identity(Path::new(&place))
+                            .is_some_and(|(id, _)| id == session_id);
+                    if local_under_root(&unc_str, &place) && proven {
+                        recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
+                        if Path::new(&place).exists() {
+                            found.push(place);
                         }
                     }
                 }

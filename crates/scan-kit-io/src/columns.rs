@@ -463,12 +463,37 @@ fn header_index(headers: &[String], raw: &str) -> Option<usize> {
 /// whose first field starts with `#`.
 pub(crate) fn strip_csv_banner(mut bytes: &[u8]) -> &[u8] {
     while bytes.first() == Some(&b'#') {
-        bytes = match bytes.iter().position(|&b| b == b'\n') {
-            Some(end) => &bytes[end + 1..],
-            None => &bytes[bytes.len()..],
+        let end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        if hash_header_line(&bytes[..end]) {
+            break;
+        }
+        bytes = match end == bytes.len() {
+            true => &bytes[bytes.len()..],
+            false => &bytes[end + 1..],
         };
     }
     bytes
+}
+
+/// A `#`-leading line can be the schema itself (`#NO,ENERGY(MeV),...`): it is
+/// comma-separated, has no prose spacing, and carries no numeric fields. A
+/// `#`-first data row or a real banner comment does not match.
+pub(crate) fn hash_header_line(line: &[u8]) -> bool {
+    line.len() > 1
+        && line.contains(&b',')
+        && !line.contains(&b' ')
+        && line[1..]
+            .split(|&b| b == b',')
+            .filter(|field| !field.is_empty())
+            .all(|field| {
+                std::str::from_utf8(field)
+                    .ok()
+                    .and_then(|f| f.parse::<f64>().ok())
+                    .is_none()
+            })
 }
 
 fn header_of(bytes: &[u8]) -> Result<Vec<String>, String> {

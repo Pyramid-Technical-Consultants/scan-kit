@@ -548,9 +548,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let session_id = required_str(input, "session_id")?;
             let note = required_str(input, "note")?;
             let db = database_path(input)?;
+            let root = library_root(path).map_err(InvokeError::Message)?;
+            // Prefetch the legacy JSON before STORE_LOCK — a stalled share
+            // must not hold the process mutex.
+            let legacy = store::legacy_files(Path::new(&root));
             with_store(&db, |conn| {
-                let root = library_root(path)?;
-                set_note(conn, &root, session_id, note)
+                set_note(conn, &root, session_id, note, Some(&legacy))
             })
             .map_err(InvokeError::Message)?;
             Ok(json!({ "session_id": session_id, "note": note.trim() }))
@@ -577,8 +580,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             // note/selection/hidden survive the failed delete. Nothing
             // found at all is not a successful delete either.
             if errors.is_empty() && !paths.is_empty() {
+                let legacy = store::legacy_files(Path::new(&root));
                 with_store(&db, |conn| {
-                    let lib_id = store::prepare_library(conn, &root)?;
+                    let lib_id = store::prepare_library(conn, &root, Some(&legacy))?;
                     store::delete_session(conn, lib_id, session_id)
                 })
                 .map_err(InvokeError::Message)?;
@@ -590,9 +594,10 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let path = required_str(input, "path")?;
             let session_ids = required_strings(input, "session_ids")?;
             let db = database_path(input)?;
+            let root = library_root(path).map_err(InvokeError::Message)?;
+            let legacy = store::legacy_files(Path::new(&root));
             with_store(&db, |conn| {
-                let root = library_root(path)?;
-                let stored = set_selected(conn, &root, &session_ids)?;
+                let stored = set_selected(conn, &root, &session_ids, Some(&legacy))?;
                 Ok(json!({ "session_ids": stored }))
             })
             .map_err(InvokeError::Message)
@@ -1061,8 +1066,11 @@ pub fn index_library(
     // stalled share can't sit inside the write lock. Fill-blanks only and
     // replayed on every scan, so a corrupt legacy file must not fail the
     // committed scan or skip the publish above: demote to retry-next-scan.
+    // Prefetch the legacy JSON before the locked apply — same stalled-
+    // share rule as the invoke arms.
+    let legacy = store::legacy_files(Path::new(&root));
     store::locked(|| {
-        let _ = import_legacy(conn, lib_id, Path::new(&root));
+        let _ = import_legacy(conn, lib_id, Path::new(&root), Some(&legacy));
         let _ = backfill_blank_notes(conn, lib_id, Path::new(&root));
         Ok(())
     })?;
@@ -1239,7 +1247,20 @@ fn hydrate(entry: &Discovered, stamped: Option<(i64, i64)>) -> (Option<SessionMe
     // stale meta under the old fingerprint.
     // A NULL-stamped row sealing on another failed stat (None == None)
     // certifies no bytes at all — only a real fingerprint may seal.
-    let readable = stamped.is_some() && fresh == stamped;
+    let readable = stamped.is_some()
+        && fresh == stamped
+        // Stat-ok is not read-ok (locked zip, remote auth flap): a session
+        // whose reads all failed must stay retryable instead of sealing
+        // NULL meta under a reachable fingerprint. A meta hit already
+        // proves reads work; the marker probe covers the absent-summary
+        // case.
+        && (meta.is_some()
+            || discover::read_session_file(
+                &entry.storage_path,
+                &entry.session_id,
+                "input_map.csv",
+            )
+            .is_some());
     (meta, readable)
 }
 
@@ -2082,7 +2103,7 @@ Layer delivery: 27/27
         let db = root.join("test.sqlite");
         let root_str = root.to_string_lossy().into_owned();
         store::with_store(&db, |conn| {
-            store::set_note(conn, &root_str, "sess", "keep me")
+            store::set_note(conn, &root_str, "sess", "keep me", None)
         })
         .unwrap();
         let result = invoke(

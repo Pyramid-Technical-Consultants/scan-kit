@@ -738,9 +738,9 @@ pub(super) fn dose_gates(categories: &[f32], glyph: &str, xmin: f32, xmax: f32) 
                 index as f32
             };
             let gate = ((GATE_ABS_MU + frac * f64::from(*mu)) / f64::from(*mu) * 100.0) as f32;
-            // mu = 0 (or NaN) makes the gate infinite/NaN — a guide at ±inf
-            // would poison the panel's y-range, so skip it.
-            if !gate.is_finite() {
+            // mu <= 0 (or NaN) makes the gate negative/infinite — a crossed
+            // or ±inf guide pair would poison the panel's y-range, so skip it.
+            if *mu <= 0.0 || !gate.is_finite() {
                 continue;
             }
             xs.push(x);
@@ -837,7 +837,11 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
     if values.is_empty() {
         return Vec::new();
     }
-    if values.len() == 1 || values.iter().all(|value| same(*value, values[0])) {
+    let lo = values.iter().copied().fold(f32::MAX, f32::min);
+    let hi = values.iter().copied().fold(f32::MIN, f32::max);
+    // "Flat" is relative to the data's scale — `same()`'s absolute 1e-4
+    // floor flattens every column under coulomb scale into a bare tick.
+    if values.len() == 1 || (hi - lo).abs() <= 1e-12 * hi.abs().max(lo.abs()).max(1e-30) {
         return vec![(values[0], half * 0.7)];
     }
     let n = values.len() as f64;
@@ -851,11 +855,9 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
         .sum::<f64>()
         / (n - 1.0);
     let bw = n.powf(-0.2) * var.sqrt();
-    if bw < 1e-9 {
+    if bw.is_nan() || bw <= 0.0 {
         return vec![(values[0], half * 0.7)];
     }
-    let lo = values.iter().copied().fold(f32::MAX, f32::min);
-    let hi = values.iter().copied().fold(f32::MIN, f32::max);
     const STEPS: usize = 48;
     // ponytail: a long bin is a 256-bin histogram, gaussian cut at 4 bandwidths.
     // Under 512 samples the kernel still visits every point, which is what the

@@ -216,7 +216,9 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     if finite.iter().all(|value| *value == finite[0]) {
         let lo = finite[0];
         let pad = (lo.abs() * f32::EPSILON).max(0.5);
-        return vec![lo - pad, lo + pad];
+        // |lo| within a pad of f32::MAX overflows to +-inf — clamp like
+        // padded_span does.
+        return vec![(lo - pad).max(-f32::MAX), (lo + pad).min(f32::MAX)];
     }
     let qs: Vec<f32> = (0..=n_bins)
         .map(|step| step as f32 / n_bins as f32)
@@ -228,7 +230,7 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     if edges.len() < 2 {
         let lo = edges.first().copied().unwrap_or(0.0);
         let pad = (lo.abs() * f32::EPSILON).max(0.5);
-        return vec![lo - pad, lo + pad];
+        return vec![(lo - pad).max(-f32::MAX), (lo + pad).min(f32::MAX)];
     }
     edges
 }
@@ -336,8 +338,8 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
         // absolute 0.5 is unrepresentable above 2^23 and leaves span 0,
         // piling every count into bin 0. Same fix uniform_edges carries.
         let pad = (hi.abs().max(lo.abs()) * f32::EPSILON).max(0.5);
-        lo -= pad;
-        hi += pad;
+        lo = (lo - pad).max(-f32::MAX);
+        hi = (hi + pad).min(f32::MAX);
     }
     // Span math in f64: a column can legitimately span more than f32::MAX,
     // which would turn every edge NaN and pile all counts into bin 0.

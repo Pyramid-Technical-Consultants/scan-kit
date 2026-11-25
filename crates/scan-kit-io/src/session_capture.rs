@@ -853,7 +853,8 @@ fn join_timeslices(
             .find_map(|row| {
                 layer_i.and_then(|i| row.get(i)).and_then(|cell| {
                     let raw = clean(cell);
-                    (!raw.is_empty()).then(|| raw.to_owned())
+                    (!raw.is_empty() && !raw.eq_ignore_ascii_case("layer_id"))
+                        .then(|| raw.to_owned())
                 })
             })
             .unwrap_or_default();
@@ -863,7 +864,8 @@ fn join_timeslices(
             .find_map(|row| {
                 spot_i.and_then(|i| row.get(i)).and_then(|cell| {
                     let raw = clean(cell);
-                    (!raw.is_empty()).then(|| raw.to_owned())
+                    (!raw.is_empty() && !raw.eq_ignore_ascii_case("spot_no"))
+                        .then(|| raw.to_owned())
                 })
             })
             .unwrap_or_default();
@@ -1050,7 +1052,7 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)], warnings: &mut Vec<String>)
             .iter()
             .find_map(|row| {
                 let raw = clean(row.get(layer_i).map(String::as_str).unwrap_or_default());
-                if raw.is_empty() {
+                if raw.is_empty() || raw.eq_ignore_ascii_case("layer_id") {
                     None
                 } else {
                     Some(raw.to_owned())
@@ -1065,12 +1067,11 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)], warnings: &mut Vec<String>)
                 eff_layer = raw_layer.to_owned();
             }
             let layer = join_key(&eff_layer);
-            let spot = join_key(clean(
-                row.get(spot_i).map(String::as_str).unwrap_or_default(),
-            ));
-            if spot.is_empty() {
+            let raw_spot = clean(row.get(spot_i).map(String::as_str).unwrap_or_default());
+            if raw_spot.is_empty() || raw_spot.eq_ignore_ascii_case("spot_no") {
                 continue;
             }
+            let spot = join_key(raw_spot);
             let base = (layer.clone(), spot.clone());
             let n = occurrences.entry(base).or_insert(0);
             let key = (layer, spot, *n);
@@ -1207,10 +1208,14 @@ fn spot_columns(device: &CaptureDevice, sheet: &Sheet) -> (Vec<String>, Vec<Stri
             if meta.contains(&base_name(name)) {
                 continue;
             }
-            pairs.push((
-                format!("{}_raw", dest_name(name)),
-                base_name(name).to_owned(),
-            ));
+            let base = dest_name(name);
+            let mut dest = format!("{base}_raw");
+            let mut suffix = 2;
+            while pairs.iter().any(|(taken, _)| *taken == dest) {
+                dest = format!("{base}_raw_{suffix}");
+                suffix += 1;
+            }
+            pairs.push((dest, base_name(name).to_owned()));
         }
     }
     (
@@ -1462,8 +1467,8 @@ fn write_termination(
     let elapsed_s = status
         .get(TIME_ELAPSED)
         .and_then(io_number)
-        .or(span_s)
-        .filter(|seconds| *seconds > 0.0);
+        .filter(|seconds| *seconds > 0.0)
+        .or(span_s);
 
     // Beam-on: the ms of the timeslice clock where commanded beam current
     // (`c_beamI`) is nonzero.

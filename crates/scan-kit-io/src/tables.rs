@@ -5274,12 +5274,10 @@ fn header_span(bytes: &[u8]) -> (usize, usize) {
             .map(|index| at + index + 1)
             .unwrap_or(bytes.len());
         let line = &bytes[at..end.min(bytes.len())];
-        if line
-            .iter()
-            .find(|byte| !byte.is_ascii_whitespace())
-            .is_some_and(|byte| *byte != b'#')
-        {
-            return (at, end);
+        if let Some(first) = line.iter().find(|byte| !byte.is_ascii_whitespace()) {
+            if *first != b'#' || crate::columns::hash_header_line(line) {
+                return (at, end);
+            }
         }
         if end >= bytes.len() {
             return (end, end);

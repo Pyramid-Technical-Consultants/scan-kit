@@ -43,7 +43,13 @@ pub(crate) fn count_choice(raw: &str) -> Option<usize> {
         // silently snapping to 32.
         let parsed = raw
             .parse::<usize>()
-            .or_else(|_| raw.parse::<f64>().map(|value| value.round() as usize))
+            .ok()
+            .or_else(|| {
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(|value| value.round() as usize)
+            })
             .unwrap_or(32);
         Some(
             BIN_STEPS
@@ -176,7 +182,7 @@ fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
         // A fixed 0.5 pad is unrepresentable above |lo| ~= 2^23 (ulp > 1) —
         // scale the pad to the magnitude so the edges stay distinct.
         let pad = (lo.abs() * f32::EPSILON).max(0.5);
-        (lo - pad, lo + pad)
+        ((lo - pad).max(-f32::MAX), (lo + pad).min(f32::MAX))
     } else {
         (lo, hi)
     };
