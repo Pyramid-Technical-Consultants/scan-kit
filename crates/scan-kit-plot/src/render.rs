@@ -2648,7 +2648,10 @@ impl Plot {
         for index in 0..count {
             let panel = &self.panels[index];
             let previous_panel = &previous.panels[index];
-            if panel.x_label != previous_panel.x_label || panel.y_label != previous_panel.y_label {
+            if panel.x_label != previous_panel.x_label
+                || panel.y_label != previous_panel.y_label
+                || dose_plane(&panel.title) != dose_plane(&previous_panel.title)
+            {
                 continue;
             }
             // A fit the user has not touched tracks the new data, so a session
@@ -2829,7 +2832,7 @@ impl Plot {
         // column keep their own axes.
         self.panels
             .get(index)
-            .is_some_and(|panel| panel.x_label.is_empty())
+            .is_some_and(|panel| panel.x_label.is_empty() && dose_plane(&panel.title).is_none())
             && index.saturating_add(self.side as usize) < self.panels.len()
     }
 
@@ -8427,7 +8430,13 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
     let rows = glyph.size[1] as u32;
     for row in 0..rows {
         for col in 0..columns {
-            let coverage = font.pixels[((v0 + row) * font.size + u0 + col) as usize] as f32 / 255.0;
+            let Some(&coverage) = font
+                .pixels
+                .get((v0 + row) as usize * font.size as usize + (u0 + col) as usize)
+            else {
+                continue;
+            };
+            let coverage = coverage as f32 / 255.0;
             if coverage < 0.004 {
                 continue;
             }

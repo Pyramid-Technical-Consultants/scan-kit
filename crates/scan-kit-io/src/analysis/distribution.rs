@@ -966,10 +966,11 @@ mod tests {
     #[test]
     fn extreme_finite_columns_produce_finite_limits() {
         let samples = vec![-f32::MAX, f32::MAX];
-        let (lo, hi) = distribution_limits("spots", &samples);
-        assert!(lo.is_finite() && hi.is_finite());
-        let (lo, hi) = padded_span(&samples);
-        assert!(lo.is_finite() && hi.is_finite());
+        assert_eq!(
+            distribution_limits("spots", &samples),
+            (-f32::MAX, f32::MAX)
+        );
+        assert_eq!(padded_span(&samples), (-f32::MAX, f32::MAX));
     }
 
     #[test]

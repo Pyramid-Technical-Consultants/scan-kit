@@ -1073,8 +1073,11 @@ mod tests {
     #[test]
     fn a_non_finite_edge_timestamp_falls_back_to_the_row_ends() {
         // A NaN inside the excursion must not erase a measurable window.
-        let (lo, hi) = hv_step_window(&[f32::NAN, 1.0, 2.0], &[0.0, 10.0, 0.0]).unwrap();
-        assert!(lo.is_finite() && hi.is_finite());
+        let window = hv_step_window(&[f32::NAN, 1.0, 2.0], &[0.0, 10.0, 0.0]).unwrap();
+        assert_eq!(window, (-39.0, 41.0));
+        // The NaN sits on the excursion edge itself — both fallbacks fire.
+        let window = hv_step_window(&[0.0, f32::NAN, 20.0], &[0.0, 10.0, 0.0]).unwrap();
+        assert_eq!(window, (-40.0, 60.0));
     }
 
     #[test]
@@ -1513,10 +1516,10 @@ mod tests {
     #[test]
     fn extreme_finite_samples_stay_finite() {
         let mut values = vec![-f32::MAX, f32::MAX];
-        let (lo, hi) = robust_limits_finite(&mut values).unwrap();
-        assert!(lo.is_finite() && hi.is_finite());
-        let (wlo, whi) = time_window(-f32::MAX, f32::MAX);
-        assert!(wlo.is_finite() && whi.is_finite());
+        let window = robust_limits_finite(&mut values).unwrap();
+        assert_eq!(window, (-f32::MAX, f32::MAX));
+        let window = time_window(-f32::MAX, f32::MAX);
+        assert_eq!(window, (0.0, f32::MAX));
     }
 
     #[test]

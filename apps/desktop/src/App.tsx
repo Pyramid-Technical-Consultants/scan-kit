@@ -104,10 +104,12 @@ function layerOpen(target: EventTarget | null): boolean {
   ) {
     return true;
   }
+  // No data-open qualifier: Base UI swaps it for data-closed during the
+  // exit animation, when the layer is still mounted and Escape/Ctrl+Q
+  // must still be swallowed.
   return (
-    document.querySelector(
-      "[role='dialog'][data-open], [role='menu'][data-open], [role='listbox'][data-open]",
-    ) != null
+    document.querySelector("[role='dialog'], [role='menu'], [role='listbox']") !=
+    null
   );
 }
 
@@ -956,12 +958,11 @@ export default function App() {
         if (selectionWrites.current === 0) {
           selectionPending.current = null;
           // A pull that landed mid-write may have shrunk the catalog -
-          // drop optimistic ids that no longer list, unless a newer
-          // commit already superseded this one.
-          if (selectionSeq.current === write) {
-            const listed = new Set(rowsRef.current.map((row) => row.session_id));
-            setSelectionOrder((ids) => ids.filter((id) => listed.has(id)));
-          }
+          // drop optimistic ids that no longer list. Idempotent, so the
+          // last-settling write always runs it even when an older commit
+          // (not the newest token) is the one that drains the counter.
+          const listed = new Set(rowsRef.current.map((row) => row.session_id));
+          setSelectionOrder((ids) => ids.filter((id) => listed.has(id)));
         }
       }
     })().catch((error: unknown) => {
@@ -1051,18 +1052,21 @@ export default function App() {
   const noteChain = useRef<Promise<unknown>>(Promise.resolve());
   const commitNote = useCallback(
     (edit: NoteEdit): Promise<boolean> => {
+      // Record the edit synchronously — an undo pressed while this write
+      // is still in flight must revert this edit, not the previous one.
+      setUndo((stack) => [...stack, edit]);
+      setRedo([]);
       const run = noteChain.current.then(() =>
         writeNote(edit.sessionId, edit.library, edit.after),
       );
       noteChain.current = run.catch(() => undefined);
       return run
         .then(() => {
-          setUndo((stack) => [...stack, edit]);
-          setRedo([]);
           dismissNotice();
           return true;
         })
         .catch((error: unknown) => {
+          setUndo((stack) => withoutEdit(stack, edit));
           notifyError(error);
           return false;
         });

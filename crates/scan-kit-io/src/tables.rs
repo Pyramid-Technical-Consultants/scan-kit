@@ -7069,8 +7069,8 @@ b,2
 
     #[test]
     fn a_span_of_extreme_finite_samples_stays_finite() {
-        let (lo, hi) = span(&[-f32::MAX, f32::MAX]);
-        assert!(lo.is_finite() && hi.is_finite());
+        // The pad overflows to inf; the clamp, not luck, keeps the span finite.
+        assert_eq!(span(&[-f32::MAX, f32::MAX]), (-f32::MAX, f32::MAX));
     }
 
     #[test]

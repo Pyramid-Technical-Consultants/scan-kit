@@ -766,7 +766,19 @@ pub fn volumetric(
                         && plan.origin == got.origin
                         && plan.spacing == got.spacing
                     {
-                        let planes = scan_kit_core::projected_gamma(got, plan, dd, dta, cutoff);
+                        // Commanded positions are the plan against itself —
+                        // planes keep their shape but score nothing, like the
+                        // 3D gamma's all-NaN "not evaluated".
+                        let planes = if clouds.get(session_at).is_some_and(|c| c.commanded) {
+                            let [nx, ny, nz] = got.shape;
+                            [
+                                (vec![f32::NAN; nx * ny], f32::NAN),
+                                (vec![f32::NAN; nx * nz], f32::NAN),
+                                (vec![f32::NAN; ny * nz], f32::NAN),
+                            ]
+                        } else {
+                            scan_kit_core::projected_gamma(got, plan, dd, dta, cutoff)
+                        };
                         integral_rates = Some(planes.each_ref().map(|(_, rate)| *rate));
                         mark.integrals = planes.into_iter().map(|(gamma, _)| gamma).collect();
                     }
@@ -1419,7 +1431,9 @@ fn analytic_cached(
     }
     let volume = deposit();
     let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
-    if held(&mut kept).is_none() {
+    // A cube bigger than the whole budget is searched again rather than
+    // pinning the three-cube floor at GB scale.
+    if held(&mut kept).is_none() && volume.values.len() <= BUDGET {
         kept.push((key, volume.clone()));
         let total = |kept: &Kept| {
             kept.iter()
@@ -1612,7 +1626,10 @@ fn load_cloud(
 }
 
 fn usable_sigma(value: f32) -> bool {
-    value.is_finite() && value > 0.2
+    // Upper bound: the beam model cannot carry a metre-wide pencil, so a
+    // corrupt-but-positive reading would only blow the lattice out to the
+    // 512³ cap (~500 MB per fill).
+    value.is_finite() && (0.2..=100.0).contains(&value)
 }
 
 fn usable_dose(value: f32) -> bool {
@@ -1656,7 +1673,7 @@ fn pencils_from(
         if !e.is_finite()
             || !px.is_finite()
             || !py.is_finite()
-            || e <= 1.0
+            || !(1.0..=300.0).contains(&e)
             || px.abs() >= ABS_INVALID_MM
             || py.abs() >= ABS_INVALID_MM
         {
@@ -2049,8 +2066,9 @@ fn gamma_with(
         cutoff_pct,
     );
     // A blank Monte Carlo capture scores nothing and is instant; keeping it
-    // would push out a real pair.
-    if result.2 > 0 {
+    // would push out a real pair. A cube over the per-entry bound (~128 MB
+    // for the two kept pairs) is searched again rather than pinned.
+    if result.2 > 0 && measured.values.len() <= (64 << 20) / 6 {
         let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
         if kept.len() >= KEEP {
             kept.remove(0);
@@ -2210,11 +2228,13 @@ mod tests {
         table.insert("ic2_x".to_owned(), vec![1.0, 2.0]);
         table.insert("ic1_y".to_owned(), vec![f32::NAN, f32::NAN]);
         table.insert("ic2_y".to_owned(), vec![0.5, 0.5]);
-        table.insert("ic1_x_plan".to_owned(), vec![9.0, 9.0]);
-        let (x, _y) = iso_positions(&table);
+        table.insert("plan_x".to_owned(), vec![9.0, 9.0]);
+        table.insert("plan_y".to_owned(), vec![7.0, 7.0]);
+        let (x, y) = iso_positions(&table);
         // Combined mode used to propagate the NaN into every position and
         // empty the cloud — the plan fallback must keep the session.
-        assert!(x.iter().all(|v| v.is_finite()));
+        assert_eq!(x, vec![9.0, 9.0]);
+        assert_eq!(y, vec![7.0, 7.0]);
     }
 
     #[test]

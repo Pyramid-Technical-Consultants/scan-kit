@@ -979,8 +979,15 @@ mod tests {
 
     #[test]
     fn pchip_keeps_opposite_extreme_means_finite() {
+        // Midpoint means of +-3e38 fit f32; a plain mean overflows to inf.
         let (_xs, ys) = pchip(&[0.0, 1.0, 2.0], &[-3.0e38, 0.0, 3.0e38]);
-        assert!(ys.iter().all(|y| y.is_finite()), "{ys:?}");
+        assert_eq!(
+            ys,
+            vec![
+                -3.0e38, -2.625e38, -2.25e38, -1.875e38, -1.5e38, -1.125e38, -7.5e37, -3.75e37,
+                0.0, 3.75e37, 7.5e37, 1.125e38, 1.5e38, 1.875e38, 2.25e38, 2.625e38, 3.0e38
+            ]
+        );
     }
 
     #[test]
