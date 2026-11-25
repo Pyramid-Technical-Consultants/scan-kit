@@ -1335,6 +1335,18 @@ mod tests {
         // coincides with maximum on this fixture — pin the fog composite
         // strictly below the peak it attenuates.
         assert!(transparent < maximum, "fog {transparent} vs max {maximum}");
+        // A flat cube gives the modes room to disagree: the axis chord sums
+        // three voxels while the maximum reads one.
+        let mut flat = peaked();
+        for value in &mut flat.values {
+            *value = 1.0;
+        }
+        let integrate = ray_value(&flat, 0.4, 0.3, 0, 0, 0.5, 0.5);
+        let maximum = ray_value(&flat, 0.4, 0.3, 1, 0, 0.5, 0.5);
+        assert!(
+            integrate > maximum,
+            "integrate {integrate} vs max {maximum}"
+        );
     }
 
     #[test]

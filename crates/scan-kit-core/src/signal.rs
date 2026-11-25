@@ -1547,7 +1547,15 @@ mod tests {
     fn a_huge_declared_shape_does_not_wrap_the_flat_index() {
         // x * nx used to overflow before the bounds check — a wrapped index
         // could land on a valid voxel and sample the wrong one.
-        let out = resample_nearest(&[1.0; 4], [usize::MAX, usize::MAX, usize::MAX], [4, 4, 4]);
+        let out = resample_nearest(
+            &[1.0, 2.0, 3.0, 4.0],
+            [usize::MAX, usize::MAX, usize::MAX],
+            [4, 4, 4],
+        );
         assert_eq!(out.len(), 64);
+        // A wrapped index could land on a valid voxel — only the first cell
+        // may hold a real sample.
+        assert_eq!(out[0], 1.0);
+        assert!(out[1..].iter().all(|value| *value == 0.0), "{out:?}");
     }
 }

@@ -877,15 +877,18 @@ export default function App() {
       } else {
         // session_id is not unique across locations — drop the id only
         // when no remaining row still lists it.
-        const remaining = rows.filter(
-          (item) => item.session_id !== pending.sessionId || item.library !== pending.library,
+        setRows((current) =>
+          current.filter(
+            (item) => item.session_id !== pending.sessionId || item.library !== pending.library,
+          ),
         );
-        setRows(remaining);
         setSelectionOrder((ids) =>
           ids.filter(
             (id) =>
               id !== pending.sessionId ||
-              remaining.some((item) => item.session_id === id),
+              rowsRef.current.some(
+                (item) => item.session_id === id && item.library !== pending.library,
+              ),
           ),
         );
         notify(
@@ -899,7 +902,7 @@ export default function App() {
     } finally {
       trashing.current = false;
     }
-  }, [rows, trashConfirm, setTrashConfirm]);
+  }, [trashConfirm, setTrashConfirm]);
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
     if (locations.length === 0) {
@@ -1378,15 +1381,7 @@ export default function App() {
                   sessionMenu.rowIds.length > 0 &&
                   sessionMenu.rowIds.every((id) => selectedIds.includes(id))
                 }
-                remote={isRemoteSpec(
-                  rows.find(
-                    (item) =>
-                      item.session_id === sessionMenu.sessionId &&
-                      item.library === sessionMenu.library,
-                  )?.library ??
-                    locations[0] ??
-                    "",
-                )}
+                remote={isRemoteSpec(sessionMenu.library)}
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
                   if (navigator.clipboard == null) {
@@ -1639,11 +1634,17 @@ export default function App() {
                   }
                   setPassword("");
                   setPasswordFor(null);
+                  // onOpenChange does not fire for this programmatic close —
+                  // re-arm here or the next prompt's submit is dead.
+                  passwordSubmitted.current = false;
                   const rest = pendingLocations.current;
                   pendingLocations.current = [];
                   return indexMany([spec, ...rest]);
                 })
-                .catch((error: unknown) => notifyError(error));
+                .catch((error: unknown) => {
+                  passwordSubmitted.current = false;
+                  notifyError(error);
+                });
             }}
           >
             <DialogHeader>

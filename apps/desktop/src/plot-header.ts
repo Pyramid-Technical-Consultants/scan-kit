@@ -263,7 +263,13 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
   return {
     title: text(parsed.title),
     controls: Array.isArray(parsed.controls) ? parsed.controls.map(viewControl) : [],
-    table: parsed.table ?? null,
+    table:
+      parsed.table != null &&
+      typeof parsed.table === "object" &&
+      Array.isArray((parsed.table as { columns?: unknown }).columns) &&
+      Array.isArray((parsed.table as { rows?: unknown }).rows)
+        ? parsed.table
+        : null,
     panels: Array.isArray(parsed.panels) ? parsed.panels : [],
     quality: quality.length > 0 ? quality : "final",
     lineToken: text(parsed.line_token),

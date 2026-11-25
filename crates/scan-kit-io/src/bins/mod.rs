@@ -623,7 +623,9 @@ fn session_stamp(root: &Path, session: &str) -> u128 {
         "config/map2map/devices.xml",
         "config/map2map/scan_dose_system.xml",
     ] {
-        stamp ^= discover::meta_stamp(&dir.join(name));
+        stamp = stamp
+            .wrapping_mul(0x9e3779b97f4a7c15)
+            .wrapping_add(discover::meta_stamp(&dir.join(name)));
     }
     // layer-*/run-* spot files feed point/beam-on times — a rewrite there
     // must invalidate prepared beam_on/overhead glyphs too.
@@ -682,7 +684,7 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
         frame,
         x: x_id,
         grain: coarse,
-        controls: source_controls,
+        controls: mut source_controls,
         ..
     } = picked;
     let metric = y.as_str();
@@ -1044,6 +1046,11 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
         title: format!("{} vs {}", group.label, x_label(&prepared.x_column)),
         panels,
         controls: {
+            for control in &mut source_controls {
+                if control.id == "x" {
+                    control.value = x_label(&prepared.x_column).to_string();
+                }
+            }
             let mut controls = controls(
                 source_controls,
                 group.id,

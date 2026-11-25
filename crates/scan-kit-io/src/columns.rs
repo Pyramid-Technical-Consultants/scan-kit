@@ -374,13 +374,13 @@ fn value_at(
                 .flatten()
                 .map(|value| value * scale)
         }
-        Source::Derived { indexes, scale } => {
+        Source::Derived { indexes, scales } => {
             let mut sum = 0.0;
-            for index in indexes {
+            for (index, scale) in indexes.iter().zip(scales) {
                 let slot = index_slot.get(index)?;
-                sum += loaded.get(*slot)?.get(row).copied().flatten()?;
+                sum += loaded.get(*slot)?.get(row).copied().flatten()? * scale;
             }
-            Some(sum * scale)
+            Some(sum)
         }
         Source::Zeros => Some(0.0),
         Source::Missing => None,
@@ -388,8 +388,14 @@ fn value_at(
 }
 
 enum Source {
-    Index { index: usize, scale: f64 },
-    Derived { indexes: Vec<usize>, scale: f64 },
+    Index {
+        index: usize,
+        scale: f64,
+    },
+    Derived {
+        indexes: Vec<usize>,
+        scales: Vec<f64>,
+    },
     Zeros,
     Missing,
 }
@@ -431,16 +437,21 @@ fn source_for(headers: &[String], requested: &str) -> Source {
         if indexes.len() == derived.sources.len() {
             // The r_ prefix marks raw coulombs needing derived.scale; a
             // resolved source without it (G3 names are already nA) must
-            // not inherit the 1e12 factor.
-            let scale = if raws
-                .iter()
-                .all(|raw| normalize_column_name(raw).starts_with("r_"))
-            {
-                derived.scale
-            } else {
-                1.0
+            // not inherit the 1e12 factor — per component, so a mixed
+            // header applies the right factor per term.
+            return Source::Derived {
+                indexes,
+                scales: raws
+                    .iter()
+                    .map(|raw| {
+                        if normalize_column_name(raw).starts_with("r_") {
+                            derived.scale
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect(),
             };
-            return Source::Derived { indexes, scale };
         }
     }
     if IC3_QUAD_ZERO_FILL

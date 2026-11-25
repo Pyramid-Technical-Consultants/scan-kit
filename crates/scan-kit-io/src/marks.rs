@@ -46,7 +46,7 @@ pub(crate) fn pick_in<'a>(
     let raw = options.get(key).and_then(Value::as_str)?.trim();
     pairs
         .iter()
-        .find(|(id, label)| *id == raw || *label == raw)
+        .find(|(id, label)| id.eq_ignore_ascii_case(raw) || label.eq_ignore_ascii_case(raw))
         .map(|(id, _)| *id)
 }
 

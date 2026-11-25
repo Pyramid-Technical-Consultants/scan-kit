@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(volume.get(1, 1, 1), 0.0);
         assert_eq!(volume.peak_index(), (0, 0, 0));
         // Out-of-range axes clamp like axis() does instead of panicking.
-        let _ = volume.index_of(5, 0.0);
-        let _ = volume.mm_of(5, 0);
+        assert_eq!(volume.index_of(5, 0.0), volume.index_of(2, 0.0));
+        assert_eq!(volume.mm_of(5, 0), volume.mm_of(2, 0));
     }
 }

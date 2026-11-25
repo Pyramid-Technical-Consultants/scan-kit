@@ -249,13 +249,12 @@ impl McRun {
         let Some(live) = self.live.as_mut() else {
             return false;
         };
-        // Saturating_mul can land on u32::MAX — not a per_batch multiple,
-        // so its tail batch would never fold in-flight.
+        // saturating_mul can land on u32::MAX — not a per_batch multiple,
+        // but the last submission folds its tail batch anyway.
         let target = histories
             .div_ceil(live.per_batch)
             .max(1)
-            .min(u32::MAX / live.per_batch)
-            * live.per_batch;
+            .saturating_mul(live.per_batch);
         if target < live.next {
             return false;
         }
@@ -357,6 +356,22 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         .ok_or_else(|| ComputeError::Message(format!("no material {}", request.medium)))?
         as i32;
     let n = request.energy.len();
+    // A ragged spot array silently truncates or zero-fills a spot —
+    // same contract patient_launch already enforces.
+    if [
+        request.protons.len(),
+        request.x.len(),
+        request.y.len(),
+        request.sx.len(),
+        request.sy.len(),
+    ]
+    .iter()
+    .any(|&len| len != n)
+    {
+        return Err(ComputeError::Message(
+            "spot arrays must carry one entry per energy".into(),
+        ));
+    }
     let mut spots = Vec::new();
     let mut weights = Vec::new();
     for i in 0..n {
@@ -836,7 +851,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let per_batch = (histories / 10).clamp(1, 100_000);
     // Round up, not down: satisfied must reach the requested target when the
     // run finishes — a floored count leaves paint_progress Pending forever.
-    let histories = histories.div_ceil(per_batch).min(u32::MAX / per_batch) * per_batch;
+    let histories = histories.div_ceil(per_batch).saturating_mul(per_batch);
     let volume_cm3 = f64::from(launch.spacing_cm[0])
         * f64::from(launch.spacing_cm[1])
         * f64::from(launch.spacing_cm[2]);
@@ -1117,10 +1132,14 @@ impl Live {
             self.queue.write_buffer(&self.params, 0, &self.base);
             self.queue
                 .write_buffer(&self.ledger, 56, &0u32.to_le_bytes());
+            // The run's last submission folds even off a batch boundary —
+            // a u32::MAX target is no per_batch multiple, and its tail
+            // batch still counts toward dose_sq and the stats sample.
             let fold = self
                 .next
                 .saturating_add(count)
-                .is_multiple_of(self.per_batch);
+                .is_multiple_of(self.per_batch)
+                || self.next.saturating_add(count) >= self.histories;
             if fold {
                 self.queue.write_buffer(
                     &self.fold_params,
@@ -1407,7 +1426,7 @@ impl Live {
         let ticket = self.begin_read(
             1,
             1.0 / (self.histories.max(1) as f32),
-            self.histories.max(1) / self.per_batch.max(1),
+            self.histories.max(1).div_ceil(self.per_batch.max(1)),
             self.histories.max(1),
         )?;
         let result = self.collect_read(&ticket, cancel)?;

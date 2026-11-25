@@ -693,8 +693,11 @@ mod tests {
 
     #[test]
     fn extreme_spacing_bounds_the_shift_count() {
-        // spacing huge enough to collapse the sub-voxel step to 0: limit is
-        // inf and reach/step saturates - the shift count must stay bounded.
+        // 1e38 makes v/(dta/4) overflow f32 -> step 0, limit inf: the shift
+        // count must stay bounded rather than allocating reach/step rows.
+        let rows = gamma_offsets([1e38; 3], 2.0, 2.0, [2, 2, 2]);
+        assert!(rows.len() <= (2 * 64 + 1_usize).pow(3), "{}", rows.len());
+        // The whole gamma run over the same fixture must not hang either.
         let _ = gamma_index(
             &[1.0f32; 8],
             &[1.0; 8],

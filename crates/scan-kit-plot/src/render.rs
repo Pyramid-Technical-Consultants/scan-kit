@@ -6596,8 +6596,15 @@ fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
     // an unbounded count is an unbounded loop. The WGSL hang_ticks caps at 96;
     // match it here.
     const MAX_TICKS: usize = 96;
-    let k0 = (lo / STEP - 1e-9).ceil() as i64;
-    let k1 = (hi / STEP + 1e-9).floor() as i64;
+    let k0f = (lo / STEP - 1e-9).ceil();
+    let k1f = (hi / STEP + 1e-9).floor();
+    // The i64 casts saturate near ±9e18 — a crafted extent that large would
+    // stamp up to 96 ticks at the same saturated position.
+    if !k0f.is_finite() || !k1f.is_finite() || k0f < -4.0e18 || k1f > 4.0e18 {
+        return vec![(lo, true), (hi, true)];
+    }
+    let k0 = k0f as i64;
+    let k1 = k1f as i64;
     // One-sided saturation (lo = f32::MIN, hi normal) overflows k1 - k0 + 1 —
     // saturate the subtraction before the cap, not after.
     let count = k1
@@ -6617,10 +6624,12 @@ fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
             || (k.rem_euclid(every) == 0 && gap as f32 >= 0.6 * every as f32);
         ticks.push((k as f32 * STEP, major));
     }
-    if ticks.first().is_none_or(|(value, _)| *value - lo > 1e-4) {
+    // Match the WGSL stub threshold — a labeled end tick with no stub
+    // under it is a floating number.
+    if ticks.first().is_none_or(|(value, _)| *value - lo > 0.05) {
         ticks.insert(0, (lo, true));
     }
-    if ticks.last().is_none_or(|(value, _)| hi - *value > 1e-4) {
+    if ticks.last().is_none_or(|(value, _)| hi - *value > 0.05) {
         ticks.push((hi, true));
     }
     ticks
@@ -7810,8 +7819,16 @@ fn split_rows(
     let mut y = margin;
     for row in 0..rows {
         let cell_h = inner_h * clean[row] / row_sum;
-        let left = row_splits[row * 2].max(0.0);
-        let right = row_splits[row * 2 + 1].max(0.0);
+        let left = if row_splits[row * 2].is_finite() {
+            row_splits[row * 2].max(0.0)
+        } else {
+            0.0
+        };
+        let right = if row_splits[row * 2 + 1].is_finite() {
+            row_splits[row * 2 + 1].max(0.0)
+        } else {
+            0.0
+        };
         let sum = (left + right).max(1.0e-6);
         let left_w = inner_w * left / sum;
         let right_w = inner_w * right / sum;
@@ -13475,6 +13492,20 @@ mod tests {
         // wrapped into an unbounded loop.
         let ticks = axis_ticks(-2.5e10, 2.5e10);
         assert!(ticks.len() <= 98, "{} ticks", ticks.len());
+        assert!(
+            ticks
+                .iter()
+                .all(|(value, _)| *value >= -2.5e10 - 1e-3 && *value <= 2.5e10 + 1e-3),
+            "{ticks:?}"
+        );
+        // Positions merge at f32 precision this far out — non-decreasing
+        // inside the range is what the order can pin.
+        assert!(ticks.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        // Past the i64-cast range only the box ends survive.
+        assert_eq!(
+            axis_ticks(1e30, 2e30),
+            vec![(1e30f32, true), (2e30f32, true)]
+        );
     }
 
     #[test]
