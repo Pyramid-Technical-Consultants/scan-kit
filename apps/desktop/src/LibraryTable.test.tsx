@@ -25,6 +25,7 @@ type EditorProps = {
       localEventY: number;
     },
   ) => void;
+  onCellActivated: (cell: readonly [number, number]) => void;
   onCellEdited: (cell: readonly [number, number], value: { kind: string; data: string }) => void;
   onGridSelectionChange: (selection: GridSelection) => void;
   drawCell: (
@@ -181,6 +182,7 @@ it("draws checks and forwards clicks, notes, and the menu", async () => {
         }}
         onCommitNote={(edit) => { notes.push(edit.after); return Promise.resolve(true); }}
         onOpenMenu={(menu) => menus.push(menu.x)}
+        pendingNotes={{ current: new Map() }}
       />,
     );
   });
@@ -232,4 +234,55 @@ it("draws checks and forwards clicks, notes, and the menu", async () => {
   expect(menus).toEqual([13]);
   expect(sorts).toEqual(["date"]);
   expect(header).toBe(1);
+});
+
+it("a retyped note commits after the undo write updates the shared pending map", async () => {
+  const notes: string[] = [];
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const rows = [row("s1"), row("s2", { note: "other" })];
+  const pending = { current: new Map<string, string>() };
+  await act(async () => {
+    root = createRoot(host);
+    root.render(
+      <LibraryTable
+        rows={rows}
+        order={[1, 0]}
+        displayIds={["s2", "s1"]}
+        sort={{ key: "session_id", direction: "desc" }}
+        theme={{} as Theme}
+        width={640}
+        height={240}
+        checks={paint}
+        selectedIds={[]}
+        folder="library"
+        gridSelection={selection}
+        onGridSelectionChange={() => {}}
+        onSort={() => {}}
+        onRowCheck={() => {}}
+        onHeaderCheck={() => {}}
+        onCommitNote={(edit) => { notes.push(edit.after); return Promise.resolve(true); }}
+        onOpenMenu={() => {}}
+        pendingNotes={pending}
+      />,
+    );
+  });
+  // Edit the note: the commit leaves the written text pending.
+  await act(async () => {
+    editor?.onCellActivated([9, 0]);
+    editor?.onCellEdited([9, 0], { kind: "text", data: "next" });
+  });
+  expect(notes).toEqual(["next"]);
+  expect(pending.current.get("library\0s2")).toBe("next");
+  // The undo write updates the shared map like applyNote does — rows still
+  // show "other" (they reflect the undo before the original write in this
+  // static fixture), so the stale "next" entry must not survive activation.
+  pending.current.set("library\0s2", "other");
+  await act(async () => {
+    editor?.onCellActivated([9, 0]);
+    editor?.onCellEdited([9, 0], { kind: "text", data: "next" });
+  });
+  // Retyping the undone text must commit — before the fix the stale "next"
+  // capture compared equal and swallowed the edit.
+  expect(notes).toEqual(["next", "next"]);
 });

@@ -1799,9 +1799,11 @@ fn parse_metric(text: &str) -> Option<GoalMetric> {
 }
 
 /// Summation types covering every fraction (PS3.3 C.8.8.3): the dose divides
-/// by the fraction count. The *_SESSION types and CONTROL_POINT are per
-/// fraction already.
-const COURSE_SUMMATIONS: &[&str] = &["PLAN", "MULTI_PLAN", "PLAN_OVERVIEW"];
+/// by the fraction count. FRACTION is the whole fraction group's delivery —
+/// every fraction of the group, not one. The *_SESSION types and
+/// CONTROL_POINT are per fraction already. Beam scopes are excluded from the
+/// gamma comparison before this scaling applies.
+const COURSE_SUMMATIONS: &[&str] = &["PLAN", "MULTI_PLAN", "PLAN_OVERVIEW", "FRACTION"];
 
 /// The TPS dose for one fraction.
 fn tps_per_fraction(dose: &[f32], summation: &str, fractions: i32) -> Vec<f32> {
@@ -1950,11 +1952,12 @@ mod tests {
     #[test]
     fn a_course_summation_divides_by_the_fractions() {
         let dose = vec![30.0f32; 4];
-        // Only course-scope summations divide — FRACTION is already one
-        // fraction's dose per C.8.8.3, and BEAM is a sub-scope.
+        // Course-scope summations divide. C.8.8.3: FRACTION is the entire
+        // fraction group's delivery (all its fractions), FRACTION_SESSION is
+        // one session, and BEAM is a sub-scope excluded upstream of gamma.
         assert_eq!(tps_per_fraction(&dose, "PLAN", 30), vec![1.0; 4]);
         assert_eq!(tps_per_fraction(&dose, "MULTI_PLAN", 30), vec![1.0; 4]);
-        assert_eq!(tps_per_fraction(&dose, "FRACTION", 30), dose);
+        assert_eq!(tps_per_fraction(&dose, "FRACTION", 30), vec![1.0; 4]);
         assert_eq!(tps_per_fraction(&dose, "BEAM", 30), dose);
         assert_eq!(tps_per_fraction(&dose, "FRACTION_SESSION", 30), dose);
         assert_eq!(tps_per_fraction(&dose, "", 30), dose);

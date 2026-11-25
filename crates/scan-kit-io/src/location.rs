@@ -608,9 +608,22 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
 fn cache_dest(library_canonical: &str, relative: &str) -> PathBuf {
     let base = cache_directory(library_canonical);
     let hash = &crate::location::hex_sha256(relative)[..8];
+    // The archive readers key the format (zip vs tar) and the decoder off
+    // the filename suffix — the hash must join the stem, not follow the
+    // suffix, or a cached run.zip@hash reads as an uncompressed tar.
+    let leaf_name = |leaf: &str| {
+        let lower = leaf.to_ascii_lowercase();
+        for (suffix, _) in discover::ARCHIVE_SUFFIXES {
+            if lower.ends_with(suffix) {
+                let stem = &leaf[..leaf.len() - suffix.len()];
+                return format!("{stem}@{hash}{}", &leaf[leaf.len() - suffix.len()..]);
+            }
+        }
+        format!("{leaf}@{hash}")
+    };
     match relative.rsplit_once('/') {
-        Some((parent, leaf)) => base.join(parent).join(format!("{leaf}@{hash}")),
-        None => base.join(format!("{relative}@{hash}")),
+        Some((parent, leaf)) => base.join(parent).join(leaf_name(leaf)),
+        None => base.join(leaf_name(relative)),
     }
 }
 
@@ -2496,6 +2509,42 @@ mod tests {
 "
                 .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn the_cache_leaf_keeps_the_archive_suffix_after_the_hash() {
+        // archive_members keys zip-vs-tar and read_tar keys the decoder off
+        // the filename suffix — run.zip@hash would read as an uncompressed tar.
+        let zip = super::cache_dest("https://h/lib", "nested/run.zip");
+        let tgz = super::cache_dest("https://h/lib", "nested/run.tar.gz");
+        let dir = super::cache_dest("https://h/lib", "nested/run");
+        let zip_leaf = zip.file_name().unwrap().to_string_lossy().into_owned();
+        let tgz_leaf = tgz.file_name().unwrap().to_string_lossy().into_owned();
+        let dir_leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            zip_leaf.starts_with("run@") && zip_leaf.ends_with(".zip"),
+            "{zip_leaf}"
+        );
+        assert!(
+            tgz_leaf.starts_with("run@") && tgz_leaf.ends_with(".tar.gz"),
+            "{tgz_leaf}"
+        );
+        assert!(
+            !dir_leaf.ends_with(".zip") && dir_leaf.starts_with("run@"),
+            "{dir_leaf}"
+        );
+        // The suffix must be exactly what the archive readers match, and the
+        // hash must differ per relative path so case-only-distinct remotes
+        // never share a dest.
+        assert!(zip_leaf.ends_with(".zip") && zip_leaf.len() == "run@".len() + 8 + ".zip".len());
+        assert_eq!(
+            super::discover::archive_kind(&zip_leaf).map(|(_, kind)| kind),
+            Some("zip")
+        );
+        assert_eq!(
+            super::discover::archive_kind(&tgz_leaf).map(|(_, kind)| kind),
+            Some("tar")
         );
     }
 

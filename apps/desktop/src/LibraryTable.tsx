@@ -191,6 +191,7 @@ export function LibraryTable({
   onHeaderCheck,
   onCommitNote,
   onOpenMenu,
+  pendingNotes,
 }: {
   rows: LibraryRow[];
   order: number[];
@@ -209,6 +210,9 @@ export function LibraryTable({
   onHeaderCheck: () => void;
   onCommitNote: (edit: NoteEdit) => Promise<boolean>;
   onOpenMenu: (menu: SessionMenu) => void;
+  // Shared with the undo/redo writes in App — a note write from any path
+  // stays pending until rows reflect it.
+  pendingNotes: { current: Map<string, string> };
 }) {
   const lastRowToggle = useRef<{ row: string; at: number } | null>(null);
   const baseColumns = useMemo(() => libraryColumns(sort), [sort]);
@@ -233,7 +237,6 @@ export function LibraryTable({
   // as `before` (it would prefill the old text and corrupt the undo chain).
   // session_id is not unique across locations — the pending map keys on
     // the same composite noteEdit captures.
-  const pendingNotes = useRef(new Map<string, string>());
   const noteKey = (library: string, id: string) => `${library}\0${id}`;
   const onCellActivated = useCallback(
     (cell: Item) => {
@@ -272,7 +275,7 @@ export function LibraryTable({
             }
           : null;
     },
-    [folder, order, rows],
+    [folder, order, pendingNotes, rows],
   );
   const onCellEdited = useCallback(
     (cell: Item, newValue: EditableGridCell) => {
@@ -317,7 +320,7 @@ export function LibraryTable({
         });
       }
     },
-    [folder, onCommitNote, onRowCheck, order, rows],
+    [folder, onCommitNote, onRowCheck, order, pendingNotes, rows],
   );
 
   const getCellContent = useCallback(

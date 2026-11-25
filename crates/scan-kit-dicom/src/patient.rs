@@ -2417,22 +2417,34 @@ pub fn write_rtdose(
     cs(&mut bytes, 0x0008, 0x0060, "RTDOSE")?;
     lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants")?;
     push_elem(&mut bytes, 0x0008, 0x0090, b"PN", &[])?;
-    // LO/PN hold 64 bytes in the declared charset — take whole chars that fit.
-    let cap64 = |text: &str| -> String {
-        text.chars()
-            .scan(0usize, |used, ch| {
-                *used += ch.len_utf8();
-                (*used <= 64).then_some(ch)
-            })
-            .collect()
-    };
+    // LO holds 64 characters — PS3.5 6.2 counts characters, not bytes, in a
+    // multi-byte charset, so a multibyte UTF-8 value may exceed 64 bytes and
+    // still be valid. The series description is our own text and truncates;
+    // the patient identifiers below may not.
+    let cap64 = |text: &str| -> String { text.chars().take(64).collect() };
     let series_description = cap64(&format!("{description} (research only)"));
     lo(&mut bytes, 0x0008, 0x103E, &series_description)?;
-    // A malformed source CT must not write an overlong value into the export.
-    let patient_name = cap64(&ct.patient_name);
-    let patient_id = cap64(&ct.patient_id);
-    pn(&mut bytes, 0x0010, 0x0010, &patient_name)?;
-    lo(&mut bytes, 0x0010, 0x0020, &patient_id)?;
+    // The identifiers pair this dose with the source patient — silently
+    // shortening one corrupts the pairing while the study UID still matches,
+    // so an overlong value rejects the export instead.
+    if ct.patient_id.chars().count() > 64 {
+        return Err(format!(
+            "patient id is {} characters — DICOM LO holds 64",
+            ct.patient_id.chars().count()
+        ));
+    }
+    // PN allows three component groups separated by '=', each limited to 64
+    // characters.
+    for group in ct.patient_name.split('=') {
+        if group.chars().count() > 64 {
+            return Err(format!(
+                "patient name component group is {} characters — DICOM PN holds 64 per group",
+                group.chars().count()
+            ));
+        }
+    }
+    pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name)?;
+    lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id)?;
     push_elem(&mut bytes, 0x0010, 0x0030, b"DA", &[])?;
     push_elem(&mut bytes, 0x0010, 0x0040, b"CS", &[])?;
     ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]])?;
@@ -3156,8 +3168,9 @@ mod tests {
             series_uid: String::new(),
             sop_uids: Vec::new(),
         };
-        // "x" + 60 é's is 77 characters; the LO cap is 64 bytes, so only
-        // whole chars that fit survive — x plus 31 two-byte é's.
+        // "x" + 60 é's is 61 characters before the provenance suffix; PS3.5
+        // 6.2 counts characters, not bytes, so 64 whole chars survive even
+        // though the é's are two bytes each.
         let description = format!("x{}", "é".repeat(60));
         let path = write_rtdose(
             &dir.join("dose.dcm"),
@@ -3172,8 +3185,9 @@ mod tests {
         .unwrap();
         let elems = parse_dataset(&fs::read(&path).unwrap()[132..]).unwrap();
         let written = text_tag(&elems, tag(0x0008, 0x103E));
-        assert!(written.len() <= 64);
-        assert_eq!(written.chars().count(), 32);
+        assert!(written.chars().count() <= 64);
+        assert_eq!(written.chars().count(), 64);
+        assert!(written.len() > 64);
         assert!(written.starts_with('x'));
         assert_eq!(int_tag(&elems, tag(0x0028, 0x0101)), Some(32));
         assert_eq!(int_tag(&elems, tag(0x0028, 0x0102)), Some(31));
@@ -3181,6 +3195,57 @@ mod tests {
     }
 
     #[test]
+    fn rtdose_preserves_a_multibyte_patient_id_and_rejects_an_overlong_one() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "1.2.3".into(),
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+            shape: [1, 1, 1],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            // 24 three-byte chars: 72 bytes, 24 characters — within the LO
+            // limit and must survive intact.
+            patient_id: "中".repeat(24),
+            patient_name: "^".into(),
+            study_uid: "1.2.3".into(),
+            series_uid: String::new(),
+            sop_uids: Vec::new(),
+        };
+        let path = write_rtdose(
+            &dir.join("dose.dcm"),
+            &[0.5],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "",
+            "",
+        )
+        .unwrap();
+        let elems = parse_dataset(&fs::read(&path).unwrap()[132..]).unwrap();
+        assert_eq!(text_tag(&elems, tag(0x0010, 0x0020)), "中".repeat(24));
+        assert_eq!(text_tag(&elems, tag(0x0010, 0x0010)), "^");
+        let mut overlong = ct.clone();
+        overlong.patient_id = "a".repeat(65);
+        assert!(write_rtdose(
+            &dir.join("over.dcm"),
+            &[0.5],
+            &overlong,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "",
+            ""
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn rtdose_rejects_a_wrong_sized_dose() {
         let ct = CtVolume {
             frame: "1.2.3".into(),

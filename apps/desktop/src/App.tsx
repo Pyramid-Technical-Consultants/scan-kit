@@ -1050,6 +1050,10 @@ export default function App() {
   // Two rapid edits must push undo entries in user order — invoke
     // completion order is not guaranteed.
   const noteChain = useRef<Promise<unknown>>(Promise.resolve());
+  // Shared with LibraryTable — undo/redo writes are note writes too, and an
+  // untracked one leaves the undone text pending: the reopened editor then
+  // prefills it and a retype compares equal to the stale capture.
+  const pendingNotes = useRef(new Map<string, string>());
   const commitNote = useCallback(
     (edit: NoteEdit): Promise<boolean> => {
       // Record the edit synchronously — an undo pressed while this write
@@ -1107,11 +1111,21 @@ export default function App() {
   async function applyNote(edit: NoteEdit, note: string) {
     // Same chain commitNote uses — an undo must not race an in-flight
     // commit or the persisted text and the stacks diverge.
+    const key = `${edit.library}\0${edit.sessionId}`;
+    pendingNotes.current.set(key, note);
     const run = noteChain.current.then(() =>
       writeNote(edit.sessionId, edit.library, note),
     );
     noteChain.current = run.catch(() => undefined);
-    await run;
+    try {
+      await run;
+    } catch (error) {
+      // A rejected write must not poison the entry — the rows never moved.
+      if (pendingNotes.current.get(key) === note) {
+        pendingNotes.current.delete(key);
+      }
+      throw error;
+    }
   }
 
   function undoNote() {
@@ -1362,6 +1376,7 @@ export default function App() {
                 onHeaderCheck={onHeaderCheck}
                 onCommitNote={commitNote}
                 onOpenMenu={setSessionMenu}
+                pendingNotes={pendingNotes}
               />
             ) : null}
             {!catalogWaiting && emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Exams" ? (

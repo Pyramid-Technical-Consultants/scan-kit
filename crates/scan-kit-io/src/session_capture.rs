@@ -936,7 +936,60 @@ fn join_timeslices(
         return None;
     }
     parts_out.sort_by(|a, b| a.0.cmp(&b.0));
-    let parts: Vec<Part> = parts_out.into_iter().map(|(_, part)| part).collect();
+    let mut parts: Vec<Part> = parts_out.into_iter().map(|(_, part)| part).collect();
+
+    // A device that records no layer/spot metadata still measures the same
+    // delivery — its rows belong to whatever layer/spot the other devices
+    // recorded at that timeslice. Keying them ("", "", ts) separates them
+    // from their siblings, so re-key them by the unambiguous
+    // timeslice → (layer, spot) mapping the recording devices establish.
+    let mut infer: HashMap<String, (String, String)> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for part in &parts {
+        for key in &part.order {
+            if key.0.is_empty() && key.1.is_empty() {
+                continue;
+            }
+            let meta = (key.0.clone(), key.1.clone());
+            match infer.get(&key.2) {
+                Some(existing) if *existing != meta => {
+                    ambiguous.insert(key.2.clone());
+                }
+                None => {
+                    infer.insert(key.2.clone(), meta);
+                }
+                _ => {}
+            }
+        }
+    }
+    for ts in &ambiguous {
+        infer.remove(ts);
+    }
+    if !infer.is_empty() {
+        for part in &mut parts {
+            if !part
+                .order
+                .iter()
+                .all(|key| key.0.is_empty() && key.1.is_empty())
+            {
+                continue;
+            }
+            let order = std::mem::take(&mut part.order);
+            for key in order {
+                let Some(row) = part.rows.remove(&key) else {
+                    continue;
+                };
+                let key = match infer.get(&key.2) {
+                    Some((layer, spot)) => (layer.clone(), spot.clone(), key.2.clone()),
+                    None => key,
+                };
+                if !part.rows.contains_key(&key) {
+                    part.order.push(key.clone());
+                }
+                part.rows.insert(key, row);
+            }
+        }
+    }
 
     // Timeslice keys joined on numeric value; a row missing in one device
     // leaves that block empty.
@@ -2008,6 +2061,27 @@ mod tests {
         assert_eq!(rows[0], "1,0,1,10,3.5,64.5,0,1,0,1,10,1,0");
         assert_eq!(rows[1], ",,,,,,0,1,0,2,20,0,0");
         assert_eq!(rows[2], "1,0,10,30,4.0,62,0,,,,,,0");
+    }
+
+    #[test]
+    fn timeslices_join_when_only_one_device_records_layer_and_spot() {
+        // The IX256 has no layer/spot columns but measures the same delivery —
+        // its rows belong to the layer/spot the RCI recorded at that
+        // timeslice, not a bare key that splits them apart.
+        let rci = sheet(
+            "spot_no,layer_id,timesliceNumber,timestamp(ms),r_beamOk\n1,0,1,10,true\n1,0,2,20,false\n",
+        );
+        let ic = sheet(
+            "timesliceNumber,timestamp(ms),ic1_total_dose_spot(nC),r_ic1_x(ch)\n1,10,3.5,64.5\n2,20,4.0,62\n",
+        );
+        let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
+        let text = join_timeslices(&refs(&parts), &mut Vec::new()).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        // Two joined rows, not four separated ones: the IC block joins the
+        // RCI row sharing its timeslice number.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "1,10,3.5,64.5,0,1,0,1,10,1,0");
+        assert_eq!(rows[1], "2,20,4.0,62,0,1,0,2,20,0,0");
     }
 
     #[test]
