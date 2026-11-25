@@ -3502,7 +3502,8 @@ impl Plot {
                     .max((x as f32 + 0.5) - right)
                     .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
                 let coverage = (0.5 - outside).clamp(0.0, 1.0);
-                if !(coverage > 0.0) {
+                // NaN coverage must not reach blend — a NaN alpha erases.
+                if coverage <= 0.0 || coverage.is_nan() {
                     continue;
                 }
                 let u = ((x as f32 + 0.5 - left + 1.0) / (span_x + 2.0)).clamp(0.0, 1.0);
@@ -8066,7 +8067,8 @@ fn fill_quad_cpu(
                 .max((x as f32 + 0.5) - right)
                 .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
             let coverage = (0.5 - outside).clamp(0.0, 1.0);
-            if !(coverage > 0.0) {
+            // NaN coverage must not reach blend — a NaN alpha erases.
+            if coverage <= 0.0 || coverage.is_nan() {
                 continue;
             }
             let mut color = if let Some(index) = quad.heatmap.filter(|_| quad.heat > 0.5) {
@@ -8207,7 +8209,8 @@ fn stroke_cpu(
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
             let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
             let coverage = pattern_coverage(dist, radius, phase + t * len, line.pattern);
-            if !(coverage > 0.0) {
+            // An inf/NaN phase yields NaN coverage — skip, don't erase.
+            if coverage <= 0.0 || coverage.is_nan() {
                 continue;
             }
             let mut ink = line.color;
@@ -8782,6 +8785,8 @@ fn upload_buffer(
     buffer
 }
 
+// Grow-only: bytes past the new prefix are stale from prior frames — every
+// draw range must be recomputed and bounded to the bytes just written.
 fn write_grow(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

@@ -633,6 +633,11 @@ pub(crate) fn decode_plot(
     if marks.panels.len() != header.panels.len() {
         return Err("plot payload panel count mismatch".into());
     }
+    // Each panel costs a bind group, a uniform slot, and per-frame draws —
+    // a crafted header must not mint them unbounded.
+    if header.panels.len() > 1024 {
+        return Err("plot payload panel count out of range".into());
+    }
     let fits = |start: u32, count: u32, len: usize| {
         (start as usize)
             .checked_add(count as usize)

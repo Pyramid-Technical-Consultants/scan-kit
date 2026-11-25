@@ -394,11 +394,12 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
 }
 
 fn color4(values: &[f32], fallback: [f32; 4]) -> [f32; 4] {
-    let mut out = fallback;
-    for (index, value) in values.iter().take(4).enumerate() {
-        out[index] = *value;
+    // A short or non-finite array must not blend channels with the
+    // fallback — take it whole or not at all.
+    if values.len() == 4 && values.iter().all(|v| v.is_finite()) {
+        return [values[0], values[1], values[2], values[3]];
     }
-    out
+    fallback
 }
 
 /// Release builds have no console, so a panic is appended to the crash log for support.

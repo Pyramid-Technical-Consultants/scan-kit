@@ -4,7 +4,8 @@
 //! poll is one window. Each later timed poll doubles that window and reads only
 //! the new bytes, until the picture passes four windows. That poll reads the
 //! rest once. `open_plot` drains the same stage with an unlimited budget, so a
-//! one-shot call still returns the scene it returns today.
+//! one-shot call still returns the scene it returns today. Volumetric views
+//! always load whole in one poll — the windowed path is analytic views only.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -197,6 +198,7 @@ pub fn start_task(
                 if task.stage.is_none() && !task.cancel.is_cancelled() {
                     task.stage = Some(stage);
                     task.generation = task.generation.saturating_add(1);
+                    task.last_report = None;
                     return Ok(json!({ "task": id, "generation": task.generation }));
                 }
             }
@@ -443,6 +445,11 @@ pub(crate) fn drain_task(
     options: &Value,
     cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
+    // A stage that ignores the poll budget (LibraryStage, CopyStage) would
+    // hot-spin the 64-iteration drive below — only export stages drain.
+    if !matches!(slot_of(view), Slot::Export) {
+        return Err(format!("{view} is not an export task"));
+    }
     drain_plot(
         view,
         root,
@@ -2018,10 +2025,20 @@ impl ExportStage {
             )
         };
         match outcome {
-            Ok(value) => match serde_json::to_vec(&value) {
-                Ok(bytes) => Poll::Ready(bytes),
-                Err(err) => self.fail(err.to_string()),
-            },
+            Ok(value) => {
+                // A cancel landing inside the destination write would
+                // leave a finished artifact for a task reported cancelled
+                // — and could overwrite a replacement export's dest.
+                if cancel.is_cancelled() {
+                    let _ = std::fs::remove_file(&self.dest);
+                    self.report.phase = Phase::Cancelled;
+                    return Poll::Cancelled;
+                }
+                match serde_json::to_vec(&value) {
+                    Ok(bytes) => Poll::Ready(bytes),
+                    Err(err) => self.fail(err.to_string()),
+                }
+            }
             Err(message) => self.fail(message),
         }
     }

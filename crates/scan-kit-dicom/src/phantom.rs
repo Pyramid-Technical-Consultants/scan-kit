@@ -375,6 +375,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         patient::is(&mut item, 0x300A, 0x0071, 1)?;
         patient::is(&mut item, 0x300A, 0x0078, request.fractions)?;
         patient::is(&mut item, 0x300A, 0x0080, 1)?;
+        patient::is(&mut item, 0x300A, 0x00A0, 0)?;
         patient::sq(&mut item, 0x300C, 0x0004, &[referenced])?;
         item
     };
@@ -386,7 +387,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     for energy in &request.energies {
         for last in [false, true] {
             let mut cp = Vec::new();
-            patient::is(&mut cp, 0x300A, 0x0112, cps.len() as i32 + 1)?;
+            patient::is(&mut cp, 0x300A, 0x0112, cps.len() as i32)?;
             patient::ds(&mut cp, 0x300A, 0x0114, &[*energy as f32])?;
             if first {
                 patient::ds(&mut cp, 0x300A, 0x011E, &[request.gantry as f32])?;

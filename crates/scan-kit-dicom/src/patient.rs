@@ -605,7 +605,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     sq(&mut plan, 0x300A, 0x0180, &[setup])?;
     let control = {
         let mut item = Vec::new();
-        is(&mut item, 0x300A, 0x0112, 1)?;
+        is(&mut item, 0x300A, 0x0112, 0)?;
         ds(&mut item, 0x300A, 0x0114, &[100.0])?;
         ds(&mut item, 0x300A, 0x011E, &[0.0])?;
         ds(&mut item, 0x300A, 0x0122, &[0.0])?;
@@ -1945,7 +1945,10 @@ fn push_elem(
     bytes.extend_from_slice(&group.to_le_bytes());
     bytes.extend_from_slice(&slot.to_le_bytes());
     bytes.extend_from_slice(vr);
-    let long = matches!(vr, b"OW" | b"OB" | b"SQ" | b"OD");
+    let long = matches!(
+        vr,
+        b"OW" | b"OB" | b"SQ" | b"OD" | b"OF" | b"OL" | b"OV" | b"UC" | b"UR" | b"UT" | b"UN"
+    );
     if long {
         bytes.extend_from_slice(&[0, 0]);
         // Exactly 2^32 bytes wraps the VL to 0 — a silent empty element.
@@ -1962,6 +1965,15 @@ fn push_elem(
 }
 
 pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    // A UID from a crafted source file would write verbatim into the
+    // export — the VR caps at 64 chars of [0-9.].
+    if text.len() > 64
+        || text
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && byte != b'.')
+    {
+        return Err(format!("{group:04X},{element:04X} is not a uid"));
+    }
     let mut value = text.as_bytes().to_vec();
     if value.len() % 2 == 1 {
         value.push(0);
@@ -2307,6 +2319,8 @@ pub fn write_rtdose(
     // Windows paths lose their separators.
     let comment: String = comment
         .chars()
+        // LT permits only CR/LF/FF of the control bytes.
+        .filter(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\x0C'))
         .take(10240)
         .map(|c| if c == '\\' { '/' } else { c })
         .collect();
@@ -2985,7 +2999,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let ct = CtVolume {
-            frame: "f".into(),
+            frame: "1.2.3".into(),
             origin: [0.0; 3],
             spacing: [1.0; 3],
             shape: [1, 1, 1],
@@ -3026,7 +3040,7 @@ mod tests {
     #[test]
     fn rtdose_rejects_a_wrong_sized_dose() {
         let ct = CtVolume {
-            frame: "f".into(),
+            frame: "1.2.3".into(),
             origin: [0.0; 3],
             spacing: [1.0; 3],
             shape: [2, 2, 2],
