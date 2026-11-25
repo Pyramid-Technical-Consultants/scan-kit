@@ -6496,38 +6496,19 @@ b,2
                 assert!((value - expected).abs() < 1e-4, "{value} {expected}");
             }
         };
-        let mm = |value: f32, reversed: bool| g3_mm(&[value], reversed)[0];
-        near(
-            table.get("ic1_x").unwrap(),
-            &[mm(49.9, false), mm(50.0, false)],
-        );
-        near(
-            table.get("ic1_y").unwrap(),
-            &[mm(113.4, true), mm(113.4, true)],
-        );
-        near(
-            table.get("ic2_x").unwrap(),
-            &[mm(78.2, true), mm(78.3, true)],
-        );
-        near(
-            table.get("ic2_y").unwrap(),
-            &[mm(78.3, false), mm(78.4, false)],
-        );
-        near(
-            table.get("ic12_x_diff").unwrap(),
-            &[
-                mm(78.2, true) - mm(49.9, false),
-                mm(78.3, true) - mm(50.0, false),
-            ],
-        );
+        // Literal mm — expected values computed by g3_mm itself would let a
+        // wrong pitch or endpoint shift actual and expected together.
+        // (strip-64.5)*2 forward, (64.5-strip)*2 reversed.
+        near(table.get("ic1_x").unwrap(), &[-29.2, -29.0]);
+        near(table.get("ic1_y").unwrap(), &[-97.8, -97.8]);
+        near(table.get("ic2_x").unwrap(), &[-27.4, -27.6]);
+        near(table.get("ic2_y").unwrap(), &[27.6, 27.8]);
+        near(table.get("ic12_x_diff").unwrap(), &[1.8, 1.4]);
         near(table.get("ic1_sig_x").unwrap(), &[3.18, 3.20]);
         // The tolerance-band midpoints stand in for the command: b tracks it
         // (≈0 err), the stuck a-axis reads ~64 strips high (≈-129 mm err).
-        let x_err = [
-            mm(49.9, false) - mm(49.9, false),
-            mm(50.0, false) - mm(51.8, false),
-        ];
-        let y_err = [mm(113.4, true) - mm(49.4, true); 2];
+        let x_err = [0.0, -3.6];
+        let y_err = [-128.0; 2];
         near(table.get("ic1_x_err").unwrap(), &x_err);
         near(table.get("ic1_y_err").unwrap(), &y_err);
         near(
@@ -6569,7 +6550,7 @@ b,2
         near(table.get("ic1_x").unwrap(), &[-29.2, -25.4]);
         near(
             table.get("ic1_x_err").unwrap(),
-            &[-29.2 - mm(49.9, false), -25.4 - mm(51.8, false)],
+            &[-29.2 - (-29.2), -25.4 - (-25.4)],
         );
         let _ = std::fs::remove_dir_all(&root);
     }

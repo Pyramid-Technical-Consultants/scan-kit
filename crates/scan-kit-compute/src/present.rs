@@ -456,10 +456,13 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
-    input
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{key} is required"))?
+    let array = match input.get(key) {
+        None => return Err(format!("{key} is required")),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| format!("{key} must be an array"))?,
+    };
+    array
         .iter()
         .map(|value| {
             value

@@ -1052,6 +1052,8 @@ struct McPlotStage {
     worker_done: bool,
     /// Preview sequence already painted. 0 means the view has not seen a cube.
     seen: u64,
+    /// bind_cancel ran — worker_cancel and a poll's `cancel` share the flag.
+    bound: bool,
     report: Report,
 }
 
@@ -1206,6 +1208,7 @@ impl McPlotStage {
             shared: Arc::new(mc_live()),
             worker: None,
             worker_cancel: Cancel::new(),
+            bound: false,
             worker_done: false,
             seen: 0,
             report: report_at(Phase::Chrome, 0, 0),
@@ -1454,6 +1457,7 @@ impl Stage for McPlotStage {
 
     fn bind_cancel(&mut self, cancel: Cancel) {
         self.worker_cancel = cancel;
+        self.bound = true;
     }
 
     fn retarget(
@@ -1524,7 +1528,13 @@ impl Stage for McPlotStage {
             // stages are unbound, so the caller's flag still reaches Live and
             // invoke_flag's "cancelled MCP request stops the drain" holds.
             if cancel.is_cancelled() {
-                return self.drain(&Cancel::new());
+                if self.bound {
+                    return self.drain(&Cancel::new());
+                }
+                // Unbound — the caller's flag just fired. A fresh token
+                // would run the whole transport for an abandoned request.
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
             }
             return self.drain(cancel);
         }

@@ -2001,6 +2001,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         let files = json!([{ "rel": "a.xml", "xml": "\u{feff}<a/>" }]);
         save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).unwrap();
+        assert!(dest.join("a.xml").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

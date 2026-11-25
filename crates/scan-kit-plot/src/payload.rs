@@ -420,6 +420,13 @@ fn write_cube(out: &mut Vec<u8>, values: &[f32]) {
 }
 
 fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
+    // ponytail: hard cap so a crafted header cannot force a giant alloc.
+    // Real patient scenes ship the full CT grid (512^2 x ~300 slices is
+    // routine); 2^28 voxels is ~1 GiB of f32 and still bounded for wasm32.
+    // Reject before the block walk — its per-block tuples amplify ~4x.
+    if count > 1 << 28 {
+        return Err("plot payload volume is too large".into());
+    }
     // Walk the blocks first, so a bad count fails before the cube is allocated.
     let mut walk = Reader {
         bytes: reader.bytes,
@@ -440,12 +447,6 @@ fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> 
             .ok_or("plot payload cube is malformed")?;
         blocks.push((start, end, walk.take(bytes)?));
         at = end;
-    }
-    // ponytail: hard cap so a crafted header cannot force a giant alloc.
-    // Real patient scenes ship the full CT grid (512^2 x ~300 slices is
-    // routine); 2^28 voxels is ~1 GiB of f32 and still bounded for wasm32.
-    if count > 1 << 28 {
-        return Err("plot payload volume is too large".into());
     }
     let mut values = vec![0.0f32; count];
     for (start, end, raw) in blocks {
@@ -626,10 +627,11 @@ pub(crate) fn decode_plot(
     let lines = decode_lines(&line_bytes);
     let points = decode_points(&point_bytes);
     let quads = decode_quads(&quad_bytes);
-    if header
-        .heatmap_size
-        .iter()
-        .any(|(cols, rows)| *cols == 0 || *rows == 0 || *cols > 4096 || *rows > 4096)
+    if header.heatmap_size.len() > 1024
+        || header
+            .heatmap_size
+            .iter()
+            .any(|(cols, rows)| *cols == 0 || *rows == 0 || *cols > 4096 || *rows > 4096)
     {
         return Err("plot payload heatmap size out of range".into());
     }
@@ -675,6 +677,13 @@ pub(crate) fn decode_plot(
         marks.lines.len()
     };
     for batch in &marks.panels {
+        if batch.heats.len() > 4096
+            || batch.line_runs.len() > 4096
+            || batch.point_runs.len() > 4096
+            || batch.clouds.len() > 4096
+        {
+            return Err("plot payload run count out of range".into());
+        }
         if !fits(batch.line_start, batch.line_count, line_len)
             || !fits(batch.point_start, batch.point_count, marks.points.len())
             || !fits(batch.quad_start, batch.quad_count, marks.quads.len())
@@ -685,6 +694,9 @@ pub(crate) fn decode_plot(
                 (*quad as usize) < solid_end
                     || *quad as usize >= marks.quads.len()
                     || *texture >= marks.heatmaps.len()
+                    // The GPU draws the pair's texture; the CPU sampler
+                    // reads the quad's own heatmap — they must agree.
+                    || marks.quads[*quad as usize].heatmap != Some(*texture)
             })
             || batch
                 .line_runs
@@ -737,6 +749,17 @@ pub(crate) fn decode_plot(
         session_focus: header.volume_session_focus,
         ..VolumeMark::default()
     };
+    // Real scenes ship a handful of session cubes; a crafted count is a
+    // ~40-byte-per-GiB allocation amplifier. Header-known — check before
+    // the volume decode pays for a reject.
+    if header
+        .volume_sessions
+        .saturating_add(header.volume_plans)
+        .saturating_add(header.volume_companions)
+        > 64
+    {
+        return Err("plot payload session count out of range".into());
+    }
     let mut scan = None;
     if voxels > 0 {
         volume.values = read_cube(&mut reader, voxels)?;
@@ -754,16 +777,6 @@ pub(crate) fn decode_plot(
                 header.volume_shape[2] as usize,
             ],
         )?);
-    }
-    // Real scenes ship a handful of session cubes; a crafted count is a
-    // ~40-byte-per-GiB allocation amplifier.
-    if header
-        .volume_sessions
-        .saturating_add(header.volume_plans)
-        .saturating_add(header.volume_companions)
-        > 64
-    {
-        return Err("plot payload session count out of range".into());
     }
     let mut voxel_budget = 1usize << 30;
     volume.sessions = read_sessions(&mut reader, header.volume_sessions, &mut voxel_budget)?;

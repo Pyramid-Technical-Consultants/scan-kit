@@ -986,7 +986,9 @@ mod tests {
     #[test]
     fn kde_and_mean_series_survive_extreme_finite_samples() {
         let curve = kde(&[f32::MAX, -f32::MAX], 1.0);
-        assert!(curve.iter().all(|(y, _)| y.is_finite()));
+        assert!(!curve.is_empty());
+        // (position, half-width) — extreme samples can corrupt either.
+        assert!(curve.iter().all(|(y, w)| y.is_finite() && w.is_finite()));
         // Two f32::MAX samples overflow an f32 sum — the f64 mean stays
         // finite instead of handing pchip a NaN.
         let mut table = BTreeMap::new();
@@ -1001,13 +1003,17 @@ mod tests {
         );
         // serde_json writes non-finite floats as null — a text scan can't
         // see them. The values themselves have to be checked.
+        assert!(!series.is_empty());
+        let mut checked = 0;
         for item in &series {
             let (xs, ys) = match item {
                 Series::Polyline { xs, ys, .. } | Series::Points { xs, ys, .. } => (xs, ys),
                 _ => continue,
             };
+            checked += 1;
             assert!(xs.iter().chain(ys.iter()).all(|v| v.is_finite()));
         }
+        assert!(checked >= 1);
     }
 
     #[test]

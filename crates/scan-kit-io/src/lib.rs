@@ -615,14 +615,19 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_forget_data_dir" => {
             let path = required_str(input, "path")?;
             let db = database_path(input)?;
-            with_store(&db, |conn| {
-                // canonical_root, not library_root: forgetting a dead path is the point.
-                let root = location::canonical_root(path)?;
+            // canonical_root, not library_root: forgetting a dead path is the point.
+            let root = location::canonical_root(path).map_err(InvokeError::Message)?;
+            let result = with_store(&db, |conn| {
                 forget_data_dir(conn, &root)?;
-                location::drop_sessions(&root);
                 publish_catalog(conn)
             })
-            .map_err(InvokeError::Message)
+            .map_err(InvokeError::Message);
+            // The cache wipe waits on the remote COPY lock — keep it out of
+            // STORE_LOCK or every store call stalls for the copy budget.
+            if result.is_ok() {
+                location::drop_sessions(&root);
+            }
+            result
         }
         "scan_kit_load_columns" => {
             let storage = required_str(input, "storage_path")?;
@@ -1078,7 +1083,7 @@ pub fn index_library(
     let legacy = store::legacy_files(Path::new(&root));
     store::locked(|| {
         let _ = import_legacy(conn, lib_id, Path::new(&root), Some(&legacy));
-        let _ = backfill_blank_notes(conn, lib_id, Path::new(&root));
+        let _ = backfill_blank_notes(conn, lib_id, legacy.notes());
         Ok(())
     })?;
     if !keep(0, total, None) {

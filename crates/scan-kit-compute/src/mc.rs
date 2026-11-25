@@ -255,7 +255,9 @@ impl McRun {
             .div_ceil(live.per_batch)
             .max(1)
             .saturating_mul(live.per_batch);
-        if target < live.next {
+        // A run cannot shrink — a smaller request must not drop issued
+        // work or rewrite delivered history counts.
+        if target < live.next || target < live.histories {
             return false;
         }
         if target != live.histories {

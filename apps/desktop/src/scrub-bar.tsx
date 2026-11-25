@@ -135,6 +135,13 @@ export function useScrub(
         speed: reported.speed,
         window: reported.window,
       }));
+      // The re-seeded state must reach onMove too — the consumer serializes
+      // its own playhead into the next task, and a stale mirror would send
+      // the pre-reseed value back and clobber the restore. Disarming also
+      // stops the rAF loop, which update() alone can't reach.
+      const next = { ...scrubRef.current, on: reported.on, speed: reported.speed, window: reported.window };
+      scrubRef.current = next;
+      onMoveRef.current(next);
     }
   }, [reported.on, reported.speed, reported.window]);
 
@@ -250,6 +257,12 @@ export function useScrub(
     let frame = 0;
     const step = (now: number) => {
       const current = scrubRef.current;
+      // A re-seed can disarm mid-play — stop at the next frame rather than
+      // driving the playhead to end under a scrub state that no longer is.
+      if (!current.on) {
+        setPlaying(false);
+        return;
+      }
       // rAF pauses on hidden tabs — without a cap, the resume frame's dt
       // is the whole hidden span and the playhead snaps to the end.
       const dt = Math.min(0.25, Math.max(0, (now - last) / 1000));

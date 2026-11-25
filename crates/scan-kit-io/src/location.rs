@@ -442,7 +442,7 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     {
         return Err("remote session path escapes the cache directory".into());
     }
-    let dest = cache_directory(library_canonical).join(&relative);
+    let dest = cache_dest(library_canonical, &relative);
     let stamp_text = remote_stamp(&session)?;
     let stamp_path = stamp_file(&dest);
     // "0\n0" means the remote could not be stat'ed (a HEAD-less HTTP server,
@@ -471,14 +471,13 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     if tmp.exists() {
         let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
     }
-    // Orphan staging dirs from any crashed run (any pid suffix) — they are
-    // never touched again and accumulate forever in the cache dir.
+    // Orphan backups from crashed runs (any pid suffix). A live peer's
+    // .part-pid staging is not reclaimed here — the COPY lock is
+    // process-local and deleting it would fail that peer's copy.
     if let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
             let stale = entry.file_name().to_string_lossy().into_owned();
-            if stale.starts_with(&format!(".{name}.part-"))
-                || stale.starts_with(&format!(".{name}.old-"))
-            {
+            if stale.starts_with(&format!(".{name}.old-")) {
                 let _ = fs::remove_dir_all(entry.path()).or_else(|_| fs::remove_file(entry.path()));
             }
         }
@@ -566,6 +565,18 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
         return Ok("0\n0".into());
     }
     Ok(format!("{}\n{}", stat.mtime_ns, stat.size))
+}
+
+/// The local cache path for a remote session — a case-insensitive NTFS
+/// can't hold Foo and foo side by side, so the relative path's hash joins
+/// the leaf and case-only-distinct remotes never share a dest or stamp.
+fn cache_dest(library_canonical: &str, relative: &str) -> PathBuf {
+    let base = cache_directory(library_canonical);
+    let hash = &crate::location::hex_sha256(relative)[..8];
+    match relative.rsplit_once('/') {
+        Some((parent, leaf)) => base.join(parent).join(format!("{leaf}@{hash}")),
+        None => base.join(format!("{relative}@{hash}")),
+    }
 }
 
 fn stamp_file(dest: &Path) -> PathBuf {
@@ -1828,8 +1839,10 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                     // root — reject it before the prefix test.
                     if child.path.split(['/', '\\']).any(|part| part == "..")
                         || (!root_path.is_empty()
-                            && !(child.path == root_path
-                                || child.path.starts_with(&format!("{root_path}/"))))
+                            // The connected root itself is not a delete
+                            // target — a marker at the remote root would
+                            // recursively remove the library.
+                            && !child.path.starts_with(&format!("{root_path}/")))
                     {
                         errors.push(format!("{spec}: outside the connected root"));
                         continue;
@@ -1850,7 +1863,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                                 .components()
                                 .all(|part| matches!(part, std::path::Component::Normal(_)));
                         if safe {
-                            let cached = cache_directory(root).join(&relative);
+                            let cached = cache_dest(root, &relative);
                             // materialize holds COPY for its whole
                             // check/clear/copy/stamp — take it here too or
                             // the copy can re-create and stamp what delete
@@ -1894,7 +1907,9 @@ fn local_under_root(root: &str, path: &str) -> bool {
         return false;
     }
     let root = Path::new(root);
-    path == root || path.starts_with(root)
+    // Strictly inside — the opened root itself is never a delete target
+    // (a session marker at the library root would trash the library).
+    path != root && path.starts_with(root)
 }
 
 fn trash_path(path: &str) -> Result<(), String> {

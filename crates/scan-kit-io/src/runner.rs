@@ -2097,14 +2097,12 @@ mod tests {
         let db = std::env::temp_dir().join(format!("sk-cat-{}.sqlite", std::process::id()));
         // catalog's own read_status is strike 1 here — the socket survives,
         // and a single failed poll must not flip the catalog to offline.
-        // A parallel disconnect() can interleave — then every arm is already
-        // offline and the assertions below would hold vacuously, so only
-        // assert while a Live actually exists.
+        // A parallel disconnect() can steal the Live between arms — fail
+        // loudly rather than let the "stays connected" half pass vacuously.
         if live() {
             let report = catalog(&db);
-            if live() {
-                assert_eq!(report["connected"], json!(true));
-            }
+            assert!(live(), "Live stolen before the strike check");
+            assert_eq!(report["connected"], json!(true));
         }
         // Two consecutive failures evict — keep polling until it happens.
         for _ in 0..4 {

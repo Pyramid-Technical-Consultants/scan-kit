@@ -227,7 +227,7 @@ export function LibraryTable({
     selectedVisible,
   );
 
-  const noteEdit = useRef<{ id: string; note: string; library: string } | null>(null);
+  const noteEdit = useRef<{ cell: Item; id: string; note: string; library: string } | null>(null);
   // A committed note stays "after" until rows catch up with the write —
   // a second edit opened in that window must not capture the stale cell
   // as `before` (it would prefill the old text and corrupt the undo chain).
@@ -248,7 +248,10 @@ export function LibraryTable({
             entry.session_id === key.slice(at + 1) &&
             (entry.library ?? folder ?? "") === key.slice(0, at),
         );
-        if (current == null || current.note === note) {
+        // Only a row that reflects the write clears the entry — an absent
+        // row is not proof the write landed, and dropping the entry here
+        // reopens the stale-before hole the map exists to close.
+        if (current != null && current.note === note) {
           pendingNotes.current.delete(key);
         }
       }
@@ -262,6 +265,7 @@ export function LibraryTable({
       noteEdit.current =
         clickEditsNote(col) && row != null
           ? {
+              cell,
               id: row.session_id,
               note: pending ?? row.note,
               library: row.library ?? folder ?? "",
@@ -283,7 +287,13 @@ export function LibraryTable({
         onRowCheck(row.session_id, newValue.data === true);
         return;
       }
-      const edit = noteEdit.current;
+      // The activation capture only covers the cell that was activated —
+      // a bulk paste fires per target cell without activating each, so a
+      // mismatched cell must fall back to its own row, not the capture.
+      const edit =
+        noteEdit.current?.cell[0] === col && noteEdit.current.cell[1] === rowIndex
+          ? noteEdit.current
+          : null;
       const before = edit?.note ?? row.note;
       if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
         const key = noteKey(

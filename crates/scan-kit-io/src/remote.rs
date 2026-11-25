@@ -1793,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_mlst_reply_is_an_error_not_a_missing_file() {
+    fn a_malformed_mlst_reply_stats_as_absent() {
         // stat_mlst returns None for both absent and unparseable — callers
         // would silently skip a real object.
         assert!(super::net::stat_mlst("type=file;size=abc; name").is_none());

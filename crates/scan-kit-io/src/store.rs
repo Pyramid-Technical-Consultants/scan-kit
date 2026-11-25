@@ -315,6 +315,17 @@ pub fn set_note(
         params![lib_id, session_id, note],
     )
     .map_err(|err| err.to_string())?;
+    if note.is_empty() {
+        // A whitespace note on an unscanned session creates a row with no
+        // note and no storage — delete_missing keeps NULL-storage rows, so
+        // it would list forever. Only truly-empty ghosts go.
+        conn.execute(
+            "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2
+             AND storage_path IS NULL AND note = ''",
+            params![lib_id, session_id],
+        )
+        .map_err(|err| err.to_string())?;
+    }
     Ok(())
 }
 
@@ -531,7 +542,11 @@ pub fn record_meta(
 ///
 /// ponytail: runs only when this library has no notes at all, so deleting one
 /// note does not revive the JSON. Clearing every note would.
-pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Result<(), String> {
+pub fn backfill_blank_notes(
+    conn: &Connection,
+    lib_id: i64,
+    notes_raw: Option<&Value>,
+) -> Result<(), String> {
     let filled: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sessions WHERE library_id = ?1 AND note != ''",
@@ -542,9 +557,7 @@ pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Resu
     if filled > 0 {
         return Ok(());
     }
-    let Some(notes) =
-        read_json(root.join("session_notes.json")).and_then(|value| value.as_object().cloned())
-    else {
+    let Some(notes) = notes_raw.and_then(|value| value.as_object()) else {
         return Ok(());
     };
     for (session_id, text) in notes {
@@ -910,8 +923,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         // Tables that predate version stamping may lack the UNIQUE
         // constraints the ON CONFLICT upserts resolve against — dedupe
         // then index or every session/exam write fails on such a DB.
+        // Rows dangling on a deleted/never-written libraries row get NULL
+        // from the repoint subquery and fail NOT NULL — sweep them first.
         conn.execute_batch(
-            "UPDATE sessions SET library_id = (
+            "DELETE FROM sessions WHERE library_id NOT IN (SELECT id FROM libraries);
+             DELETE FROM exams WHERE library_id NOT IN (SELECT id FROM libraries);
+             UPDATE sessions SET library_id = (
                 SELECT keep.id FROM libraries l1
                 JOIN libraries keep
                     ON keep.root_path = l1.root_path
@@ -972,6 +989,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if version < 4 {
         conn.execute_batch(EXAMS_TABLE)
             .map_err(|err| err.to_string())?;
+        // An exams table that exists with a stale column set (partial
+        // creation at the same version) heals like sessions/libraries do.
+        migrate_columns(
+            conn,
+            "exams",
+            &[
+                ("folder_name", "TEXT NOT NULL DEFAULT ''"),
+                ("storage_path", "TEXT"),
+                ("patient_name", "TEXT NOT NULL DEFAULT ''"),
+                ("patient_id", "TEXT NOT NULL DEFAULT ''"),
+                ("study_date", "TEXT"),
+                ("study_description", "TEXT NOT NULL DEFAULT ''"),
+                ("file_count", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
     }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -1045,6 +1077,14 @@ pub(crate) struct LegacyFiles {
     notes_ok: bool,
     settings: Value,
     notes_raw: Option<Value>,
+}
+
+impl LegacyFiles {
+    /// The prefetched session_notes.json, parsed — lets the backfill reuse
+    /// it instead of re-reading inside STORE_LOCK.
+    pub(crate) fn notes(&self) -> Option<&Value> {
+        self.notes_raw.as_ref()
+    }
 }
 
 pub fn legacy_files(base: &Path) -> LegacyFiles {
@@ -1549,7 +1589,11 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                // Only a Normal component pops — popping RootDir/Prefix
+                // would yield a relative path stored as canonical.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
             }
             other => out.push(other.as_os_str()),
         }
