@@ -7,9 +7,7 @@ use scan_kit_core::{
 };
 use serde_json::Value;
 
-use super::{
-    col, control, drew_line, flag, load_csv, panel, placed, scene, session_text, span, stroke, MARK,
-};
+use super::{control, drew_line, flag, panel, placed, scene, session_text, span, stroke, MARK};
 
 /// Timeslice rows are 1 ms apart.
 const SAMPLE_S: f32 = 0.001;
@@ -417,15 +415,22 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
         let mut panels = Vec::new();
         for device in ["IC1", "IC2", "IC3"] {
             let path = format!("ic_hv_toggle/{device}_HCC.csv");
-            let columns = load_csv(root, session, &path);
+            // The sheet keeps `wide` (f64) columns — `time_s`/`timestamp`/
+            // `time_ns` classify as Wide, so a `num`-only map could never
+            // resolve those clocks.
+            let sheet = crate::discover::read_session_file(root, session, &path)
+                .map(|bytes| crate::tables::read_sheet(&bytes))
+                .unwrap_or_default();
             // Prefer the exact "current" column — a file carrying e.g.
             // charge_current and ic_current would otherwise bind whichever
             // sorts first alphabetically.
-            let Some((_, current)) = columns
+            let Some((_, current)) = sheet
+                .num
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("current"))
                 .or_else(|| {
-                    columns
+                    sheet
+                        .num
                         .iter()
                         .find(|(name, _)| name.to_ascii_lowercase().contains("current"))
                 })
@@ -434,15 +439,31 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
             };
             // The capacitance integrates real milliseconds — the device
             // file's "time" column is ms, time_s is seconds, timestamp is
-            // epoch ms. When no clock resolves the index axis draws the
-            // trace but the measured pF must not be fabricated.
-            let clock = col(&columns, "time")
-                .map(|values| values.to_vec())
+            // epoch ms, time_ns is nanoseconds. `num_clock`/`wide_clock`
+            // honor `(unit)` header suffixes; an epoch-scale stamp is
+            // differenced in f64 before the f32 cast or the ~131 s ulp
+            // erases the trace. When no clock resolves the index axis
+            // draws the trace but the measured pF must not be fabricated.
+            let clock = crate::tables::num_clock(&sheet, "time", "ms")
+                .map(|(values, factor)| values.iter().map(|v| v * factor).collect::<Vec<f32>>())
                 .or_else(|| {
-                    col(&columns, "time_s")
-                        .map(|values| values.iter().map(|v| v * 1000.0).collect::<Vec<f32>>())
-                })
-                .or_else(|| col(&columns, "timestamp").map(|values| values.to_vec()));
+                    [
+                        ("time_s", "s", 1000.0),
+                        ("timestamp", "ms", 1.0),
+                        ("time_ns", "ns", 1e-6),
+                    ]
+                    .iter()
+                    .find_map(|(name, unit, to_ms)| {
+                        crate::tables::wide_clock(&sheet, name, unit).map(|(values, factor)| {
+                            let t0 = values.first().copied().unwrap_or(0.0);
+                            let origin = if t0.abs() > 1.0e6 { t0 } else { 0.0 };
+                            values
+                                .iter()
+                                .map(|v| ((v - origin) * factor * to_ms) as f32)
+                                .collect::<Vec<f32>>()
+                        })
+                    })
+                });
             let time = clock
                 .clone()
                 .unwrap_or_else(|| (0..current.len()).map(|i| i as f32).collect());

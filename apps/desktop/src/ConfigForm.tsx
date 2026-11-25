@@ -159,7 +159,7 @@ export function FormTree({
     <div className="flex flex-col gap-3">
       {nodes.map((node, index) => (
         <FormNodeView
-          key={`${node.kind}-${node.id ?? node.title ?? index}`}
+          key={`${node.kind}-${node.id ?? node.title}-${index}`}
           node={node}
           hideUnused={hideUnused}
           onField={onField}

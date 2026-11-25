@@ -312,6 +312,7 @@ fn push_roi(
     // RT ROI Interpreted Type lives in the Type 1 RT ROI Observations
     // sequence — inside the Structure Set ROI item no reader looks for it.
     let mut observation = Vec::new();
+    patient::is(&mut observation, 0x3006, 0x0082, number)?;
     patient::is(&mut observation, 0x3006, 0x0084, number)?;
     patient::cs(&mut observation, 0x3006, 0x00A4, kind)?;
     observations.push(observation);
@@ -398,9 +399,9 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     0x012C,
                     &[0.0, ((PTV.y0 + PTV.y1) / 2.0) as f32, 0.0],
                 )?;
-                // Cumulative meterset counts this control point too —
-                // writing the pre-point total undercounts every layer.
-                patient::ds(&mut cp, 0x300A, 0x0134, &[weight + n as f32])?;
+                // Cumulative Meterset Weight through this CP — the
+                // first control point's value must be 0 per C.8.8.25.7.
+                patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
                 patient::fl(&mut cp, 0x300A, 0x030D, &[300.0])?;
                 if request.wet > 0.0 {
                     let mut setting = Vec::new();
@@ -411,14 +412,9 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     patient::sq(&mut cp, 0x300A, 0x0360, &[setting])?;
                 }
             } else {
-                // Same cumulative-through-this-point semantics — the
-                // trailing zero-weight cp contributes nothing.
-                patient::ds(
-                    &mut cp,
-                    0x300A,
-                    0x0134,
-                    &[weight + if last { 0.0 } else { n as f32 }],
-                )?;
+                // The end CP carries the post-segment cumulative (the
+                // increment on the start CP already landed).
+                patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
             }
             patient::sh(&mut cp, 0x300A, 0x0390, "3.0")?;
             patient::is(&mut cp, 0x300A, 0x0392, n as i32)?;

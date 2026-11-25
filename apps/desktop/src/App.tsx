@@ -50,6 +50,7 @@ import { dismissNotice, logError, notify, notifyError } from "@/notify";
 import { usePageLoad } from "@/page-load";
 import { driveTask, type Report } from "@/task-client";
 import { type CheckPaint } from "@/session-checkbox";
+import { selectionFromLibrary } from "@/session-colors";
 import { SessionContextMenu } from "@/session-menu";
 import {
   MAX_SELECTED,
@@ -422,7 +423,10 @@ export default function App() {
       setRows(payload.rows.map((item) => ({ ...item, selected: live.has(item.session_id) })));
     } else {
       setRows(payload.rows);
-      setSelectionOrder(payload.selected);
+      // A stored selection id can outlive its row (files deleted outside
+      // the app) — a phantom id keeps the row "checked" invisibly and
+      // anchors `folder` to the wrong library.
+      setSelectionOrder(selectionFromLibrary(payload.rows, payload.selected));
     }
   }, []);
 
@@ -868,12 +872,19 @@ export default function App() {
       } else if (result.removed === 0) {
         notify(`No files found for session ${pending.sessionId}`);
       } else {
-        setRows((items) =>
-          items.filter(
-            (item) => item.session_id !== pending.sessionId || item.library !== pending.library,
+        // session_id is not unique across locations — drop the id only
+        // when no remaining row still lists it.
+        const remaining = rows.filter(
+          (item) => item.session_id !== pending.sessionId || item.library !== pending.library,
+        );
+        setRows(remaining);
+        setSelectionOrder((ids) =>
+          ids.filter(
+            (id) =>
+              id !== pending.sessionId ||
+              remaining.some((item) => item.session_id === id),
           ),
         );
-        setSelectionOrder((ids) => ids.filter((id) => id !== pending.sessionId));
         notify(
           pending.remote
             ? `Deleted session ${pending.sessionId}`
@@ -885,7 +896,7 @@ export default function App() {
     } finally {
       trashing.current = false;
     }
-  }, [trashConfirm, setTrashConfirm]);
+  }, [rows, trashConfirm, setTrashConfirm]);
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
     if (locations.length === 0) {
@@ -1368,7 +1379,7 @@ export default function App() {
                 )}
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
-                  void navigator.clipboard.writeText(id).then(
+                  void navigator.clipboard?.writeText(id).then(
                     () => notify(`Copied session ${id}`),
                     () => notifyError("Could not copy the session id"),
                   );

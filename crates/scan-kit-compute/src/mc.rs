@@ -523,9 +523,11 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
                     "spot gaussian share outside 0..=1".into(),
                 ));
             }
-            // Past the table top the shader clamps the stopping power —
-            // error rather than transport with the wrong physics.
-            if record[2] > 400.0 {
+            // Outside the table the shader clamps the stopping power —
+            // error rather than transport with the wrong physics. The
+            // floor matters too: a non-positive energy silently lands in
+            // the bottom bin (slab_launch requires the same range).
+            if record[2] <= 0.0 || record[2] > 400.0 {
                 return Err(ComputeError::Message(
                     "spot energy outside the table range".into(),
                 ));
@@ -2044,8 +2046,12 @@ mod tests {
     #[test]
     fn patient_launch_rejects_bad_payloads() {
         fn request() -> PatientRequest {
+            // spots[2] is the energy — it must be inside the table range
+            // (0, 400] for later checks to be reached.
+            let mut spots = vec![0.0; 40];
+            spots[2] = 100.0;
             PatientRequest {
-                spots: vec![0.0; 40],
+                spots,
                 protons: vec![1.0],
                 // A real record — an all-zero one is itself invalid (smx/smy
                 // are shader divisors and a zero produces a NaN particle).

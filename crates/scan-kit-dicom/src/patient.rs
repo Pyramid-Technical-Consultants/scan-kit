@@ -360,7 +360,7 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
     let elems = parse_file(&bytes)?;
     // Wrong file kind — a CT or RTDOSE must not read as an empty ion plan.
     let sop = text_tag(&elems, tag(0x0008, 0x0016));
-    if !sop.contains("1.2.840.10008.5.1.4.1.1.481.8") {
+    if sop != "1.2.840.10008.5.1.4.1.1.481.8" {
         return Err("not an RT Ion Plan storage object".into());
     }
     let label = text_tag(&elems, tag(0x300A, 0x0002));
@@ -534,6 +534,9 @@ fn label_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> i32 {
 
 pub fn hu_density(hu: f32) -> f32 {
     let table = density_table();
+    if table.0.len() < 2 || !hu.is_finite() {
+        return 1e-6;
+    }
     let i = below(&table.0, hu).clamp(0, table.0.len() - 2);
     let (x0, x1) = (table.0[i], table.0[i + 1]);
     let (y0, y1) = (table.1[i], table.1[i + 1]);
@@ -547,6 +550,14 @@ pub fn hu_density(hu: f32) -> f32 {
 
 pub fn hu_label(hu: f32) -> i32 {
     let table = material_table();
+    if table.1.is_empty() {
+        return 0;
+    }
+    // below() maps NaN to the last index — the densest material. A
+    // non-finite voxel gets the lightest entry instead.
+    if !hu.is_finite() {
+        return table.1[0];
+    }
     let i = below(&table.0, hu).clamp(0, table.1.len() - 1);
     table.1[i]
 }
@@ -668,6 +679,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     ui(&mut structures, 0x0020, 0x0052, frame)?;
     let observation = {
         let mut item = Vec::new();
+        is(&mut item, 0x3006, 0x0082, 1)?;
         is(&mut item, 0x3006, 0x0084, 1)?;
         cs(&mut item, 0x3006, 0x00A4, "PTV")?;
         item
@@ -1051,7 +1063,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         {
             return Err(format!("beam {number} has no meterset"));
         }
-        let setup = int_tag(beam, tag(0x300C, 0x006A)).unwrap_or(1);
+        // An absent reference is only unambiguous when a single setup
+        // exists — guessing #1 mirrors the beam when there are several.
+        let setup = match int_tag(beam, tag(0x300C, 0x006A)) {
+            Some(setup) => setup,
+            None if setups.len() > 1 => {
+                return Err(format!("beam {number} has an ambiguous patient setup"));
+            }
+            None => 1,
+        };
         // The setup sequence is optional — but an unresolvable or empty
         // position cannot default to "HFS": the support matrix would mirror
         // the beam geometry of an FFS patient. With no setup sequence at
@@ -1069,6 +1089,13 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| format!("beam {number} has no patient position"))?
         };
+        // A beam position that disagrees with the CT's mirrors the support
+        // matrix against the volume — fail like the frame-of-reference rule.
+        if !ct_position.is_empty() && !position.eq_ignore_ascii_case(ct_position) {
+            return Err(format!(
+                "beam {number} is {position} but the CT is {ct_position}"
+            ));
+        }
         let mut shifter_ids = Vec::new();
         for item in seq(beam, tag(0x300A, 0x0314)) {
             let id = int_tag(item, tag(0x300A, 0x0316)).unwrap_or(0);
@@ -1095,10 +1122,16 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
         let control_points = seq(beam, tag(0x300A, 0x03A8));
-        // Cumulative Meterset Weight (300A,0134): element k is the beam's
-        // cumulative share through control point k — a spot-bearing CP's
-        // dose is its delta segment, not the whole beam.
-        let cums = floats_tag(beam, tag(0x300A, 0x0134));
+        // Cumulative Meterset Weight (300A,0134) is a per-item Type 2
+        // element (VM 1) on each control point — element k's value is the
+        // cumulative share through CP k. A spot-bearing CP's dose is the
+        // FORWARD segment cum[k+1] - cum[k] per C.8.8.25.7, not the whole
+        // beam, and not the backward delta (which hands the segment to the
+        // end-marker CP).
+        let cums: Vec<f32> = control_points
+            .iter()
+            .map(|cp| float_tag(cp, tag(0x300A, 0x0134)).unwrap_or(f32::NAN))
+            .collect();
         for (k, cp) in control_points.iter().enumerate() {
             // DS fields can carry "nan" — a non-finite value must not
             // replace the last good reading.
@@ -1241,17 +1274,12 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 let mu = if has_weights {
                     weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight
                 } else {
-                    // UNIFORM — this control point's cumulative-weight
-                    // segment divided evenly over its spots (PS3.3
-                    // C.8.8.25.7); the whole beam meterset went to every
-                    // spot-bearing CP otherwise. Missing sequence: split
-                    // the beam evenly across control points.
-                    let segment = cums.get(k).copied().unwrap_or(f32::NAN)
-                        - if k == 0 {
-                            0.0
-                        } else {
-                            cums.get(k - 1).copied().unwrap_or(f32::NAN)
-                        };
+                    // UNIFORM — the forward cumulative-weight segment
+                    // (this CP to the next) divided evenly over its spots;
+                    // the whole beam meterset went to every spot-bearing
+                    // CP otherwise. Missing tags: split evenly.
+                    let segment = cums.get(k + 1).copied().unwrap_or(f32::NAN)
+                        - cums.get(k).copied().unwrap_or(f32::NAN);
                     if segment.is_finite() && segment > 0.0 {
                         meterset * segment / final_weight / limit as f32
                     } else {
@@ -1260,9 +1288,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 };
                 let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);
                 let y = xy.get(i * 2 + 1).copied().unwrap_or(f32::NAN);
-                // A non-finite position or meterset reaches the transport
-                // and the plan CSV — reject it like a non-finite energy.
-                if mu.is_finite() && mu > 0.0 && x.is_finite() && y.is_finite() {
+                // A negative or non-finite weight is corrupt input — a
+                // silently dropped spot under-models the delivered dose.
+                // Zero weights are the legal end-of-segment marker.
+                if !mu.is_finite() || mu < 0.0 {
+                    return Err(format!("beam {number} carries a corrupt meterset weight"));
+                }
+                // A non-finite position reaches the transport and the plan
+                // CSV — skip it like a zero-weight marker.
+                if mu > 0.0 && x.is_finite() && y.is_finite() {
                     spots.push(Spot {
                         energy,
                         x,
@@ -1599,6 +1633,8 @@ fn parse_dataset(bytes: &[u8]) -> Result<Vec<Elem>, String> {
 
 fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Elem>, String> {
     let mut elems = Vec::new();
+    // HashSet lookup — a per-element linear scan is O(n^2) on crafted input.
+    let mut seen = std::collections::HashSet::new();
     let mut cursor = 0;
     while cursor + 8 <= bytes.len() {
         let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
@@ -1680,10 +1716,7 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
         } else {
             (Vec::new(), false)
         };
-        if elems
-            .iter()
-            .any(|held: &Elem| held.tag == tag(group, element))
-        {
+        if !seen.insert(tag(group, element)) {
             return Err(format!(
                 "duplicate tag ({group:04X},{element:04X}) in one dataset"
             ));
@@ -2026,9 +2059,10 @@ pub(crate) fn ds(
         .iter()
         .map(|value| {
             let plain = format!("{value:.6}");
-            // {:.6} collapses small magnitudes to "0.000000" - a declared
-            // zero geometry is worse than an exponential spelling.
-            if *value != 0.0 && plain.parse::<f64>() == Ok(0.0) {
+            // {:.6} collapses small magnitudes to "0.000000" and overflows
+            // the 16-char DS cap past |v| >= ~1e9 — the exponential
+            // spelling covers both.
+            if (*value != 0.0 && plain.parse::<f64>() == Ok(0.0)) || plain.len() > 16 {
                 format!("{value:.6e}")
             } else {
                 plain
@@ -2340,7 +2374,7 @@ pub fn write_rtdose(
         .chars()
         // LT permits only CR/LF/FF of the control bytes.
         .filter(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\x0C'))
-        .take(10240)
+        .take(10239)
         .map(|c| if c == '\\' { '/' } else { c })
         .collect();
     lt(&mut bytes, 0x0020, 0x4000, &comment)?;
@@ -3584,11 +3618,10 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::NAN]).is_err());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::INFINITY]).is_err());
-        // 1e10 formats to 18 chars — over the 16-byte DS limit.
-        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10]).is_err());
-        // The limit is per component — one overlong element is not
-        // diluted by short siblings.
-        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10, 1.5]).is_err());
+        // 1e10 formats to 18 chars plain — but "1.000000e10" is a legal
+        // 11-char DS, so it encodes.
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10]).is_ok());
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10, 1.5]).is_ok());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5, 2.5]).is_ok());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5]).is_ok());
     }

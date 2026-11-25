@@ -419,7 +419,14 @@ pub fn file_is_dicom(path: &Path) -> bool {
 }
 
 fn dicom_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
+    // Interior control bytes (charset escapes, CSI, newlines) must not
+    // reach reports or JSON verbatim — same strip as patient::text_of.
+    let bytes: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|byte| *byte >= 0x20 && *byte != 0x7F)
+        .collect();
+    String::from_utf8_lossy(&bytes)
         .trim_matches(|ch: char| ch == '\0' || ch.is_whitespace())
         .to_owned()
 }
@@ -456,9 +463,7 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
         if end > bytes.len() {
             break;
         }
-        let text = String::from_utf8_lossy(&bytes[start..end])
-            .trim_matches(|c: char| c == '\0' || c.is_whitespace())
-            .to_owned();
+        let text = dicom_text(&bytes[start..end]);
         match (group, element) {
             (0x0008, 0x0016) => sop_class = text,
             (0x0008, 0x0060) => modality = text,
@@ -515,7 +520,7 @@ fn looks_like_explicit_element(bytes: &[u8]) -> bool {
     ];
     const SHORT_VR: &[&[u8]] = &[
         b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FD", b"FL", b"IS", b"LO", b"LT", b"PN",
-        b"SH", b"SL", b"SS", b"ST", b"TM", b"UI", b"UL", b"US",
+        b"SH", b"SL", b"SS", b"ST", b"SV", b"TM", b"UI", b"UL", b"US", b"UV",
     ];
     let vr = &bytes[4..6];
     if !LONG_VR.contains(&vr) && !SHORT_VR.contains(&vr) {

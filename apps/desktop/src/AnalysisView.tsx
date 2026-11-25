@@ -461,7 +461,7 @@ export function AnalysisView({
   const [scanners, setScanners] = useState<{ label: string; folder: string }[]>([]);
   // gridTheme() runs DOM probes — memoize it instead of re-probing on
   // every poll-driven render.
-  const editorTheme = useMemo(gridTheme, []);
+  const editorTheme = useMemo(() => gridTheme(), []);
   const exportArgsRef = useRef({ studyPath, scanners, sessions, hidden, folder });
   useEffect(() => {
     exportArgsRef.current = { studyPath, scanners, sessions, hidden, folder };

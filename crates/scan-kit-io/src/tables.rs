@@ -19,7 +19,7 @@ use scan_kit_core::{
     remap_g3_raw_reversed, remove_mean, scale_column, sigma_error_pct,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Sheet {
     pub(crate) num: BTreeMap<String, Vec<f32>>,
     pub(crate) wide: BTreeMap<String, Vec<f64>>,
@@ -1545,14 +1545,14 @@ fn unit_seconds(unit: &str) -> Option<f64> {
 /// A wide clock column plus the factor that scales it into `unit`. A header
 /// carrying a different `(unit)` - `time_s(min)` - still resolves; one with a
 /// unit we cannot convert does not, instead of reading minutes as seconds.
-fn wide_clock<'a>(sheet: &'a Sheet, name: &str, unit: &str) -> Option<(&'a [f64], f64)> {
+pub(crate) fn wide_clock<'a>(sheet: &'a Sheet, name: &str, unit: &str) -> Option<(&'a [f64], f64)> {
     let key = wide_named(sheet, name)?;
     let factor = unit_seconds(header_unit(key).unwrap_or(unit))? / unit_seconds(unit)?;
     Some((sheet.wide.get(key)?.as_slice(), factor))
 }
 
 /// `wide_clock` for the f32 sheets.
-fn num_clock<'a>(sheet: &'a Sheet, name: &str, unit: &str) -> Option<(&'a [f32], f32)> {
+pub(crate) fn num_clock<'a>(sheet: &'a Sheet, name: &str, unit: &str) -> Option<(&'a [f32], f32)> {
     let key = num_named(sheet, name)?;
     let factor = unit_seconds(header_unit(key).unwrap_or(unit))? / unit_seconds(unit)?;
     Some((sheet.num.get(key)?.as_slice(), factor as f32))
