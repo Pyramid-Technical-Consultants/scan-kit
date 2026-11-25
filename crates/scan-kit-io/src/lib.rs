@@ -262,7 +262,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "db_path": { "type": "string" }
             },
             "required": ["path", "session_ids"],
@@ -308,7 +308,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "view": { "type": "string" },
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" }
             },
             "required": ["view", "path", "session_ids"],
@@ -325,7 +325,7 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "template": { "type": "string" },
                 "params": { "type": "object" },
                 "path": { "type": "string" },
-                "csv": { "type": "string" },
+                "csv": { "type": "string", "description": "Raw plan CSV starting with #NO,ENERGY(MeV)" },
                 "db_path": { "type": "string" }
             },
             // The csv+path write mode needs neither template nor params —
@@ -370,7 +370,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "source": { "type": "string" },
                 "dest": { "type": "string" },
-                "files": { "type": "array" },
+                "files": { "type": "array", "items": { "type": "object", "properties": { "rel": { "type": "string" }, "xml": { "type": "string" } }, "required": ["rel", "xml"] } },
                 "hide_unused": { "type": "boolean" },
                 "db_path": { "type": "string" }
             },
@@ -466,7 +466,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_runner_control" => json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string" }
+                "action": { "type": "string", "enum": ["start", "pause", "stop", "reset"] }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -474,7 +474,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_runner_download" => json!({
             "type": "object",
             "properties": {
-                "dest": { "type": "string" },
+                "dest": { "type": "string", "description": "A local .zip path" },
                 "db_path": { "type": "string" }
             },
             "required": ["dest"],
@@ -736,10 +736,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             config::save_folder(&db, Path::new(source), Path::new(dest), &files, hide)
                 .map_err(InvokeError::Message)
         }
-        "scan_kit_config_tune" => {
-            let db = database_path(input)?;
-            config::tune(input, &db).map_err(InvokeError::Message)
-        }
+        "scan_kit_config_tune" => config::tune(input).map_err(InvokeError::Message),
         "scan_kit_config_diff" => config::diff(input).map_err(InvokeError::Message),
         "scan_kit_config_integrity" => {
             let path = required_str(input, "path")?;
@@ -984,6 +981,13 @@ pub fn index_library(
     // covers the short DB sections only.
     let spec = data_dir.to_string_lossy();
     let (root, opened) = location::open_root(&spec)?;
+    let conn = &mut store::open_connection(db)?;
+    // A forget_data_dir that lands during the walk must not be resurrected
+    // by this index's commit — remember whether the root was registered
+    // before the scan started; first-time adds are absent at both reads.
+    let was_member = store::locked(|| data_dirs(conn))?
+        .iter()
+        .any(|dir| dir == &root);
     let found = match &opened {
         location::Opened::Local(path) => {
             discover::discover(path, &mut |done, total| keep(done, total, None))?
@@ -1007,7 +1011,6 @@ pub fn index_library(
             return Err("cancelled".into());
         }
     }
-    let conn = &mut store::open_connection(db)?;
     let places = found
         .entries
         .iter()
@@ -1036,6 +1039,11 @@ pub fn index_library(
         // ensure_library only — import_legacy/backfill read legacy JSON off
         // disk and must not hold the write lock while a share stalls.
         let lib_id = ensure_library(&tx, &root)?;
+        // A forget_data_dir that landed during the walk must not be
+        // re-registered by this commit — roll the whole sync back.
+        if was_member && !data_dirs(&tx)?.iter().any(|dir| dir == &root) {
+            return Err("cancelled".into());
+        }
         let ids = places
             .iter()
             .map(|(session_id, _)| session_id.clone())
@@ -1071,6 +1079,11 @@ pub fn index_library(
     // forget_data_dir on a peer connection cannot interleave between the
     // drop and the publish.
     store::locked(|| {
+        // Same race, second window: a forget between the commit and this
+        // publish must not repopulate bindings nothing will clear again.
+        if was_member && !data_dirs(conn)?.iter().any(|dir| dir == &root) {
+            return Err("cancelled".into());
+        }
         location::replace_sessions(&root, &places, !walk_failed);
         publish_catalog(conn)
     })?;

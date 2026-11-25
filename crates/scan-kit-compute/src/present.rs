@@ -41,13 +41,13 @@ pub fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "view": { "type": "string" },
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" },
-                "width": { "type": "integer" },
-                "height": { "type": "integer" },
-                "background": { "type": "array", "items": { "type": "number" } },
-                "foreground": { "type": "array", "items": { "type": "number" } },
-                "palette": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }
+                "width": { "type": "integer", "minimum": 1, "maximum": 8192 },
+                "height": { "type": "integer", "minimum": 1, "maximum": 8192 },
+                "background": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                "foreground": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                "palette": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 } }
             },
             "required": ["view", "path", "session_ids"],
             "additionalProperties": false
@@ -56,9 +56,9 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" },
-                "dest": { "type": "string" },
+                "dest": { "type": "string", "description": "An absolute .dcm write path" },
                 "description": { "type": "string" }
             },
             "required": ["path", "session_ids", "dest"],
@@ -68,9 +68,9 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" },
-                "dest": { "type": "string" }
+                "dest": { "type": "string", "description": "An absolute .pdf write path" }
             },
             "required": ["path", "session_ids", "dest"],
             "additionalProperties": false

@@ -155,9 +155,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         }
         // Swap: the old session is only retired now that the new one
         // survived the open phase.
-        if let Some(mut old) = guard.take() {
-            let _ = old.socket.close(None);
-        }
+        let old = guard.take();
         *guard = Some(Live {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
             host: host.clone(),
@@ -170,6 +168,13 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
             plan_path,
             poll_errors: 0,
         });
+        // The close frame can block on a half-dead peer — send it after the
+        // guard drops like disconnect/read_status do, or every serialized
+        // call stalls behind an unrelated connect.
+        drop(guard);
+        if let Some(mut old) = old {
+            let _ = old.socket.close(None);
+        }
     }
     let _ = with_store(db, |conn| store::set_runner_host(conn, &host));
     Ok(connected_body(

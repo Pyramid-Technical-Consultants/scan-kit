@@ -309,7 +309,9 @@ export function LibraryTable({
           before,
           after: newValue.data,
         }).then((ok) => {
-          if (ok === false) {
+          // Only clear the marker this commit left — a newer pending
+          // write to the same cell must survive a stale rejection.
+          if (ok === false && pendingNotes.current.get(key) === newValue.data) {
             pendingNotes.current.delete(key);
           }
         });

@@ -269,7 +269,7 @@ pub fn save_folder(
     }))
 }
 
-pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
+pub fn tune(input: &Value) -> Result<Value, String> {
     let workflow = text(input, "workflow")?;
     let mut xml = text(input, "xml")?.to_owned();
     if let Some(form) = input.get("form") {
@@ -1508,16 +1508,13 @@ mod tests {
         .unwrap();
         let xml = r#"<devices><ion_chamber><device name="IC_1_X"/><beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="1" K1="0" K2="0" K3="0"/></ion_chamber></devices>"#;
         let db = root.join("unused.sqlite");
-        let result = tune(
-            &json!({
-                "workflow": "sigma_tuning",
-                "xml": xml,
-                "data_dir": root.to_string_lossy(),
-                "session_ids": ["sess"],
-                "params": {}
-            }),
-            &db,
-        )
+        let result = tune(&json!({
+            "workflow": "sigma_tuning",
+            "xml": xml,
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+            "params": {}
+        }))
         .unwrap();
         assert_eq!(result["changed"], true);
         assert!(result["summary"].as_str().unwrap().contains("from sess"));
@@ -1552,16 +1549,13 @@ mod tests {
         )
         .unwrap();
         let xml = r#"<devices><ion_chamber><device name="IC_1_X"/><beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="1" K1="0" K2="0" K3="0"/></ion_chamber></devices>"#;
-        let result = tune(
-            &json!({
-                "workflow": "sigma_tuning",
-                "xml": xml,
-                "data_dir": root.to_string_lossy(),
-                "session_ids": ["sess"],
-                "params": {}
-            }),
-            &root.join("unused.sqlite"),
-        )
+        let result = tune(&json!({
+            "workflow": "sigma_tuning",
+            "xml": xml,
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+            "params": {}
+        }))
         .unwrap();
         let after = preview_number(&result, "IC_1", "70", 4);
         // raw 1.4 mm ×2 = 2.8 min; 1% headroom below it, then the ±20% band.
@@ -1602,16 +1596,13 @@ mod tests {
         let form = config_form(&xml).unwrap();
         assert!(form_has(&form, "IC 1 X", true));
 
-        let sigma = tune(
-            &json!({
-                "workflow": "sigma_tuning",
-                "xml": &xml,
-                "data_dir": logs.to_string_lossy(),
-                "session_ids": ["1093436476"],
-                "params": {}
-            }),
-            &db,
-        )
+        let sigma = tune(&json!({
+            "workflow": "sigma_tuning",
+            "xml": &xml,
+            "data_dir": logs.to_string_lossy(),
+            "session_ids": ["1093436476"],
+            "params": {}
+        }))
         .unwrap();
         assert_eq!(sigma["changed"], true, "{sigma}");
         let k0 = preview_number(&sigma, "IC_1", "179.5", 4);
@@ -1621,16 +1612,13 @@ mod tests {
         );
 
         for workflow in ["position_offset_tuning", "ic_distance_tuning", "kmu_tuning"] {
-            let result = tune(
-                &json!({
-                    "workflow": workflow,
-                    "xml": &xml,
-                    "data_dir": logs.to_string_lossy(),
-                    "session_ids": ["1093436476"],
-                    "params": {}
-                }),
-                &db,
-            )
+            let result = tune(&json!({
+                "workflow": workflow,
+                "xml": &xml,
+                "data_dir": logs.to_string_lossy(),
+                "session_ids": ["1093436476"],
+                "params": {}
+            }))
             .unwrap_or_else(|err| panic!("{workflow}: {err}"));
             assert_eq!(result["changed"], true, "{workflow}: {}", result["summary"]);
         }

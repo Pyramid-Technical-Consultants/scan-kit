@@ -1481,7 +1481,7 @@ fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
         stamps
             .iter()
             .map(|value| {
-                if ok(*value) {
+                if ok(*value) && plausible(*value) {
                     (*value - origin) as f32
                 } else {
                     f32::NAN
@@ -1524,7 +1524,9 @@ fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
     }
     if let Some((seconds, s_scale)) = wide_clock(spot, "time_s", "s") {
         if seconds.len() >= n {
-            let nanos = wide_clock(spot, "time_ns", "ns");
+            // A time_ns column shorter than time_s would silently quantize
+            // only the tail rows - fall back to uniform seconds.
+            let nanos = wide_clock(spot, "time_ns", "ns").filter(|(values, _)| values.len() >= n);
             let time: Vec<f64> = seconds
                 .iter()
                 .take(n)
@@ -2503,6 +2505,7 @@ fn build_slice_metric(
                 sheet,
                 &frames.map,
                 &frames.energies,
+                &frames.layers,
                 frames.layers.get(file_index).copied().unwrap_or(-1),
                 file_index,
             );
@@ -3599,6 +3602,7 @@ fn frame_energy(
     sheet: &Sheet,
     map: &Sheet,
     energies: &[f32],
+    layers: &[i64],
     layer_idx: i64,
     file_index: usize,
 ) -> f32 {
@@ -3606,7 +3610,15 @@ fn frame_energy(
         return tag;
     }
     let index = if layer_idx >= 0 {
-        layer_idx as usize
+        // The Nth delivered layer picks the Nth unique energy — folder
+        // numbers are not positional (1-indexed or non-contiguous).
+        let mut order: Vec<i64> = layers.to_vec();
+        order.sort_unstable();
+        order.dedup();
+        order
+            .iter()
+            .position(|layer| *layer == layer_idx)
+            .unwrap_or(usize::MAX)
     } else {
         file_index
     };
@@ -3629,9 +3641,10 @@ fn sheet_layer_energy(sheet: &Sheet, map: &Sheet) -> Option<f32> {
     let mut found = None;
     for (map_layer, energy) in map_layers.iter().zip(energies) {
         if map_layer.is_finite() && energy.is_finite() && *map_layer == layer {
-            // Two map rows claiming this layer is ambiguous - the folder
-            // index is the tiebreak the callers have always used.
-            if found.is_some() {
+            // Per-spot maps repeat the layer's energy per row - only a
+            // disagreeing second row is ambiguous and falls to the folder
+            // index.
+            if found.is_some_and(|have| !same(have, *energy)) {
                 return None;
             }
             found = Some(*energy);
@@ -3693,6 +3706,7 @@ fn signal_from(
                 sheet,
                 map,
                 energies,
+                layers,
                 layers.get(index).copied().unwrap_or(-1),
                 index,
             );
@@ -3742,6 +3756,7 @@ fn signal_from(
             sheet,
             map,
             energies,
+            layers,
             layers.get(index).copied().unwrap_or(-1),
             index,
         );
@@ -3867,6 +3882,7 @@ fn current_from(
             sheet,
             map,
             energies,
+            layers,
             layers.get(index).copied().unwrap_or(-1),
             index,
         );
@@ -4014,6 +4030,7 @@ fn current_ratio_from(
             sheet,
             map,
             energies,
+            layers,
             layers.get(index).copied().unwrap_or(-1),
             index,
         );
@@ -4130,14 +4147,20 @@ pub(crate) fn ic3_current(sheet: &Sheet) -> Vec<f32> {
         if sum.is_empty() {
             sum = values;
         } else {
-            for (slot, value) in sum.iter_mut().zip(values) {
+            // Parts shorter than the sum leave their tail a partial sum;
+            // a longer part's uncovered rows have no quadrant total.
+            sum.resize(sum.len().max(values.len()), f32::NAN);
+            for (slot, value) in sum.iter_mut().zip(&values) {
                 if value.is_finite() {
                     *slot = if slot.is_finite() {
                         *slot + value
                     } else {
-                        value
+                        *value
                     };
                 }
+            }
+            for slot in &mut sum[values.len()..] {
+                *slot = f32::NAN;
             }
         }
     }
@@ -4220,7 +4243,7 @@ fn unique_seen(values: &[f32]) -> Vec<f32> {
         if !value.is_finite() {
             continue;
         }
-        if out.last().is_some_and(|have| same(*have, *value)) {
+        if out.last().is_some_and(|have| *have == *value) {
             continue;
         }
         out.push(*value);
@@ -7124,7 +7147,10 @@ b,2
         let energies = unique_seen(&[70.0, 90.0, 90.0]);
         // Folder layer-2 has no third unique energy - the file's own
         // layer_id still finds its repainted 90.
-        assert_eq!(frame_energy(&sheet, &map, &energies, 2, 0), 90.0);
+        assert_eq!(
+            frame_energy(&sheet, &map, &energies, &[0, 1, 2], 2, 0),
+            90.0
+        );
         // An ambiguous map layer (two rows claim it) keeps the folder order.
         let ambiguous = Sheet {
             num: BTreeMap::from([
@@ -7139,7 +7165,10 @@ b,2
             wide: BTreeMap::new(),
             block: BTreeMap::new(),
         };
-        assert_eq!(frame_energy(&sheet, &ambiguous, &[180.0, 70.0], 1, 0), 70.0);
+        assert_eq!(
+            frame_energy(&sheet, &ambiguous, &[180.0, 70.0], &[0, 1], 1, 0),
+            70.0
+        );
     }
 
     #[test]

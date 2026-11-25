@@ -425,6 +425,24 @@ fn copy_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
     let _copy = copy_lock();
+    // A forget_data_dir or rescan can drop the binding between the caller's
+    // lookup and this copy - re-check under the copy lock so an orphaned
+    // session isn't re-downloaded into a cache nothing resolves. The
+    // archive-file case (library == session URL) has no map binding.
+    let bound = library_canonical == session_url
+        || sessions()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .any(|((root, _), place)| root == library_canonical && place == session_url)
+        || catalog()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .any(|row| row.library == library_canonical && row.place == session_url);
+    if !bound {
+        return Err("session binding was dropped".into());
+    }
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
     // Only plain relative segments may join the cache — a `..` escapes it, and
@@ -1909,7 +1927,15 @@ fn local_under_root(root: &str, path: &str) -> bool {
     let root = Path::new(root);
     // Strictly inside — the opened root itself is never a delete target
     // (a session marker at the library root would trash the library).
-    path != root && path.starts_with(root)
+    if path == root || !path.starts_with(root) {
+        return false;
+    }
+    // A spec routed through a symlinked ancestor inside the library resolves
+    // outside it at delete time - compare resolved paths when both exist.
+    if let (Ok(root), Ok(path)) = (fs::canonicalize(root), fs::canonicalize(path)) {
+        return path.starts_with(&root);
+    }
+    true
 }
 
 fn trash_path(path: &str) -> Result<(), String> {
