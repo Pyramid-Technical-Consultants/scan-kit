@@ -117,7 +117,14 @@ pub fn dvh_csv(curves: &[DvhCurve], effective: bool) -> Result<String, String> {
         let mut name = curve.name.replace([',', '\n', '\r', '"'], " ");
         // A leading formula char would evaluate when the CSV lands in a
         // spreadsheet — the ' prefix keeps the name legible and inert.
-        if name.starts_with(['=', '+', '-', '@']) {
+        // A leading tab/space lets `=…` still evaluate in a spreadsheet —
+        // check the first non-whitespace char, not just the literal first.
+        if name
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@'))
+        {
             name.insert(0, '\'');
         }
         out.push_str(&name);
@@ -155,28 +162,34 @@ fn wrap(text: &str, size: f32, width: f32) -> Vec<String> {
     let mut line = String::new();
     // Split over-long tokens by characters first - provenance text (UIDs,
     // digests, paths) has no spaces to wrap on and would run off the page.
-    let mut pieces: Vec<String> = Vec::new();
+    // bool: piece continues the previous one (char-split token) — it must
+    // re-join without the space a real word break inserts.
+    let mut pieces: Vec<(String, bool)> = Vec::new();
     for word in text.split(' ') {
         if text_width(word, size) <= width {
-            pieces.push(word.to_owned());
+            pieces.push((word.to_owned(), false));
             continue;
         }
         let mut chunk = String::new();
+        let mut continued = false;
         for c in word.chars() {
             let mut trial = chunk.clone();
             trial.push(c);
             if !chunk.is_empty() && text_width(&trial, size) > width {
-                pieces.push(std::mem::take(&mut chunk));
+                pieces.push((std::mem::take(&mut chunk), continued));
+                continued = true;
             }
             chunk.push(c);
         }
         if !chunk.is_empty() {
-            pieces.push(chunk);
+            pieces.push((chunk, continued));
         }
     }
-    for word in &pieces {
+    for (word, continued) in &pieces {
         let candidate = if line.is_empty() {
             word.clone()
+        } else if *continued {
+            format!("{line}{word}")
         } else {
             format!("{line} {word}")
         };
@@ -324,11 +337,23 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
                 let sum: f32 = natural.iter().sum();
                 let widths: Vec<f32> = natural.iter().map(|w| w * TEXT_W / sum).collect();
                 let mut x = MARGIN;
+                let mut head_height = ROW_H;
                 for (col, label) in head.iter().enumerate() {
-                    text(&mut ops, x + 4.0, y + 10.0, 9.0, Ink::Faint, label);
+                    let label_lines = wrap(label, 9.0, (widths[col] - 8.0).max(20.0));
+                    head_height = head_height.max(ROW_H * label_lines.len() as f32);
+                    for (line_no, line) in label_lines.iter().enumerate() {
+                        text(
+                            &mut ops,
+                            x + 4.0,
+                            y + 10.0 + line_no as f32 * ROW_H,
+                            9.0,
+                            Ink::Faint,
+                            line,
+                        );
+                    }
                     x += widths[col];
                 }
-                y += ROW_H;
+                y += head_height;
                 ops.push(Op::Rule { y });
                 for row in rows {
                     let mut x = MARGIN;

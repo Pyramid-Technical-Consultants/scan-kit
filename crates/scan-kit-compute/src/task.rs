@@ -1596,7 +1596,11 @@ fn panic_note(payload: &dyn std::any::Any) -> String {
 
 fn blank_result(job: &McJob) -> McResult {
     let (origin, shape, spacing) = match job {
-        McJob::Slab(request) => (request.origin, request.shape, [request.voxel_mm; 3]),
+        McJob::Slab(request) => (
+            request.origin,
+            request.shape,
+            [request.voxel_mm.max(0.25); 3],
+        ),
         McJob::Patient(request) => (
             request.origin_mm,
             request.shape,

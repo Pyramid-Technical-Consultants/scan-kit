@@ -1194,7 +1194,9 @@ pub fn file_uri_path(rest: &str) -> PathBuf {
         Some((host, path)) if !host.is_empty() => {
             // The client collapses `..` on the share - same rule as smb://.
             if path.split('/').any(|part| part == "..") {
-                return PathBuf::new();
+                // An empty path resolves to the cwd — emit a host that
+                // cannot resolve so callers error instead.
+                return PathBuf::from("\\\\file-uri-invalid\\..");
             }
             PathBuf::from(format!("\\\\{host}\\{}", path.replace('/', "\\")))
         }
@@ -1668,7 +1670,14 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                     // the local branch above does, so a remote `sess.zip`
                     // wrapping `other/` still counts as sess. The remote
                     // catalog discovers by filename stem the same way.
-                    if fs.stat(&format!("{base}/{name}"))?.is_some() {
+                    // Same discrimination as the local branch: the bare
+                    // id must be a dir, an archive name a file — a stray
+                    // `sess` file or `sess.zip` dir is not this session's
+                    // storage and must not be deleted.
+                    if fs
+                        .stat(&format!("{base}/{name}"))?
+                        .is_some_and(|stat| stat.dir == (*name == session_id))
+                    {
                         let rel = match base.strip_prefix(root_path) {
                             Some(rest) if rest.is_empty() || rest.starts_with('/') => {
                                 format!("{rest}/{name}")
@@ -1830,6 +1839,10 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                         // guard as materialize: only plain segments join.
                         let relative = relative_remote(root, &child);
                         let safe = !relative.is_empty()
+                            // Same guard as materialize — `a\b` is one
+                            // Normal component here but two path segments
+                            // in the local cache.
+                            && !relative.contains('\\')
                             && Path::new(&relative)
                                 .components()
                                 .all(|part| matches!(part, std::path::Component::Normal(_)));

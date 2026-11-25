@@ -335,7 +335,7 @@ pub(crate) fn finish_patient_report(
         &metrics,
         rbe,
         run.effective,
-        dvh_figure(&metrics)?,
+        dvh_figure(&metrics, run.effective)?,
         provenance,
     );
     let dest = Path::new(dest);
@@ -383,6 +383,7 @@ pub(crate) fn finish_patient_report(
 /// names each curve's color because the plot has no legend.
 fn dvh_figure(
     metrics: &scan_kit_io::patient_view::PatientMetrics,
+    effective: bool,
 ) -> Result<Option<scan_kit_io::report::Figure>, String> {
     const COLORS: &[([f32; 4], &str)] = &[
         ([0.12, 0.47, 0.71, 1.0], "blue"),
@@ -420,7 +421,12 @@ fn dvh_figure(
     scene.panels.push(scan_kit_core::Panel {
         title: "DVH".into(),
         y_label: "Volume (fraction)".into(),
-        x_label: "Dose (Gy(RBE))".into(),
+        x_label: if effective {
+            "Dose (Gy(RBE))".into()
+        } else {
+            // A physical-dose run reports Gy like its CSV and stats tables.
+            "Dose (Gy)".into()
+        },
         xmin: 0.0,
         xmax,
         ymin: 0.0,
@@ -579,7 +585,7 @@ mod tests {
             structures: Vec::new(),
             gamma: None,
         };
-        assert!(super::dvh_figure(&metrics).unwrap().is_none());
+        assert!(super::dvh_figure(&metrics, true).unwrap().is_none());
     }
 
     #[test]

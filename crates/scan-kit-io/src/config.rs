@@ -187,8 +187,10 @@ pub fn save_folder(
             let target = under(base, rel)?;
             let mut dir = target.parent();
             while dir.is_some_and(|d| d != base && d.starts_with(base)) {
-                if dir.is_some_and(|d| d.is_file()) {
-                    return Err(format!("{rel} sits under a file in the save"));
+                // A symlinked intermediate dir follows through to outside
+                // the tree — the same refusal the walkers carry.
+                if dir.is_some_and(|d| d.is_file() || d.is_symlink()) {
+                    return Err(format!("{rel} sits under a file or link in the save"));
                 }
                 dir = dir.and_then(|d| d.parent());
             }
@@ -302,7 +304,8 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
     if found.is_empty() {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
-    found.dedup();
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|id| seen.insert(id.clone()));
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
     if !params.is_object() {
         return Err("params must be an object".to_owned());
@@ -364,7 +367,8 @@ pub fn diff(input: &Value) -> Result<Value, String> {
     if found.is_empty() {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
-    found.dedup();
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|id| seen.insert(id.clone()));
     let base_root = diff_root(loaded_dir);
     let mut base_files = walk_files(&base_root)?;
     // The open file diffs its in-memory text (form edits applied) so pending
@@ -553,7 +557,22 @@ fn walk_files_at(
             ));
         }
         {
-            let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+            let bytes = {
+                use std::io::Read;
+                let mut file = fs::File::open(&path).map_err(|err| err.to_string())?;
+                let mut buf = Vec::new();
+                file.by_ref()
+                    .take(MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|err| err.to_string())?;
+                if buf.len() as u64 > MAX_FILE_BYTES {
+                    return Err(format!(
+                        "config file {} exceeds the file cap",
+                        path.display()
+                    ));
+                }
+                buf
+            };
             *total = total.saturating_add(bytes.len() as u64);
             if *total > MAX_WALK_BYTES {
                 return Err(format!(
@@ -953,10 +972,12 @@ fn session_config_dir(data_dir: &str, session_id: &str) -> Option<PathBuf> {
     if data_dir.is_empty() || session_id.is_empty() {
         return None;
     }
-    let dir = discover::session_directory(Path::new(data_dir), session_id)
-        .join("config")
-        .join("map2map");
-    (dir.is_dir() && !dir.is_symlink()).then_some(dir)
+    let session = discover::session_directory(Path::new(data_dir), session_id);
+    let dir = session.join("config").join("map2map");
+    // Same refusal diff applies — a link at config/ or the session dir
+    // would serve files outside the session tree.
+    let linked = dir.ancestors().take(2).any(|a| a.is_symlink()) || session.is_symlink();
+    (dir.is_dir() && !linked).then_some(dir)
 }
 
 fn session_present(root: &Path, session_id: &str) -> bool {

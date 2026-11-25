@@ -536,7 +536,8 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             if beam < 0.0 || beam.fract() != 0.0 || beam as usize >= request.beams.len() / 16 {
                 return Err(ComputeError::Message("spot beam index out of range".into()));
             }
-            // spots[32..35] = range shifter (lo, material, rho); a shifted
+            // spots[32..35] = range shifter (thickness, exit, material,
+            // rho); a shifted
             // spot's material indexes mc_tables().media like slab_launch's.
             if record[32] < 0.0 || record[33] < 0.0 {
                 return Err(ComputeError::Message(
@@ -926,6 +927,11 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
 impl Live {
     fn report(&self, preview: bool) -> Report {
         let uncertainty = self.cached_uncertainty;
+        // `next` counts submitted histories — the bar used to run up to
+        // MAX_INFLIGHT chunks ahead of GPU truth.
+        let done = self
+            .next
+            .saturating_sub(self.inflight.len() as u32 * self.per_batch);
         Report {
             task: 0,
             generation: 0,
@@ -934,9 +940,9 @@ impl Live {
             } else {
                 Phase::Compute
             },
-            done: u64::from(self.next),
+            done: u64::from(done),
             total: u64::from(self.histories),
-            note: history_note(self.next, self.histories, uncertainty),
+            note: history_note(done, self.histories, uncertainty),
         }
     }
 
@@ -1296,7 +1302,9 @@ impl Live {
             match ticket.receiver.try_recv() {
                 Ok(result) => {
                     if let Err(err) = result {
-                        gpu_lost(&self.gpu);
+                        // A failed map is not proof of device loss — same
+                        // policy the preview path uses; the wait probes
+                        // diagnose a real wedge instead.
                         return Err(ComputeError::Message(err.to_string()));
                     }
                     self.gpu
