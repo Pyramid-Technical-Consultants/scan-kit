@@ -355,7 +355,9 @@ pub fn session_zip_dest(dest: &str) -> Option<String> {
     // A bare filename resolves against the process CWD - a saved session
     // must name a real directory or the file lands where nobody looks.
     // Both separator spellings count; Path::parent would read a Windows
-    // path as one filename on a Unix build.
+    // path as one filename on a Unix build. The absolute gate is host
+    // semantics on purpose: `D:/out` is CWD-relative on a Unix host, and
+    // accepting it would write exactly the ambient-CWD file this refuses.
     let no_dir = !dest.contains('/') && !dest.contains('\\');
     if dest.is_empty()
         || dest.starts_with("/root/")
@@ -523,10 +525,13 @@ mod tests {
             &json!({POINTS_VALID: true, READY_PERMIT: false, READY_PERMIT_REASON: ["Door open", 1.0]})
         )
         .contains("Door open"));
+        #[cfg(windows)]
         assert_eq!(
             session_zip_dest(r"C:\data\abc.zip").unwrap(),
             r"C:\data\abc.zip"
         );
+        #[cfg(not(windows))]
+        assert_eq!(session_zip_dest("/data/abc.zip").unwrap(), "/data/abc.zip");
         assert!(session_zip_dest("/root/reports/session/abc").is_none());
         assert!(session_zip_dest(r"C:\data\abc").is_none());
         assert_eq!(default_session_zip_path("", "", ""), "session.zip");
@@ -553,7 +558,12 @@ mod tests {
         // "session.zip" resolves against the process CWD - the saved file
         // must name a real directory.
         assert!(session_zip_dest("session.zip").is_none());
+        // The positive case is host-absolute: a drive path on Windows, a
+        // root path elsewhere — `D:/out` is CWD-relative on a Unix host.
+        #[cfg(windows)]
         assert!(session_zip_dest("D:/out/session.zip").is_some());
+        #[cfg(not(windows))]
+        assert!(session_zip_dest("/out/session.zip").is_some());
     }
 
     #[test]
