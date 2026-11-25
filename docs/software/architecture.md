@@ -37,6 +37,8 @@ Tools:
 - `scan_kit_health`, workflow, calls the version function and reports that the catalog is non-empty
 - `scan_kit_about`, granular, returns the About dialog text and the workspace version
 - `scan_kit_open_library`, workflow, discovers a local data folder, syncs the sqlite index, and returns the session rows
+- `scan_kit_data_dirs` and `scan_kit_read_catalog`, granular, the remembered folders and the published catalog rows
+- `scan_kit_forget_data_dir`, granular, removes a remembered folder and its rows
 - `scan_kit_set_note` and `scan_kit_select_sessions`, granular
 - `scan_kit_load_columns`, granular, returns requested columns after alias resolution and the G2 current scale
 - `scan_kit_load_timeslice` and `scan_kit_channel_catalog`, granular
@@ -46,7 +48,7 @@ Tools:
 - `scan_kit_open_study` and `scan_kit_clinical_goal`, the DICOM study index and a dose-volume goal
 - `scan_kit_plan_catalog`, granular, lists the four plan templates and their parameter specs
 - `scan_kit_synthesize_plan`, workflow, builds an input map CSV from one of those templates
-- `scan_kit_config_catalog`, granular, lists the four configuration tuners and the remembered config folder
+- `scan_kit_config_catalog`, granular, lists the four configuration tuners plus the config-diff workflow, and the remembered config folder
 - `scan_kit_config_open`, `scan_kit_config_form`, and `scan_kit_config_apply`, granular, browse a config folder and edit its XML through a form
 - `scan_kit_config_save`, workflow, writes the folder and refreshes Pyramid `.md5` sidecars
 - `scan_kit_config_tune`, workflow, updates devices.xml from the selected sessions
@@ -56,6 +58,8 @@ Tools:
 - `scan_kit_runner_catalog` and `scan_kit_runner_status`, granular, the Plan Runner operator view
 - `scan_kit_runner_connect`, `scan_kit_runner_upload`, `scan_kit_runner_control`, and `scan_kit_runner_download`, workflow, the live RCI session
 - `scan_kit_runner_disconnect` and `scan_kit_runner_remember`, granular
+- `scan_kit_discover_subnet` and `scan_kit_scanners`, granular, RCI device discovery and the scanner list
+- `scan_kit_write_dose` and `scan_kit_write_report`, workflow, export the recalculated dose as RTDOSE and the study summary as PDF + DVH CSV
 
 Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run -p scan-kit-mcp --quiet` on stdio). `npm run tauri build` also places that release binary beside the desktop executable, so an installed Scan Kit can serve an agent without a Rust toolchain.
 
@@ -79,7 +83,7 @@ Chrome uses shadcn semantic tokens (`bg-background`, `text-foreground`, `bg-card
 
 Tabular data, including the session list and Session Log Compare, is drawn by [Glide Data Grid](https://grid.glideapps.com/). The grid theme is filled from the stock tokens (background, card, foreground, muted foreground, border, accent, and the Geist font). Those tokens are not edited. A DOM table, including a shadcn Table, is not used for data.
 
-The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Volumetric can open a DICOM folder through `scan_kit_open_study`.
+The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_start`, and the webview polls `scan_kit_poll`, which returns a progress report and, when the slice produced one, a binary payload: a JSON header (controls, table, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Volumetric can open a DICOM folder through `scan_kit_open_study`.
 
 A plotted series contains every sample that passed the view's filters. Nothing drops rows before the camera exists: no fixed stride, bucket count, or point cap on a line or a scatter. Histograms, contours, and spectra still reduce the samples, and they count every sample that passed the filter. The renderer may later simplify a stroke for the current camera when several samples fall in one pixel. That simplification keeps the extrema in the pixel, and a camera that gives a sample its own pixel draws the sample. Zoom and pan stay in the webview, so a thinned payload can never grow back.
 

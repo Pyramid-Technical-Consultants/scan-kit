@@ -587,7 +587,12 @@ pub fn mip_xy(grid: &[f32], shape: [usize; 3]) -> Vec<f32> {
     if grid.len() < nx.saturating_mul(ny).saturating_mul(nz) {
         return image;
     }
-    for z in 0..nz {
+    // Seed from the z=0 slice — a zero seed would floor an all-negative
+    // grid's true maximum.
+    if nz > 0 {
+        image.copy_from_slice(&grid[..pixels]);
+    }
+    for z in 1..nz {
         for y in 0..ny {
             for x in 0..nx {
                 let value = grid[x + nx * (y + ny * z)];

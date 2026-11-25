@@ -443,7 +443,16 @@ impl ServerHandler for ScanKit {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let effects = std::env::args().any(|arg| arg == "--allow-effects");
+    let mut effects = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--allow-effects" => effects = true,
+            _ => {
+                eprintln!("unknown argument {arg}; usage: scan-kit-mcp [--allow-effects]");
+                std::process::exit(2);
+            }
+        }
+    }
     // Init the memoized catalog now — a duplicate tool name must fail at
     // startup, not inside a spawned handler task rmcp never joins.
     catalog_specs();

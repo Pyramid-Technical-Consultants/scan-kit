@@ -287,6 +287,17 @@ pub fn read_mhd(path: &Path) -> Result<([usize; 3], Vec<f64>), String> {
     if dims.len() != 3 {
         return Err(format!("{path:?}: DimSize {dims:?}"));
     }
+    if head.get("ElementByteOrderMSB").is_some_and(|v| v == "True") {
+        return Err(format!("{path:?}: ElementByteOrderMSB unsupported"));
+    }
+    match head.get("CompressedData").map(String::as_str) {
+        Some("False") | None => {}
+        other => return Err(format!("{path:?}: CompressedData {other:?}")),
+    }
+    match head.get("HeaderSize").map(String::as_str) {
+        None | Some("0") => {}
+        other => return Err(format!("{path:?}: HeaderSize {other:?}")),
+    }
     let raw_path = path
         .parent()
         .unwrap_or(path)

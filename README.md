@@ -162,7 +162,7 @@ launcher tab and analysis view. To regenerate:
 2. Capture all shots (fixture sessions under `test_data\logs`):
 
    ```cmd
-   npm run capture:screenshots -- --exe ..\..\target\release\scan-kit-desktop.exe
+   npm run screenshots -- --exe ..\..\target\release\scan-kit-desktop.exe
    ```
 
 3. Review `docs\images\` and commit the updated PNGs.
@@ -196,12 +196,12 @@ SFTP uses SSH keys or the agent first. If those fail, Scan Kit prompts for a pas
 
 ### 2. Select sessions
 
-The session table shows **Use**, **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**. Selected rows get a plot-color swatch so overlays match the views.
+The session table shows **Use**, **Session ID**, **Date**, **MU**, **Ext.**, **Lyr.**, **Time**, **RM**, **Config**, and **Note**. Selected rows get a plot-color swatch so overlays match the views.
 
-- Sort by **Date** (newest first), **ID**, **Config**, or **MU**
+- Sort by any column (Date defaults to newest first)
 - Tick **Use** on up to **five** sessions; no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin...** (or **Delete from remote host...**), or **Open in Config Tuning...** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Select/Deselect Rows**, **Move to Recycle Bin...** (or **Delete from remote host...**), or **Open in Config Tuning...** when a config folder is available
 
 Remote deletes are permanent (no recycle bin on the host). Local sessions go to the OS Recycle Bin / trash and can be restored from there.
 
@@ -232,11 +232,9 @@ For position scatter, position-error outliers, beam-on/off IC current histograms
 
 ### Volumetric
 
-The left side is a 2×3 grid. Drag the gaps to resize a row or that row's two cells. The grid starts with the axial slice and the 3D volume, then the coronal and sagittal slices, then two plots. The picker in the top right corner of each cell sets what it shows, independently of the others: two cells can show the same plane. There is one 3D view, so picking it in a cell hands the old cell that cell's plane. The dose grid is uploaded once; paging, rotating, and orbiting stay in the view. A loaded planning CT draws on this same grid, with the CT under the dose wash and structure outlines, and the two plots start as a DVH and a gamma histogram. Each view's own settings sit in its header, left of the picker. A slice can turn a quarter turn (**⟲ 90°**) or show the whole volume summed through the plane (**∫**) instead of one slice. The 3D view sets whether a ray integrates, keeps its maximum or fades, and nearest, linear or cubic sampling. Slices have mm axes in the frame's coordinates, a box around the grid, and their own color bar. They take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel. A summed slice scales to its own range, in Gy·mm. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam from the grid edge, **Lateral profile** across the beam and **Longitudinal profile** along it through the crosshair, **Lateral + longitudinal** together, **DVH**, or **Gamma histogram**. A profile's **∫** sums the dose over each plane across the line, in Gy·mm², so a depth dose becomes an integrated depth dose. There are no modes to switch. Two settings pick what runs: **Compare → Plan** and **Phantom → Medium**.
-- **Session log** measures the logged spots against the session's own plan spots in a phantom. The Sessions section below covers it.
-- **DICOM plan** runs the loaded study's RT Ion Plan, and its matched logged fractions, through the Monte Carlo.
-- **Medium** picks where the beam goes: a uniform phantom, or the study's **Planning CT**. Loading a study with a plan selects the planning CT.
-- A DICOM plan also runs in a water, plastic or metal phantom: a cube centred on the first beam's isocenter. Its side is **Thickness**, or 300 mm on Auto; its voxels are **Voxel**, but no smaller than 2 mm. Picking a phantom after the CT goes back to **Session log**, so pick **DICOM plan** again for this crossover.
+The left side is a 2×3 grid. Drag the gaps to resize a row or that row's two cells. The grid starts with the axial slice and the 3D volume, then the coronal and sagittal slices, then two plots. The picker in the top right corner of each cell sets what it shows, independently of the others: two cells can show the same plane. There is one 3D view, so picking it in a cell hands the old cell that cell's plane. The dose grid is uploaded once; paging, rotating, and orbiting stay in the view. A loaded planning CT draws on this same grid, with the CT under the dose wash and structure outlines, and the two plots start as a DVH and a gamma histogram. Each view's own settings sit in its header, left of the picker. A slice can turn a quarter turn (**⟲ 90°**) or show the whole volume summed through the plane (**∫**) instead of one slice. The 3D view sets whether a ray integrates, keeps its maximum or fades, and nearest, linear or cubic sampling. Slices have mm axes in the frame's coordinates, a box around the grid, and their own color bar. They take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel. A summed slice scales to its own range, in Gy·mm. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam from the grid edge, **Lateral profile** across the beam and **Longitudinal profile** along it through the crosshair, **Lateral + longitudinal** together, **DVH**, or **Gamma histogram**. A profile's **∫** sums the dose over each plane across the line, in Gy·mm², so a depth dose becomes an integrated depth dose. There are no modes to switch; what runs follows from what is loaded.
+- **Session log** (no study loaded) measures the logged spots against the session's own plan spots in a uniform phantom. The Sessions section below covers it.
+- A loaded study runs its RT Ion Plan, and its matched logged fractions, through the Monte Carlo on the planning CT — there is no uniform-phantom crossover for a DICOM plan.
 - Structures, gamma against the TPS, clinical goals and export need the CT, so they are shown only there.
 - The panel shows only the controls for what is running. **Histories**, **Display**, **Gamma** criteria and **Color** are shared.
 
@@ -264,11 +262,11 @@ The sessions selected in the launcher are the logged deliveries:
 - Sessions group into fractions in log order: a new fraction starts when a beam repeats. **Fraction** picks one fraction or their sum, and **Beams** narrows to one field.
 - The Study panel lists each beam's delivered-to-planned MU and spot position RMS.
 
-**Dose** in the Study group picks the planned recalculation or the delivered dose. **Show** then draws that dose, delivered minus planned, or gamma against the TPS dose, on the slices and in the 3D volume. Gamma is global, normalized to the TPS maximum, and compares one fraction of the TPS dose with one fraction of the selected delivery. The shared **Gamma** criteria set it. Shown and gamma-evaluated dose is limited to the patient (above −900 HU), because dose in air voxels is noisy.
+**Dose** in the Study group picks the planned recalculation or the delivered dose. **Show** then draws that dose, delivered minus planned, or gamma against the TPS dose, on the slices and in the 3D volume. Gamma is global, normalized to the TPS maximum, and compares one fraction of the TPS dose with one fraction of the selected delivery. The shared **Gamma** criteria set it.
 
 DVHs (the picked dose bright, the other faded) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
 
-**RBE** weights the shown dose, DVHs, and clinical goals by 1.0 or 1.1. Gamma against the TPS stays on physical dose.
+**RBE** weights the shown dose, DVHs, and clinical goals by 1.0, 1.1, or a variable model (McNamara 2015, Wedenberg 2013, Carabe 2012, Unkelbach 2016) with an (α/β)x parameter. Gamma against the TPS stays on physical dose where the TPS dose is physical.
 
 **Export report** writes the study table (frame, beams, uncertainty, clinical goals, and the gamma pass rate) as a PDF, and writes the DVH curves to a CSV beside it. **Export dose** writes the recalculated dose as an RTDOSE.
 

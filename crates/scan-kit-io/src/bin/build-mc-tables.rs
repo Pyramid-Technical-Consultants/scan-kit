@@ -202,7 +202,16 @@ struct Props {
     components: Vec<(String, f64)>,
 }
 
+// Names come from data files and join under Materials/ — no separators.
+fn member_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains(['/', '\\']) || name.split('.').all(|p| p.is_empty()) {
+        return Err(format!("bad material name {name:?}"));
+    }
+    Ok(())
+}
+
 fn read_properties(materials: &Path, name: &str) -> Result<Props, String> {
+    member_name(name)?;
     let mut p = Props {
         name: name.to_string(),
         ..Default::default()
@@ -243,6 +252,7 @@ fn read_properties(materials: &Path, name: &str) -> Result<Props, String> {
 }
 
 fn read_stop_pow(materials: &Path, name: &str) -> Result<Vec<f64>, String> {
+    member_name(name)?;
     let path = materials.join(name).join("G4_Stop_Pow.dat");
     let text = fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
     let mut rows: Vec<(f64, f64)> = Vec::new();
@@ -325,6 +335,11 @@ fn read_elastic(
     if !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(format!("{name}: elastic energies are not ascending"));
     }
+    if energies.len() < 2 {
+        return Err(format!(
+            "{name}: elastic table needs at least 2 energy rows"
+        ));
+    }
     Ok((energies, sigma, cdfs))
 }
 
@@ -393,7 +408,11 @@ fn read_inelastic(materials: &Path, name: &str, a: f64) -> Result<Vec<InelasticR
                             t.get(1).map_or("<missing>", String::as_str)
                         )
                     })?;
-                let n: usize = t.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let n: usize = t
+                    .get(2)
+                    .ok_or_else(|| format!("{name}: missing cross-section row count"))?
+                    .parse()
+                    .map_err(|_| format!("{name}: bad cross-section row count"))?;
                 let mut e = Vec::with_capacity(n);
                 let mut d = Vec::with_capacity(n);
                 let mut dd = Vec::with_capacity(n);
@@ -448,6 +467,9 @@ fn pp(e: f64) -> f64 {
 
 /// Largest i clamped to [0, len-2] then lerp (ICRU single element).
 fn icru_clamped(e_grid: &[f64], s_grid: &[f64], e: f64) -> f64 {
+    if e_grid.len() < 2 {
+        return s_grid.first().copied().unwrap_or(0.0);
+    }
     let k = (binary_search(e, e_grid).max(0) as usize).min(e_grid.len().saturating_sub(2));
     lerp(e, e_grid[k], e_grid[k + 1], s_grid[k], s_grid[k + 1])
 }

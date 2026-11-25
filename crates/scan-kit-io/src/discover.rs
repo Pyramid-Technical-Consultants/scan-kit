@@ -840,8 +840,8 @@ fn walk_files(
 ) {
     // The archive branch caps members and the aggregate; a local session tree
     // is the same trust boundary — bound both before the bytes land.
-    // ponytail: a tree over the cap drops the rest silently (the archive path
-    // errors instead) — a tail-truncated session still parses as complete.
+    // ponytail: a tree over the cap drops the rest silently, and the archive
+    // readers do the same — a tail-truncated session still parses as complete.
     let mut total = 0u64;
     let mut failed = false;
     visit_files(
@@ -1120,7 +1120,13 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
             continue;
         };
         total = total.saturating_add(bytes.len() as u64);
-        out.push((name.clone(), bytes));
+        // A writer updating in place can carry the member twice — last wins,
+        // like extraction semantics.
+        if let Some((_, have)) = out.iter_mut().find(|(have, _)| *have == name) {
+            *have = bytes;
+        } else {
+            out.push((name, bytes));
+        }
     }
     Ok((out, roots))
 }
@@ -1138,7 +1144,7 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
         Box::new(file)
     };
     let mut archive = tar::Archive::new(decoder);
-    let mut out = Vec::new();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     let mut roots = std::collections::BTreeSet::new();
     let mut total = 0u64;
     let entries = archive.entries().map_err(|err| err.to_string())?;
@@ -1149,7 +1155,8 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
         let Ok(mut entry) = entry else {
             break;
         };
-        if !entry.header().entry_type().is_file() {
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && kind != tar::EntryType::Link {
             continue;
         }
         let Ok(path) = entry.path() else {
@@ -1162,6 +1169,21 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
         if !want(&name) {
             continue;
         }
+        // A hardlink member carries no bytes — clone the linked target's.
+        // GNU tar writes the target first, so it is already in `out`.
+        if kind == tar::EntryType::Link {
+            let target = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some((_, bytes)) = out.iter().find(|(n, _)| *n == target) {
+                let bytes = bytes.clone();
+                out.push((name, bytes));
+            }
+            continue;
+        }
         // A mid-entry read failure can leave the tar stream desynced —
         // keep what was read and stop rather than drop the whole archive.
         let Ok(bytes) = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))
@@ -1169,7 +1191,11 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
             break;
         };
         total = total.saturating_add(bytes.len() as u64);
-        out.push((name.clone(), bytes));
+        if let Some((_, have)) = out.iter_mut().find(|(have, _)| *have == name) {
+            *have = bytes;
+        } else {
+            out.push((name, bytes));
+        }
     }
     Ok((out, roots))
 }

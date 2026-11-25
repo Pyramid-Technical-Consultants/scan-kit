@@ -2,9 +2,9 @@
 
 This is the engineering design for keeping the desktop responsive while session parses and GPU work finish. The crate rules in [architecture.md](architecture.md) still apply.
 
-## What is slow today
+## What was slow
 
-`scan_kit_open_plot` builds the whole scene on one blocking thread and returns one payload. The webview drops a late response with `openSeq`, but the work still runs to the end. Monte Carlo in `scan-kit-compute` waits until every history is folded. The retired Python `McRun` did the useful version of this: `step(budget)` queues a slice and returns while the GPU runs it, `preview` reads the mean dose so far, `extend` keeps the tallies, and the next slice grows or shrinks from how long the last wait blocked the caller. A sliced run matches a one-shot run because the tallies are integers and the fold gain is `1 / histories`.
+This section is the historical motivation; the task model below has landed. `scan_kit_open_plot` used to build the whole scene on one blocking thread and return one payload, with the work running to the end even when the webview dropped the late response. Monte Carlo in `scan-kit-compute` waited until every history was folded. The retired Python `McRun` did the useful version of this: `step(budget)` queues a slice and returns while the GPU runs it, `preview` reads the mean dose so far, `extend` keeps the tallies, and the next slice grows or shrinks from how long the last wait blocked the caller. A sliced run matches a one-shot run because the tallies are integers and the fold gain is `1 / histories`.
 
 ## What this is
 
@@ -126,13 +126,13 @@ Three commands, shared by every view:
 - `scan_kit_poll(task) -> report, and a payload when this slice produced one`
 - `scan_kit_cancel(task)`
 
-`poll` is `spawn_blocking` around one `stage.poll(12ms)`. The webview calls it while the task is open and paints between calls, so a wheel or a source change is not stuck behind a parse. `scan_kit_open_plot` remains the drain of that task until the desktop hook replaces the call sites. After that it can stay as the one-shot helper for tests.
+`poll` is `spawn_blocking` around one `stage.poll(12ms)`. The webview calls it while the task is open and paints between calls, so a wheel or a source change is not stuck behind a parse. The desktop call sites are wired (`task-client.ts`), and `scan_kit_run_view` stays the one-shot drain for MCP and tests.
 
 MCP does not grow a status tool. `scan_kit_run_view` polls with an unlimited budget until `Ready` or `Failed` and returns the final frame, as it does now.
 
 ## Faces
 
-One hook, `useTask`, owns start, poll, cancel, and the generation check. A view only chooses how to draw the `Report`. It does not compute a fraction.
+The `driveTask` helper in `task-client.ts` owns start, poll, cancel, and the generation check. A view only chooses how to draw the `Report`. It does not compute a fraction.
 
 | View | First paint | Later slices | Face |
 |---|---|---|---|

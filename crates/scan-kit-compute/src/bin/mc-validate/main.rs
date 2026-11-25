@@ -84,8 +84,10 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or("--golden-primaries needs a value")?
                     .parse()
                     .map_err(|_| "bad --golden-primaries")?;
-                if !value.is_finite() || value <= 0.0 {
-                    return Err("--golden-primaries must be a positive number".into());
+                if !value.is_finite() || value <= 0.0 || value > i64::MAX as f64 {
+                    return Err(
+                        "--golden-primaries must be a positive number under i64::MAX".into(),
+                    );
                 }
                 args.golden_primaries = value;
             }
@@ -369,7 +371,7 @@ fn main_slab(args: &Args) -> Result<i32, String> {
     }
 
     println!(
-        "{} suite: GPU {:.0e} histories per case against cached MCsquare\n",
+        "{} suite: GPU {:.0e} base histories (scaled per case) against cached MCsquare\n",
         args.suite, histories
     );
     println!(
@@ -491,7 +493,7 @@ fn main_patient(args: &Args) -> Result<i32, String> {
         println!();
     }
 
-    println!("patient suite: GPU {histories:.0e} histories per case against cached MCsquare\n");
+    println!("patient suite: GPU {histories:.0e} base histories (scaled per case) against cached MCsquare\n");
     println!(
         "{:24} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}  GPU s",
         "case", "gamma", "Dmean", "D95", "D2", "LETd", "Dtot", "closure"

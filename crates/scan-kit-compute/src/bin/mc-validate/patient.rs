@@ -214,6 +214,10 @@ pub fn write_plan(path: &Path, name: &str, fields: &[PlanField]) -> Result<(), S
 
 /// Fields of an MCsquare Plan.txt, as [`write_plan`] writes them (rs_wet 0
 /// when the shifter is out).
+fn parse_num(nxt: &str, key: &str) -> Result<f64, String> {
+    nxt.parse().map_err(|_| format!("bad {key}: {nxt:?}"))
+}
+
 pub fn read_plan(path: &Path) -> Result<Vec<PlanField>, String> {
     let lines: Vec<String> = fs::read_to_string(path)
         .map_err(|err| format!("{path:?}: {err}"))?
@@ -242,21 +246,23 @@ pub fn read_plan(path: &Path) -> Result<Vec<PlanField>, String> {
             });
         } else if key == "###GantryAngle" {
             if let Some(f) = field.as_mut() {
-                f.gantry = nxt.parse().unwrap_or(0.0);
+                f.gantry = parse_num(nxt, key)?;
             }
         } else if key == "###PatientSupportAngle" {
             if let Some(f) = field.as_mut() {
-                f.couch = nxt.parse().unwrap_or(0.0);
+                f.couch = parse_num(nxt, key)?;
             }
         } else if key == "###IsocenterPosition" {
-            let v: Vec<f64> = nxt
-                .split_whitespace()
-                .map(|s| s.parse().unwrap_or(0.0))
-                .collect();
-            if v.len() == 3 {
-                if let Some(f) = field.as_mut() {
-                    f.iso = [v[0], v[1], v[2]];
-                }
+            let v: Vec<&str> = nxt.split_whitespace().collect();
+            if v.len() != 3 {
+                return Err(format!("bad {key}: {nxt:?}"));
+            }
+            if let Some(f) = field.as_mut() {
+                f.iso = [
+                    parse_num(v[0], key)?,
+                    parse_num(v[1], key)?,
+                    parse_num(v[2], key)?,
+                ];
             }
         } else if key == "###RangeShifterID" {
             if let Some(f) = field.as_mut() {
@@ -269,7 +275,7 @@ pub fn read_plan(path: &Path) -> Result<Vec<PlanField>, String> {
             });
         } else if key.starts_with("####Energy") {
             if let Some(ly) = layers.last_mut() {
-                ly.energy = nxt.parse().unwrap_or(0.0);
+                ly.energy = parse_num(nxt, key)?;
             }
         } else if key == "####RangeShifterSetting" {
             if let Some(ly) = layers.last_mut() {
@@ -281,23 +287,25 @@ pub fn read_plan(path: &Path) -> Result<Vec<PlanField>, String> {
             }
         } else if key == "####RangeShifterWaterEquivalentThickness" {
             if let Some(ly) = layers.last_mut() {
-                ly.rs_wet = nxt.parse().unwrap_or(0.0);
+                ly.rs_wet = parse_num(nxt, key)?;
             }
         } else if key == "####NbOfScannedSpots" {
-            n_spots = nxt.parse().unwrap_or(0);
+            n_spots = nxt.parse().map_err(|_| format!("bad {key}: {nxt:?}"))?;
         } else if key.starts_with("####X") {
             if let Some(ly) = layers.last_mut() {
                 for k in 0..n_spots {
-                    if let Some(row) = lines.get(i + 1 + k) {
-                        let v: Vec<f64> = row
-                            .split_whitespace()
-                            .take(3)
-                            .map(|s| s.parse().unwrap_or(0.0))
-                            .collect();
-                        if v.len() == 3 {
-                            ly.spots.push([v[0], v[1], v[2]]);
-                        }
+                    let row = lines
+                        .get(i + 1 + k)
+                        .ok_or_else(|| format!("truncated spot rows at {key}"))?;
+                    let v: Vec<&str> = row.split_whitespace().take(3).collect();
+                    if v.len() != 3 {
+                        return Err(format!("bad spot row: {row:?}"));
                     }
+                    ly.spots.push([
+                        parse_num(v[0], key)?,
+                        parse_num(v[1], key)?,
+                        parse_num(v[2], key)?,
+                    ]);
                 }
             }
             i += n_spots;
@@ -488,6 +496,7 @@ pub fn patient_hash(work: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for p in [
+        work.join("CT.mhd"),
         work.join("CT.raw"),
         work.join("Plan.txt"),
         patient_bdl(),

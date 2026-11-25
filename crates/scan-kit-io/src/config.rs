@@ -1507,7 +1507,6 @@ mod tests {
         )
         .unwrap();
         let xml = r#"<devices><ion_chamber><device name="IC_1_X"/><beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="1" K1="0" K2="0" K3="0"/></ion_chamber></devices>"#;
-        let db = root.join("unused.sqlite");
         let result = tune(&json!({
             "workflow": "sigma_tuning",
             "xml": xml,
