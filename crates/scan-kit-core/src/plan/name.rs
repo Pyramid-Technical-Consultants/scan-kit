@@ -69,13 +69,15 @@ pub(super) fn energy_part(template: &str, params: &Value) -> String {
         }
     }
     if energies.len() <= 4 {
+        // "+" keeps the list from reading as a contiguous Ehi-Elo range —
+        // [250, 70] would otherwise collide with the full 250->70 run.
         return format!(
             "E{}",
             energies
                 .iter()
                 .map(|energy| num(*energy, 3))
                 .collect::<Vec<_>>()
-                .join("-")
+                .join("+")
         );
     }
     format!(
@@ -158,6 +160,8 @@ pub(super) fn weight_part(template: &str, params: &Value) -> String {
 }
 
 pub(super) fn num(value: f64, decimals: usize) -> String {
+    // Normalize -0 so a negative sub-decimal value can't emit a "-" segment.
+    let value = if value == 0.0 { 0.0 } else { value };
     let text = trim_zeros(&format!("{value:.decimals$}"));
     if text.is_empty() {
         "0".into()

@@ -370,9 +370,17 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
     let label = text_tag(&elems, tag(0x300A, 0x0002));
     let mut spots = Vec::new();
     let mut plan_index = 0i32;
+    let mut treatment_beams = 0;
     for beam in seq(&elems, tag(0x300A, 0x03A2)) {
         if text_tag(beam, tag(0x300A, 0x00CE)) == "SETUP" {
             continue;
+        }
+        treatment_beams += 1;
+        if treatment_beams > 1 {
+            // The spot map has no beam column — a second gantry's spots would
+            // merge into the same energy layers with no record. One map per
+            // field, like read_plan's single fraction group.
+            return Err("more than one treatment beam is not supported".into());
         }
         let mut energy = 0.0f32;
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
@@ -2056,6 +2064,17 @@ pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> R
 
 pub(crate) fn cs(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
     push_elem(bytes, group, element, b"CS", &even(text))
+}
+
+/// A zero-length element with the right VR — Type 2 tags are required to be
+/// present but may be empty.
+pub(crate) fn empty(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    vr: &[u8],
+) -> Result<(), String> {
+    push_elem(bytes, group, element, vr, &[])
 }
 
 pub(crate) fn lo(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {

@@ -463,7 +463,12 @@ fn preview_row(index: usize, row: &Row) -> Vec<String> {
         trim_float(row.beam_size),
         trim_float(row.x),
         trim_float(row.y),
-        format!("{:.4}", row.charge),
+        // A sub-1e-4 MU spot is real — don't preview it as a literal zero.
+        if row.charge != 0.0 && format!("{:.4}", row.charge) == "0.0000" {
+            format!("{:.2e}", row.charge)
+        } else {
+            format!("{:.4}", row.charge)
+        },
         trim_float(row.velocity),
     ]
 }
@@ -765,8 +770,8 @@ fn validate_spot_order(params: &Value) -> Vec<String> {
 }
 
 fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64) -> Vec<String> {
-    // The consumer defaults null the same as the bool fields do.
-    if value.is_some_and(Value::is_null) {
+    // The consumer defaults a missing key the same as an explicit null.
+    if value.is_none_or(Value::is_null) {
         return Vec::new();
     }
     let Some(number) = value.and_then(Value::as_f64) else {
@@ -798,7 +803,8 @@ fn validate_spot_budget(params: &Value, per_layer: i64) -> Vec<String> {
 }
 
 fn validate_positive_int(value: Option<&Value>, label: &str, max: i64) -> Vec<String> {
-    if value.is_some_and(Value::is_null) {
+    // A missing key takes the catalog default, like an explicit null.
+    if value.is_none_or(Value::is_null) {
         return Vec::new();
     }
     let Some(number) = value.and_then(as_int) else {

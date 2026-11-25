@@ -1762,7 +1762,11 @@ fn axis_iso_z(near: &[f32], far: &[f32], plan: &[f32]) -> Option<f32> {
             continue;
         }
         let z = IC2_Z_MM + (spot - a) / slope;
-        if z.is_finite() && z > IC2_Z_MM {
+        // Bound the crossing to a plausible iso plane — a noise-dominated
+        // chamber pair can intersect metres past the isocenter and drag the
+        // median, and t = z/IC_SEP would scale the projected positions by
+        // the same bogus factor.
+        if z.is_finite() && z > IC2_Z_MM && z < IC1_Z_MM + 10.0 * IC_SEP_MM {
             zs.push(z);
         }
     }
@@ -3144,6 +3148,15 @@ mod tests {
             1
         );
         assert!(super::session_at(&serde_json::json!({ "session": "zzz" }), &ids).is_err());
+    }
+
+    #[test]
+    fn a_noise_iso_crossing_is_rejected() {
+        // near/far equal within 1e-3 → slope 1e-5 → a 10 mm plan offset
+        // crosses at z = 1e6 mm. Unbounded, that drags the iso median.
+        assert!(super::axis_iso_z(&[10.0], &[10.001], &[20.0]).is_none());
+        // A plausible crossing (z = 200 mm) is still accepted.
+        assert_eq!(super::axis_iso_z(&[5.0], &[10.0], &[15.0]), Some(200.0));
     }
 
     fn fieldsets(controls: &[scan_kit_core::Control]) -> Vec<&str> {

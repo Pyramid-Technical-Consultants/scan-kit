@@ -125,15 +125,22 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
         let sop = uid();
         let mut bytes = patient::preamble();
         patient::file_meta(&mut bytes, CT, &sop)?;
+        patient::cs(&mut bytes, 0x0008, 0x0008, "DERIVED\\SECONDARY")?;
         patient::ui(&mut bytes, 0x0008, 0x0016, CT)?;
         patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
+        id_dates(&mut bytes)?;
         patient::cs(&mut bytes, 0x0008, 0x0060, "CT")?;
+        patient::empty(&mut bytes, 0x0008, 0x0090, b"PN")?;
         patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
         patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
+        patient::empty(&mut bytes, 0x0010, 0x0030, b"DA")?;
+        patient::empty(&mut bytes, 0x0010, 0x0040, b"CS")?;
         patient::ds(&mut bytes, 0x0018, 0x0050, &[dz as f32])?;
         patient::cs(&mut bytes, 0x0018, 0x5100, &request.position)?;
         patient::ui(&mut bytes, 0x0020, 0x000D, &study)?;
         patient::ui(&mut bytes, 0x0020, 0x000E, &ct_series)?;
+        patient::empty(&mut bytes, 0x0020, 0x0010, b"SH")?;
+        patient::empty(&mut bytes, 0x0020, 0x0011, b"IS")?;
         patient::is(&mut bytes, 0x0020, 0x0013, k as i32 + 1)?;
         patient::ds(
             &mut bytes,
@@ -159,16 +166,28 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
         patient::us(&mut bytes, 0x0028, 0x0103, 1)?;
         patient::ds(&mut bytes, 0x0028, 0x1052, &[-1024.0])?;
         patient::ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
+        // Type 1C — required whenever Rescale Intercept is written.
+        patient::lo(&mut bytes, 0x0028, 0x1054, "HU")?;
         patient::ow(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
         let name = format!("CT_{}.dcm", &sop[sop.len().saturating_sub(12)..]);
         scan_kit_core::atomic_write(&dir.join(name), &bytes).map_err(|err| err.to_string())?;
     }
-    write_struct(dir, &request, &study, &frame, &ct_series)?;
-    write_plan(dir, &request, &study, &frame)?;
+    let rs_sop = write_struct(dir, &request, &study, &frame, &ct_series)?;
+    write_plan(dir, &request, &study, &frame, &rs_sop)?;
     Ok(format!(
         "{} CT slices, RTSTRUCT and RT Ion Plan",
         request.nz
     ))
+}
+
+/// The Type 2 study/series dates the IODs require — present, empty.
+fn id_dates(bytes: &mut Vec<u8>) -> Result<(), String> {
+    patient::empty(bytes, 0x0008, 0x0020, b"DA")?;
+    patient::empty(bytes, 0x0008, 0x0021, b"DA")?;
+    patient::empty(bytes, 0x0008, 0x0030, b"TM")?;
+    patient::empty(bytes, 0x0008, 0x0031, b"TM")?;
+    patient::empty(bytes, 0x0008, 0x0050, b"SH")?;
+    Ok(())
 }
 
 fn write_struct(
@@ -177,7 +196,7 @@ fn write_struct(
     study: &str,
     frame: &str,
     ct_series: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut rois = Vec::new();
     let mut observations = Vec::new();
     let mut contours = Vec::new();
@@ -259,13 +278,21 @@ fn write_struct(
     patient::file_meta(&mut bytes, RT_STRUCT, &sop)?;
     patient::ui(&mut bytes, 0x0008, 0x0016, RT_STRUCT)?;
     patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
+    id_dates(&mut bytes)?;
     patient::cs(&mut bytes, 0x0008, 0x0060, "RTSTRUCT")?;
+    patient::empty(&mut bytes, 0x0008, 0x0090, b"PN")?;
     patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
     patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
+    patient::empty(&mut bytes, 0x0010, 0x0030, b"DA")?;
+    patient::empty(&mut bytes, 0x0010, 0x0040, b"CS")?;
     patient::ui(&mut bytes, 0x0020, 0x000D, study)?;
     patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    patient::empty(&mut bytes, 0x0020, 0x0010, b"SH")?;
+    patient::empty(&mut bytes, 0x0020, 0x0011, b"IS")?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
     patient::sh(&mut bytes, 0x3006, 0x0002, "Synthetic")?;
+    patient::empty(&mut bytes, 0x3006, 0x0008, b"DA")?;
+    patient::empty(&mut bytes, 0x3006, 0x0009, b"TM")?;
     let referenced = referenced_frame(frame, study, ct_series)?;
     patient::sq(&mut bytes, 0x3006, 0x0010, &[referenced])?;
     patient::sq(&mut bytes, 0x3006, 0x0020, &rois)?;
@@ -273,7 +300,8 @@ fn write_struct(
     // RT ROI Observations is Type 1 — required for a readable structure set.
     patient::sq(&mut bytes, 0x3006, 0x0080, &observations)?;
     scan_kit_core::atomic_write(&dir.join("RS_synthetic.dcm"), &bytes)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    Ok(sop)
 }
 
 fn referenced_frame(frame: &str, study: &str, ct_series: &str) -> Result<Vec<u8>, String> {
@@ -334,20 +362,36 @@ fn push_roi(
     Ok(())
 }
 
-fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result<(), String> {
+fn write_plan(
+    dir: &Path,
+    request: &Request,
+    study: &str,
+    frame: &str,
+    rs_sop: &str,
+) -> Result<(), String> {
     let mut bytes = patient::preamble();
     let sop = uid();
     patient::file_meta(&mut bytes, RT_PLAN, &sop)?;
     patient::ui(&mut bytes, 0x0008, 0x0016, RT_PLAN)?;
     patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
+    id_dates(&mut bytes)?;
     patient::cs(&mut bytes, 0x0008, 0x0060, "RTPLAN")?;
+    patient::empty(&mut bytes, 0x0008, 0x0090, b"PN")?;
     patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
     patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
+    patient::empty(&mut bytes, 0x0010, 0x0030, b"DA")?;
+    patient::empty(&mut bytes, 0x0010, 0x0040, b"CS")?;
     patient::ui(&mut bytes, 0x0020, 0x000D, study)?;
     patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    patient::empty(&mut bytes, 0x0020, 0x0010, b"SH")?;
+    patient::empty(&mut bytes, 0x0020, 0x0011, b"IS")?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
     patient::sh(&mut bytes, 0x300A, 0x0002, "SYNTH")?;
-    patient::cs(&mut bytes, 0x300A, 0x000C, "RESEARCH")?;
+    patient::empty(&mut bytes, 0x300A, 0x0006, b"DA")?;
+    patient::empty(&mut bytes, 0x300A, 0x0007, b"TM")?;
+    // PATIENT is the only legal geometry term once a structure set exists —
+    // and it makes Referenced Structure Set Sequence Type 1C (written last).
+    patient::cs(&mut bytes, 0x300A, 0x000C, "PATIENT")?;
     let dose_ref = {
         let mut item = Vec::new();
         patient::is(&mut item, 0x300A, 0x0012, 1)?;
@@ -460,6 +504,10 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         item
     };
     patient::sq(&mut bytes, 0x300A, 0x03A2, &[beam])?;
+    let mut rs_ref = Vec::new();
+    patient::ui(&mut rs_ref, 0x0008, 0x1150, RT_STRUCT)?;
+    patient::ui(&mut rs_ref, 0x0008, 0x1155, rs_sop)?;
+    patient::sq(&mut bytes, 0x300C, 0x0060, &[rs_ref])?;
     scan_kit_core::atomic_write(&dir.join("RP_synthetic.dcm"), &bytes)
         .map_err(|err| err.to_string())
 }

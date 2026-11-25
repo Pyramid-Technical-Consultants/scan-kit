@@ -1133,8 +1133,11 @@ fn deliveries(
             // ic1 value must not suppress a complete ic2 column.
             let ic1 = table.get("ic1_dose").cloned().unwrap_or_default();
             let ic2 = table.get("ic2_dose").cloned().unwrap_or_default();
-            let n1 = ic1.iter().filter(|v| v.is_finite()).count();
-            let n2 = ic2.iter().filter(|v| v.is_finite()).count();
+            // Count usable readings like pick_beam does — a column of
+            // finite-but-nonpositive sentinels must not outrank a shorter
+            // all-positive column.
+            let n1 = ic1.iter().filter(|v| v.is_finite() && **v > 0.0).count();
+            let n2 = ic2.iter().filter(|v| v.is_finite() && **v > 0.0).count();
             let mu = if n2 > n1 { ic2 } else { ic1 };
             let beam = pick_beam(&study.beams, &energy, &mu)?;
             let mut matched = match_delivery(beam, &study.beams[beam], &energy, &x, &y, &mu);

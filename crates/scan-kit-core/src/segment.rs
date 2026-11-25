@@ -295,6 +295,9 @@ pub fn scrub_control(options: &Value, end: f32, layers: &[f32]) -> Control {
         .and_then(|item| item.get("on"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Echo the same state the filter applies — on without a usable finite
+    // `at` is off (scrub_limits), not a live playhead at t=0.
+    let on = on && finite_f32(value.as_ref().and_then(|item| item.get("at"))).is_some();
     let at = finite_f32(value.as_ref().and_then(|item| item.get("at"))).unwrap_or(0.0);
     let speed = scrub_speed(
         value
@@ -408,8 +411,12 @@ fn beam_keep(gate: Option<&[f32]>, state: BeamGate, keep: &mut [bool]) {
     let Some(gate) = gate else {
         return;
     };
-    for slot in keep.iter_mut().skip(gate.len()) {
-        *slot = false;
+    // Rows past the gate follow the same unknown-is-off rule as a
+    // non-finite reading: only the On state drops them; Off and Both keep.
+    if matches!(state, BeamGate::On) {
+        for slot in keep.iter_mut().skip(gate.len()) {
+            *slot = false;
+        }
     }
     for (slot, value) in keep.iter_mut().zip(gate) {
         // Same gate as beam_on_mask / plateau_mean: unknown (non-finite) is off.

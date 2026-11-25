@@ -370,7 +370,13 @@ pub fn peek_study(bytes: &[u8]) -> StudyPeek {
             break;
         }
         let Some((start, end)) = element_span(bytes, cursor, implicit) else {
-            break;
+            match skip_undefined(bytes, cursor, implicit) {
+                Some(next) => {
+                    cursor = next;
+                    continue;
+                }
+                None => break,
+            }
         };
         if end > limit {
             break;
@@ -458,7 +464,13 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
             break;
         }
         let Some((start, end)) = element_span(&bytes, cursor, implicit) else {
-            break;
+            match skip_undefined(&bytes, cursor, implicit) {
+                Some(next) => {
+                    cursor = next;
+                    continue;
+                }
+                None => break,
+            }
         };
         if end > bytes.len() {
             break;
@@ -506,8 +518,71 @@ fn element_span(bytes: &[u8], cursor: usize, implicit: bool) -> Option<(usize, u
     }
     let vr = bytes.get(cursor + 4..cursor + 6)?;
     let (length, header) = value_length(vr, bytes.get(cursor + 6..)?)?;
+    if length == u32::MAX as usize {
+        return None;
+    }
     let start = cursor + 6 + header;
     Some((start, start.checked_add(length)?))
+}
+
+/// Skip an element whose declared length is undefined (0xFFFFFFFF) — the
+/// normal SQ encoding in both VR modes. Tracks item/sequence delimiters by
+/// depth so a sequence sitting ahead of the study UID doesn't end the peek
+/// walk. Returns the cursor past the delimitation, or None on truncation.
+fn skip_undefined(bytes: &[u8], mut cursor: usize, implicit: bool) -> Option<usize> {
+    // Header size of the undefined-length element itself.
+    cursor += if implicit { 8 } else { 12 };
+    let mut depth = 1usize;
+    while cursor + 8 <= bytes.len() {
+        let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+        let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
+        if group == 0xFFFE {
+            let length =
+                u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().ok()?) as usize;
+            match element {
+                0xE00D | 0xE0DD => {
+                    depth -= 1;
+                    cursor += 8;
+                    if depth == 0 {
+                        return Some(cursor);
+                    }
+                }
+                0xE000 => {
+                    if length == u32::MAX as usize {
+                        depth += 1;
+                        cursor += 8;
+                    } else {
+                        // A defined-length item's delimiters stay inside it.
+                        cursor = cursor.checked_add(8 + length)?;
+                    }
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        // A dataset element inside an item: defined length skips, undefined
+        // length nests another delimiter level.
+        if implicit {
+            let length =
+                u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().ok()?) as usize;
+            if length == u32::MAX as usize {
+                depth += 1;
+                cursor += 8;
+            } else {
+                cursor = cursor.checked_add(8 + length)?;
+            }
+            continue;
+        }
+        let vr = bytes.get(cursor + 4..cursor + 6)?;
+        let (length, header) = value_length(vr, bytes.get(cursor + 6..)?)?;
+        if length == u32::MAX as usize {
+            depth += 1;
+            cursor += 6 + header;
+        } else {
+            cursor = cursor.checked_add(6 + header + length)?;
+        }
+    }
+    None
 }
 
 /// Whether the element at `bytes[0]` reads as explicit VR: a known VR code
@@ -522,21 +597,50 @@ fn looks_like_explicit_element(bytes: &[u8]) -> bool {
         b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FD", b"FL", b"IS", b"LO", b"LT", b"PN",
         b"SH", b"SL", b"SS", b"ST", b"SV", b"TM", b"UI", b"UL", b"US", b"UV",
     ];
-    let vr = &bytes[4..6];
-    if !LONG_VR.contains(&vr) && !SHORT_VR.contains(&vr) {
-        return false;
+    let mut bytes = bytes;
+    loop {
+        if bytes.len() < 8 {
+            return false;
+        }
+        let vr = &bytes[4..6];
+        if !LONG_VR.contains(&vr) && !SHORT_VR.contains(&vr) {
+            return false;
+        }
+        if LONG_VR.contains(&vr) && bytes[6..8] != [0, 0] {
+            return false; // explicit long VRs reserve two zero bytes
+        }
+        let Some((length, header)) = value_length(vr, &bytes[6..]) else {
+            return false;
+        };
+        if length == u32::MAX as usize {
+            // Legal explicit (SQ/items) — but also reachable from an implicit
+            // element whose length spells a VR and whose value head is all
+            // 0xFF. An undefined-length explicit value must open with an
+            // item or the sequence delimitation tag.
+            let Some(item) = bytes.get(6 + header..6 + header + 8) else {
+                return true;
+            };
+            let g = u16::from_le_bytes([item[0], item[1]]);
+            let e = u16::from_le_bytes([item[2], item[3]]);
+            return g == 0xFFFE && (e == 0xE000 || e == 0xE0DD);
+        }
+        let Some(end) = 6usize
+            .checked_add(header)
+            .and_then(|need| need.checked_add(length))
+        else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
+        // A colliding implicit length (low bytes spelling a VR, high word
+        // becoming the "declared" short length) fits trivially - the element
+        // after it lands mid-value, so verify the next header too.
+        if end + 8 > bytes.len() {
+            return true;
+        }
+        bytes = &bytes[end..];
     }
-    if LONG_VR.contains(&vr) && bytes[6..8] != [0, 0] {
-        return false; // explicit long VRs reserve two zero bytes
-    }
-    let Some((length, header)) = value_length(vr, &bytes[6..]) else {
-        return false;
-    };
-    // checked like element_span - on wasm32 a u32 length could wrap the add.
-    6usize
-        .checked_add(header)
-        .and_then(|need| need.checked_add(length))
-        .is_some_and(|need| need <= bytes.len())
 }
 
 fn value_length(vr: &[u8], rest: &[u8]) -> Option<(usize, usize)> {
@@ -726,6 +830,58 @@ mod tests {
         let (offset, implicit) = dataset_offset(&bytes);
         assert_eq!(offset, 132);
         assert!(implicit.unwrap());
+    }
+
+    #[test]
+    fn a_short_implicit_length_spelling_a_vr_is_not_explicit() {
+        // Implicit length 0x0000_4955: low word "UI", high word 0 — the
+        // declared short-VR length reads 0 and fits trivially, but the
+        // element after it lands mid-value.
+        let mut bytes = vec![0u8; 128];
+        bytes.extend_from_slice(b"DICM");
+        bytes.extend_from_slice(&0x0008u16.to_le_bytes());
+        bytes.extend_from_slice(&0x1140u16.to_le_bytes());
+        bytes.extend_from_slice(&0x4955u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        let (_, implicit) = dataset_offset(&bytes);
+        assert!(implicit.unwrap());
+    }
+
+    #[test]
+    fn an_undefined_length_sequence_is_explicit() {
+        // First dataset element is an explicit SQ with undefined length —
+        // legal explicit encoding that must not read as implicit.
+        let mut bytes = vec![0u8; 128];
+        bytes.extend_from_slice(b"DICM");
+        bytes.extend_from_slice(&0x0008u16.to_le_bytes());
+        bytes.extend_from_slice(&0x1111u16.to_le_bytes());
+        bytes.extend_from_slice(b"SQ");
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        bytes.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let (_, implicit) = dataset_offset(&bytes);
+        assert!(!implicit.unwrap());
+    }
+
+    #[test]
+    fn peek_walks_past_an_undefined_length_sequence() {
+        // A Referenced Study Sequence ahead of the study UID used to end the
+        // walk — the exam silently lost its UID and vanished from discovery.
+        let mut bytes = vec![0u8; 128];
+        bytes.extend_from_slice(b"DICM");
+        bytes.extend_from_slice(&0x0008u16.to_le_bytes());
+        bytes.extend_from_slice(&0x1111u16.to_le_bytes());
+        bytes.extend_from_slice(b"SQ");
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        bytes.extend_from_slice(&0xE0DDu16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        push_tag(&mut bytes, 0x0020, 0x000D, b"UI", "1.2.3");
+        let peek = peek_study(&bytes);
+        assert_eq!(peek.study_uid, "1.2.3");
     }
 
     #[test]

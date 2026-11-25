@@ -178,7 +178,10 @@ fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
     // The span subtracts in f64 — a finite range wider than f32::MAX would
     // otherwise overflow to +inf and NaN the first edge.
     let span = f64::from(hi) - f64::from(lo);
-    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || span.abs() < 1e-12 {
+    // Relative flat test like scan_kit_core::histogram — an absolute 1e-12
+    // calls a real 1e-13-wide column flat and bins it onto a ±0.5 axis.
+    let scale = f64::from(hi.abs().max(lo.abs())).max(1e-30);
+    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || span.abs() <= 1e-12 * scale {
         // A fixed 0.5 pad is unrepresentable above |lo| ~= 2^23 (ulp > 1) —
         // scale the pad to the magnitude so the edges stay distinct.
         let pad = (lo.abs() * f32::EPSILON).max(0.5);

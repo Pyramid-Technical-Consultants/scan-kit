@@ -28,7 +28,7 @@ pub fn parse_pld(text: &str, beam_size: f64) -> Result<Vec<ImportSpot>, String> 
             } else {
                 weight * header.total_mu / header.cumulative
             };
-            if charge <= 0.0 {
+            if !(charge.is_finite() && charge > 0.0) {
                 continue;
             }
             spots.push(ImportSpot {
@@ -95,9 +95,17 @@ pub(super) fn parse_beam_header(line: &str) -> Result<BeamHeader, String> {
     if parts.len() < 10 {
         return Err("PLD Beam header is missing required fields".into());
     }
+    // The format defines total MU, cumulative weight, and layer count as the
+    // last three fields — fixed indices misread any variant with extra
+    // metadata columns.
+    let total_mu = parse_pld_float(parts[parts.len() - 3], "beam total MU")?;
+    let cumulative = parse_pld_float(parts[parts.len() - 2], "cumulative meterset weight")?;
+    if !total_mu.is_finite() || !cumulative.is_finite() || total_mu <= 0.0 || cumulative <= 0.0 {
+        return Err("PLD beam total MU and cumulative meterset weight must be positive".into());
+    }
     Ok(BeamHeader {
-        total_mu: parse_pld_float(parts[7], "beam total MU")?,
-        cumulative: parse_pld_float(parts[8], "cumulative meterset weight")?,
+        total_mu,
+        cumulative,
     })
 }
 
@@ -113,7 +121,7 @@ pub(super) fn parse_layer_header(line: &str) -> Result<(f64,), String> {
     // Same bound the DICOM writer enforces - a hand-edited PLD is a trust
     // boundary too.
     if !energy.is_finite() || energy <= 0.0 || energy > 330.0 {
-        return Err("PLD layer energy must be from 0 to 330 MeV".into());
+        return Err("PLD layer energy must be greater than 0 and at most 330 MeV".into());
     }
     Ok((energy,))
 }
