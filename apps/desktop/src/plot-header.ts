@@ -271,6 +271,24 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
 }
 
 /** Canvas backing size in device pixels for a CSS box. */
+/// A devicePixelRatio change (the window moved to a differently-scaled
+/// monitor) fires no ResizeObserver event — refit on it. The query names the
+/// current scale, so it re-arms after every change.
+export function watchDpr(refit: () => void): () => void {
+  let media: MediaQueryList | null = null;
+  const onChange = () => {
+    media?.removeEventListener("change", onChange);
+    refit();
+    arm();
+  };
+  const arm = () => {
+    media = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    media.addEventListener("change", onChange, { once: true });
+  };
+  arm();
+  return () => media?.removeEventListener("change", onChange);
+}
+
 export function backingSize(cssWidth: number, cssHeight: number, ratio: number): { width: number; height: number } {
   const scale = ratio > 0 ? ratio : 1;
   return {

@@ -110,6 +110,22 @@ impl ScanKit {
     /// scheme, a UNC share, or a file://host URI (file:/// is local).
     fn remote_spec(spec: &str) -> bool {
         let spec = spec.trim();
+        // `\\?\` verbatim and `\\.\` device paths are local — except
+        // `\\?\UNC\`, which is a verbatim spelling of a share.
+        if spec
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\.\"))
+        {
+            return false;
+        }
+        if spec
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\?\"))
+        {
+            return spec
+                .get(4..8)
+                .is_some_and(|rest| rest.eq_ignore_ascii_case("UNC\\"));
+        }
         if scan_kit_io::is_remote_location(spec) || spec.starts_with('\\') || Self::unc(spec) {
             return true;
         }
@@ -163,10 +179,12 @@ impl ScanKit {
 }
 
 fn schema_object(value: Value) -> Arc<Map<String, Value>> {
-    let Value::Object(schema) = value else {
-        unreachable!("tool schema is an object");
-    };
-    Arc::new(schema)
+    match value {
+        Value::Object(schema) => Arc::new(schema),
+        // A non-object catalog schema must not panic the handler task —
+        // rmcp never awaits the spawned task, so a panic hangs the client.
+        _ => Arc::new(Map::new()),
+    }
 }
 
 fn catalog_specs() -> Vec<scan_kit_core::ToolSpec> {
@@ -174,6 +192,16 @@ fn catalog_specs() -> Vec<scan_kit_core::ToolSpec> {
     specs.extend_from_slice(scan_kit_io::tools());
     specs.extend_from_slice(scan_kit_compute::tools());
     specs.extend_from_slice(scan_kit_dicom::tools());
+    // A name collision across catalogs would shadow the later tool.
+    debug_assert_eq!(
+        specs
+            .iter()
+            .map(|tool| tool.name)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        specs.len(),
+        "duplicate tool names across catalogs"
+    );
     specs
 }
 
@@ -266,7 +294,7 @@ impl ServerHandler for ScanKit {
         let name = request.name.clone();
         let result = match self.blocked(&name, &input) {
             Some(name) => Err(format!(
-                "{name} changes files, devices, or reference configuration; start the server with --allow-effects to use it"
+                "{name} writes files/devices/configuration or reaches the network; start the server with --allow-effects to use it"
             )),
             None => {
                 if !catalog_specs().iter().any(|tool| tool.name == name) {
@@ -275,6 +303,13 @@ impl ServerHandler for ScanKit {
                         None,
                     ));
                 }
+                // rmcp spawns one task per request; cap in-flight
+                // dispatches so a flood can't queue unbounded blocking work.
+                static DISPATCH_LIMIT: tokio::sync::Semaphore =
+                    tokio::sync::Semaphore::const_new(8);
+                let _permit = DISPATCH_LIMIT.acquire().await.map_err(|_| {
+                    McpError::internal_error("dispatch limiter closed", None)
+                })?;
                 // The advertised schema is the contract — a typo'd arg
                 // must not silently default (e.g. `db_pth` writes the
                 // default index, `dest` drops a save). db_path is exempt:
@@ -332,7 +367,12 @@ impl ServerHandler for ScanKit {
                 let result = tokio::select! {
                     out = joined => match out {
                         Ok(inner) => inner,
-                        Err(err) => Err(format!("{tool} failed: {err}")),
+                        Err(err) => {
+                            // JoinError's Display embeds the panic payload —
+                            // internal details stay server-side.
+                            eprintln!("scan-kit-mcp: {tool} task failed: {err}");
+                            Err(format!("{tool} failed"))
+                        }
                     },
                     _ = ct.cancelled() => {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -358,6 +398,19 @@ impl ServerHandler for ScanKit {
                 } else {
                     serde_json::json!({ "result": value })
                 };
+                // rmcp silently discards response lines over 16 MiB — a
+                // full-dim run_view frame would hang the client, not fail it.
+                const MAX_RESULT: usize = 12 << 20;
+                let oversized = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len() > MAX_RESULT)
+                    .unwrap_or(true);
+                if oversized {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "{} produced a response over the transport's message limit",
+                        request.name
+                    ))])
+                    .into());
+                }
                 Ok(CallToolResult::structured(value).into())
             }
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
@@ -370,7 +423,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let effects = std::env::args().any(|arg| arg == "--allow-effects");
     let server = ScanKit { effects }.serve(stdio()).await?;
     server.waiting().await?;
-    Ok(())
+    // A detached spawn_blocking task (e.g. a cancelled core/dicom read)
+    // would otherwise keep the runtime — and this process — alive past
+    // stdin EOF, a zombie holding the index and GPU.
+    std::process::exit(0);
 }
 
 #[cfg(test)]

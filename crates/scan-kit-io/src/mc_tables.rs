@@ -67,6 +67,15 @@ fn pack() -> Result<McTables, String> {
     {
         return Err("the material tables are truncated".into());
     }
+    // mc_transport.wgsl bakes these offsets and counts — a regenerated npz
+    // with a different layout must fail here, not misalign every table read.
+    if width != 6
+        || stop_bins != 801
+        || nuc_bins != 250
+        || media.first().map(|name| name.as_str()) != Some("water")
+    {
+        return Err("material table layout doesn't match the shader's baked offsets".into());
+    }
     let m_stop = 3 + width;
     let m_nuc = m_stop + stop_bins;
     let stride = m_nuc + nuc_bins;

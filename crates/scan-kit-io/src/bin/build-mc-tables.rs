@@ -314,6 +314,17 @@ fn read_elastic(
         }
         i += 1;
     }
+    if energies.len() != sigma.len() || energies.len() != cdfs.len() {
+        return Err(format!(
+            "{name}: energy/sigma/cdf counts disagree ({} vs {} vs {})",
+            energies.len(),
+            sigma.len(),
+            cdfs.len()
+        ));
+    }
+    if !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(format!("{name}: elastic energies are not ascending"));
+    }
     Ok((energies, sigma, cdfs))
 }
 
@@ -546,6 +557,9 @@ fn run() -> Result<(), String> {
             el.el_cdf = c;
             el.inelastic = read_inelastic(&materials, n, p.a)?;
             el.in_e = el.inelastic.iter().map(|r| r.e).collect();
+            if !el.in_e.windows(2).all(|w| w[0] <= w[1]) {
+                return Err(format!("{n}: inelastic energies are not ascending"));
+            }
             el.in_sigma = el.inelastic.iter().map(|r| r.sigma).collect();
         }
         elements.insert(n.clone(), el);

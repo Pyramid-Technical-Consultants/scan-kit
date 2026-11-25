@@ -68,7 +68,9 @@ export function ExamTable({
   // re-sort permutes order without touching rows, like LibraryTable. Compare
   // the ordered keys, not the array: a catalog refresh rebuilds rows with a
   // new identity every pull and must not wipe a still-valid highlight.
-  const orderKey = order.map((index) => rows[index]?.exam ?? "").join("\0");
+  const orderKey = order
+    .map((index) => `${rows[index]?.exam ?? ""}\0${rows[index]?.patient_id ?? ""}`)
+    .join("\0");
   const [prevOrderKey, setPrevOrderKey] = useState(orderKey);
   if (prevOrderKey !== orderKey) {
     setPrevOrderKey(orderKey);

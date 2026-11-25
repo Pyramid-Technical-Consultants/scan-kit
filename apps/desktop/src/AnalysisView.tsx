@@ -38,6 +38,7 @@ import { optionIcon } from "@/option-icons";
 import {
   applyLevelPaint,
   backingSize,
+  watchDpr,
   plotHeader,
   shownHeader,
   type PlotHeader,
@@ -385,6 +386,9 @@ export function AnalysisView({
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotter = useRef<Plotter | null>(null);
+  // The canvas whose WebPlot.create is in flight — a width write while the
+  // surface is being configured resets the only context it will ever get.
+  const creating = useRef<HTMLCanvasElement | null>(null);
   const payload = useRef<Uint8Array | null>(null);
   const hold = useRef(0);
   const taskId = useRef(0);
@@ -533,7 +537,7 @@ export function AnalysisView({
     const rect = node.getBoundingClientRect();
     const next = backingSize(rect.width, rect.height, window.devicePixelRatio);
     // The plotter configures the drawing buffer. Assigning width here resets it.
-    if (plotter.current == null && (node.width !== next.width || node.height !== next.height)) {
+    if (plotter.current == null && creating.current !== node && (node.width !== next.width || node.height !== next.height)) {
       node.width = next.width;
       node.height = next.height;
     }
@@ -732,9 +736,17 @@ export function AnalysisView({
     let live = true;
     const observer = new ResizeObserver(fitCanvas);
     observer.observe(node);
+    const unwatchDpr = watchDpr(fitCanvas);
     fitCanvas();
+    creating.current = node;
+    const settle = () => {
+      if (creating.current === node) {
+        creating.current = null;
+      }
+    };
     plotterFor(node)
       .then((plot) => {
+        settle();
         if (!live) {
           return;
         }
@@ -743,10 +755,15 @@ export function AnalysisView({
         fitCanvas();
         loadPayload();
       })
-      .catch((reason: unknown) => notifyError(messageOf(reason), "analysis"));
+      .catch((reason: unknown) => {
+        settle();
+        notifyError(messageOf(reason), "analysis");
+      });
     return () => {
       live = false;
       observer.disconnect();
+      unwatchDpr();
+      creating.current = null;
       plotter.current = null;
       cancelAnimationFrame(frame.current);
       frame.current = 0;
@@ -906,8 +923,12 @@ export function AnalysisView({
           // The start lost the slot race and has no ticket to poll - settle
           // or the view sweeps "Loading plot" forever. Releasing useScrub's
           // pending latch too, or every later commit is silently dropped.
-          setArrivedKey(requestKey);
-          setSettled((count) => count + 1);
+          // But a stale run must not settle the live ticket's latch or stamp
+          // its requestKey as arrived.
+          if (!stop && openSeq.current === ticket) {
+            setArrivedKey(requestKey);
+            setSettled((count) => count + 1);
+          }
           return;
         }
         if (stop || openSeq.current !== ticket) {

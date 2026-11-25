@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
-import { backingSize, type ViewControl } from "@/plot-header";
+import { backingSize, watchDpr, type ViewControl } from "@/plot-header";
 import { Splitter } from "@/splitter";
 
 type Plotter = import("@/wasm/scan_kit_plot.js").WebPlot;
@@ -178,6 +178,7 @@ function DoseCell({
     };
     const observer = new ResizeObserver(fit);
     observer.observe(node);
+    const unwatchDpr = watchDpr(fit);
     fit();
     node.addEventListener("wheel", onWheel, { passive: false });
     node.addEventListener("pointerdown", onDown);
@@ -191,6 +192,7 @@ function DoseCell({
       live = false;
       slots[panel] = null;
       observer.disconnect();
+      unwatchDpr();
       node.removeEventListener("wheel", onWheel);
       node.removeEventListener("pointerdown", onDown);
       node.removeEventListener("pointerup", onUp);

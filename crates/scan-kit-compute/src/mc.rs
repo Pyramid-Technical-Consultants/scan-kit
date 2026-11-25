@@ -509,7 +509,12 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     }
     for row in 0..rows {
         let weight = request.protons.get(row).copied().unwrap_or(0.0);
-        if weight.is_finite() && weight > 0.0 {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(ComputeError::Message(format!(
+                "spot {row} has a non-finite or negative meterset weight"
+            )));
+        }
+        if weight > 0.0 {
             let record = &request.spots[row * 40..(row + 1) * 40];
             if !record.iter().all(|value| value.is_finite()) {
                 return Err(ComputeError::Message(

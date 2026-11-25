@@ -146,6 +146,9 @@ export function useScrub(
       layers: lastSent.current.layers,
     };
     if (controlValue == null) {
+      // The control vanished mid-commit — release the latch or every later
+      // commit is dropped until the next settled bump.
+      pending.current = false;
       return;
     }
     if (!cameraFollow) {
@@ -222,7 +225,9 @@ export function useScrub(
     let frame = 0;
     const step = (now: number) => {
       const current = scrubRef.current;
-      const dt = Math.max(0, (now - last) / 1000);
+      // rAF pauses on hidden tabs — without a cap, the resume frame's dt
+      // is the whole hidden span and the playhead snaps to the end.
+      const dt = Math.min(0.25, Math.max(0, (now - last) / 1000));
       last = now;
       const at = Math.min(current.end, current.at + current.speed * dt);
       if (at !== current.at) {
@@ -243,6 +248,9 @@ export function useScrub(
 
   const update = (patch: Partial<Scrub>) => {
     const next = { ...scrubRef.current, ...patch };
+    // Keep the stored value inside the rendered clamp — an at > end would
+    // otherwise ride into follow()/commits forever past the tail.
+    next.at = Math.min(next.end, Math.max(0, next.at));
     if (!next.on || next.at !== scrubRef.current.at) {
       setPlaying(false);
     }

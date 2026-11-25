@@ -124,7 +124,8 @@ impl CtCalibration {
         let mut missing = Vec::new();
         for label in &labels {
             match ids.iter().position(|id| id == label) {
-                Some(index) => media.push(index as u8),
+                Some(index) => media
+                    .push(u8::try_from(index).map_err(|_| "more than 256 media in the mc tables")?),
                 None => missing.push(label.to_string()),
             }
         }

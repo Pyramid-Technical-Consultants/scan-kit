@@ -5,6 +5,15 @@ use wasm_bindgen::prelude::*;
 
 use crate::render::{Plot, PlotGpu, PlotInput, MAX_SIDE, MIN_SIDE};
 
+/// A wasm panic traps as a bare `unreachable` — hook it so the message and
+/// location reach the console.
+#[wasm_bindgen(start)]
+pub fn start() {
+    std::panic::set_hook(Box::new(|info| {
+        web_sys::console::error_1(&info.to_string().into());
+    }));
+}
+
 #[wasm_bindgen]
 pub struct WebPlot {
     gpu: PlotGpu,
