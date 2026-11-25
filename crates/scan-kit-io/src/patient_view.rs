@@ -602,9 +602,13 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             return None;
         }
         let tps = study.tps.as_ref()?;
-        // A per-beam TPS export is one beam's dose — gamma'ing it against
-        // the whole-plan MC dose produces a plausible but wrong rate.
-        if tps.summation.eq_ignore_ascii_case("BEAM") {
+        // A partial-scope TPS export is a fraction of the plan's dose —
+        // gamma'ing it against the whole-plan MC dose produces a plausible
+        // but wrong rate. Only whole-scope summations are comparable.
+        if matches!(
+            tps.summation.to_ascii_uppercase().as_str(),
+            "BEAM" | "BEAM_SESSION" | "BRACHY_SESSION" | "CONTROL_POINT"
+        ) {
             return None;
         }
         let (dd, dta, cutoff) = gamma_criteria(options);
@@ -780,11 +784,19 @@ pub(crate) fn scene(
         ]);
         rows.push(vec![
             format!("{label} energy error"),
-            format!("{:.2} MeV", matched.energy_error),
+            if matched.energy_error.is_finite() {
+                format!("{:.2} MeV", matched.energy_error)
+            } else {
+                "n/a".into()
+            },
         ]);
         rows.push(vec![
             format!("{label} position RMS"),
-            format!("{:.2} mm", matched.position_rms),
+            if matched.position_rms.is_finite() {
+                format!("{:.2} mm", matched.position_rms)
+            } else {
+                "n/a".into()
+            },
         ]);
         let ratios: Vec<f32> = matched
             .layer_mu_ratio
@@ -1741,6 +1753,11 @@ impl Goal {
     }
 
     fn check(&self, dvh: &Dvh, rx: Option<f32>) -> Result<(f32, bool), String> {
+        if self.op.is_empty() {
+            // A line that didn't parse keeps its raw text as the verdict —
+            // a measured number beside it would imply a real metric ran.
+            return Err("unparseable goal".into());
+        }
         let measured = self.measure(dvh, rx)?;
         Ok((measured, compare(measured, &self.op, self.value)))
     }

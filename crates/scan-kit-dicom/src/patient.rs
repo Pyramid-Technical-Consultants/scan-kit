@@ -1094,7 +1094,12 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         let mut first_iso = [0.0f32; 3];
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
-        for cp in seq(beam, tag(0x300A, 0x03A8)) {
+        let control_points = seq(beam, tag(0x300A, 0x03A8));
+        // Cumulative Meterset Weight (300A,0134): element k is the beam's
+        // cumulative share through control point k — a spot-bearing CP's
+        // dose is its delta segment, not the whole beam.
+        let cums = floats_tag(beam, tag(0x300A, 0x0134));
+        for (k, cp) in control_points.iter().enumerate() {
             // DS fields can carry "nan" — a non-finite value must not
             // replace the last good reading.
             energy = float_tag(cp, tag(0x300A, 0x0114))
@@ -1236,8 +1241,22 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 let mu = if has_weights {
                     weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight
                 } else {
-                    // UNIFORM — an equal share of the beam meterset.
-                    meterset / limit as f32
+                    // UNIFORM — this control point's cumulative-weight
+                    // segment divided evenly over its spots (PS3.3
+                    // C.8.8.25.7); the whole beam meterset went to every
+                    // spot-bearing CP otherwise. Missing sequence: split
+                    // the beam evenly across control points.
+                    let segment = cums.get(k).copied().unwrap_or(f32::NAN)
+                        - if k == 0 {
+                            0.0
+                        } else {
+                            cums.get(k - 1).copied().unwrap_or(f32::NAN)
+                        };
+                    if segment.is_finite() && segment > 0.0 {
+                        meterset * segment / final_weight / limit as f32
+                    } else {
+                        meterset / (limit * control_points.len()).max(1) as f32
+                    }
                 };
                 let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);
                 let y = xy.get(i * 2 + 1).copied().unwrap_or(f32::NAN);

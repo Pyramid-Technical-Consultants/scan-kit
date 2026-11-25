@@ -462,9 +462,13 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let values = f32_array(input, "values")?;
             let bins = match input.get("bins") {
                 None | Some(Value::Null) => 8,
-                Some(value) => value.as_u64().ok_or_else(|| {
-                    InvokeError::Message("bins must be a non-negative integer".into())
-                })? as usize,
+                Some(value) => value
+                    .as_f64()
+                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= u64::MAX as f64)
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        InvokeError::Message("bins must be a non-negative integer".into())
+                    })?,
             };
             json!({ "edges": quantile_edges(&values, bins) })
         }
@@ -472,9 +476,13 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let values = f32_array(input, "values")?;
             let bins = match input.get("bins") {
                 None | Some(Value::Null) => 16,
-                Some(value) => value.as_u64().ok_or_else(|| {
-                    InvokeError::Message("bins must be a non-negative integer".into())
-                })? as usize,
+                Some(value) => value
+                    .as_f64()
+                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= u64::MAX as f64)
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        InvokeError::Message("bins must be a non-negative integer".into())
+                    })?,
             };
             let (edges, counts) = histogram(&values, bins);
             json!({ "edges": edges, "counts": counts })

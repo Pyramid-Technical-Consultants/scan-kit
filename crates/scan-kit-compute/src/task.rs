@@ -1492,7 +1492,11 @@ impl Stage for McPlotStage {
         if !same {
             return false;
         }
-        let histories = job_histories(&jobs[0]);
+        // The extend target must cover every job's request — runs cannot
+        // shrink, so under-delivery reports Ready at fewer histories than
+        // asked. (The publish gate's min is per-run satisfied; different
+        // scalar, different job.)
+        let histories = jobs.iter().map(job_histories).max().unwrap_or(0);
         self.shared.target.store(histories, Ordering::Relaxed);
         // Runs cannot shrink — a lower request still transports the old
         // count, so total never drops below what the worker reports.
@@ -1740,8 +1744,10 @@ impl Stage for LibraryStage {
                     &scan_kit_io::default_db_path(),
                     &path,
                     &mut |done, total, preview| {
-                        shared.done.store(done, Ordering::Relaxed);
+                        // total first — a poll between the stores reads
+                        // done <= total either way round this order.
                         shared.total.store(total, Ordering::Relaxed);
+                        shared.done.store(done, Ordering::Relaxed);
                         if let Some(preview) = preview {
                             let mut slot =
                                 shared.preview.lock().unwrap_or_else(|err| err.into_inner());
@@ -1869,8 +1875,9 @@ impl Stage for CopyStage {
             let shared = Arc::clone(&self.shared);
             self.worker = Some(std::thread::spawn(move || {
                 let value = scan_kit_io::copy_runner(&dest, &mut |done, total| {
-                    shared.done.store(done, Ordering::Relaxed);
+                    // total first — see LibraryStage's callback.
                     shared.total.store(total, Ordering::Relaxed);
+                    shared.done.store(done, Ordering::Relaxed);
                     !shared.stop.load(Ordering::SeqCst)
                 })?;
                 serde_json::to_vec(&value).map_err(|err| err.to_string())
@@ -2034,6 +2041,14 @@ impl ExportStage {
                 // — and could overwrite a replacement export's dest.
                 if cancel.is_cancelled() {
                     let _ = std::fs::remove_file(&self.dest);
+                    if !self.dose {
+                        // finish_patient_report also commits a *_dvh.csv
+                        // sidecar — a cancelled report can't leave it
+                        // orphaned to pair with a different later PDF.
+                        let _ = std::fs::remove_file(crate::present::dvh_sidecar(Path::new(
+                            &self.dest,
+                        )));
+                    }
                     self.report.phase = Phase::Cancelled;
                     return Poll::Cancelled;
                 }

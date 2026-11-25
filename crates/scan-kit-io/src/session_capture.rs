@@ -1429,7 +1429,11 @@ fn write_termination(
     let last_dose = |ic: &str| -> Option<String> {
         let sheet = ic_sheet(ic)?;
         let index = sheet.column("total_dose")?;
-        let dose: f64 = sheet.rows.last()?.get(index)?.trim().parse().ok()?;
+        let dose: f64 = sheet
+            .rows
+            .iter()
+            .rev()
+            .find_map(|row| row.get(index)?.trim().parse().ok())?;
         // Summary convention is measured units — "Total dose target" below
         // scales its C targets INTO nC to sit beside this raw nC total.
         Some(num_text(dose))
@@ -1497,10 +1501,18 @@ fn write_termination(
         .or_else(|| {
             let sheet = ["ic3", "ic1", "ic2"].iter().find_map(|ic| ic_sheet(ic))?;
             let ic = ic_prefix(sheet)?;
-            let measured: Vec<f32> = column_values(sheet, "point_dose")
+            // Same preference spot_columns uses — a sheet carrying only
+            // total_dose would scale targets by an empty set (1.0).
+            let measured: Vec<f32> = ["point_dose", "total_dose"]
                 .iter()
-                .map(|v| *v as f32)
-                .collect();
+                .find_map(|name| {
+                    let values: Vec<f32> = column_values(sheet, name)
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect();
+                    (!values.is_empty()).then_some(values)
+                })
+                .unwrap_or_default();
             let targets: Vec<f32> = column_values(sheet, &format!("{ic}_dose_target"))
                 .iter()
                 .map(|v| *v as f32)
@@ -1526,7 +1538,8 @@ fn write_termination(
                     // adds a phantom layer too.
                     .filter_map(|cell| {
                         let cell = clean(cell);
-                        (!cell.is_empty()).then(|| join_key(cell))
+                        (!cell.is_empty() && !cell.eq_ignore_ascii_case("layer_id"))
+                            .then(|| join_key(cell))
                     })
                     .collect::<HashSet<_>>()
                     .len()

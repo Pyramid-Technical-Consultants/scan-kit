@@ -4,7 +4,7 @@
 //! `run_view` renders the same plot offscreen and returns the base64 frame that
 //! MCP and the view tests use.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use scan_kit_core::Cancel;
 use scan_kit_core::{is_session, Series, ToolKind, ToolSpec};
@@ -298,6 +298,17 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
     }
 }
 
+/// The `*_dvh.csv` path that pairs with a report written at `dest` — shared
+/// so the cancel path removes the same artifact the writer commits.
+pub(crate) fn dvh_sidecar(dest: &Path) -> PathBuf {
+    dest.with_file_name(format!(
+        "{}_dvh.csv",
+        dest.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("report")
+    ))
+}
+
 /// `scan_kit_write_report`: the QA report `scan_kit.qa.report.write_report`
 /// produced — the patient pipeline's metrics as a PDF, with the DVH curves in
 /// a `*_dvh.csv` sidecar. The task stage runs the transport; this is the tail.
@@ -332,12 +343,7 @@ pub(crate) fn finish_patient_report(
     // fresh PDF beside the report the task calls failed.
     let csv = scan_kit_io::report::dvh_csv(&curves, run.effective)?;
     let pdf = scan_kit_io::report::write_pdf(&report, dest)?;
-    let csv_path = dest.with_file_name(format!(
-        "{}_dvh.csv",
-        dest.file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("report")
-    ));
+    let csv_path = dvh_sidecar(dest);
     let mut out = json!({
         "pdf": pdf.display().to_string(),
         "provenance": report.provenance,

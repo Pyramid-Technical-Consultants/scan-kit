@@ -43,6 +43,9 @@ pub fn default_db_path() -> PathBuf {
         .filter(|value| !value.is_empty())
         .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
+        // ponytail: env-bare hosts get a CWD-relative store — a service
+        // account could mint a db under its launch dir; erroring instead
+        // would brick every tool on such hosts.
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".scan-kit").join("scan-kit.sqlite")
 }

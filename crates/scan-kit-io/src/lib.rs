@@ -532,6 +532,11 @@ impl std::fmt::Display for InvokeError {
 impl std::error::Error for InvokeError {}
 
 pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
+    if !input.is_null() && !input.is_object() {
+        // A non-object args payload would silently default every arg —
+        // callers get success for input they never intended.
+        return Err(InvokeError::Message("args must be an object".into()));
+    }
     match name {
         "scan_kit_open_library" => {
             let path = required_str(input, "path")?;
@@ -749,7 +754,14 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_write_phantom" => {
             let db = database_path(input)?;
             let parent = required_str(input, "parent")?;
-            let params = object_arg(input, "params")?;
+            // Schema marks params required — a missing object must not
+            // mint a full default study.
+            let params = match input.get("params") {
+                Some(value) if value.is_object() => value.clone(),
+                _ => {
+                    return Err(InvokeError::Message("params must be an object".into()));
+                }
+            };
             phantom::write(Path::new(parent), &params, &db).map_err(InvokeError::Message)
         }
         "scan_kit_runner_catalog" => {
@@ -813,6 +825,10 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
     let stored: Vec<(String, String)> = match action {
         "add" => {
             let folder = folder.ok_or("scanner folder required")?;
+            // "" would resolve against the process CWD and register it.
+            if folder.trim().is_empty() {
+                return Err("scanner folder required".into());
+            }
             // File IO outside STORE_LOCK — resolve before taking it.
             let calibration = calibration::CtCalibration::resolve(folder)?;
             store::with_store(db, |conn| {
@@ -1238,11 +1254,13 @@ fn library_root(path: &str) -> Result<String, String> {
     if location::is_remote_location(path) {
         return location::canonical_root(path);
     }
-    let path = Path::new(path);
-    if !path.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
+    // canonical_root unwraps file:// URIs and ~ before the dir check —
+    // open_library accepts those specs, so the write arms must too.
+    let root = location::canonical_root(path)?;
+    if !Path::new(&root).is_dir() {
+        return Err(format!("{root} is not a directory"));
     }
-    location::canonical_root(&path.to_string_lossy())
+    Ok(root)
 }
 
 fn database_path(input: &Value) -> Result<PathBuf, InvokeError> {

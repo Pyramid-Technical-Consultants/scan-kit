@@ -25,7 +25,7 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
     // A present-but-blank path is a caller error — silently degrading to
     // preview means the caller thinks a file was written.
     let path = match input.get("path") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(value) => match value.as_str().map(str::trim) {
             Some("") | None => return Err("path must be a non-empty string".into()),
             Some(text) => Some(text.to_owned()),
@@ -36,7 +36,7 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
     if let Some(path) = &path {
         validate_csv_path(Path::new(path))?;
     }
-    if let Some(csv_value) = input.get("csv") {
+    if let Some(csv_value) = input.get("csv").filter(|value| !value.is_null()) {
         let Some(csv) = csv_value.as_str() else {
             return Err("csv must be a string".into());
         };

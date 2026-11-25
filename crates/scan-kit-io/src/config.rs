@@ -58,9 +58,14 @@ pub fn open_folder(
         (Some(dir), Some(id)) => session_config_dir(dir, id),
         _ => None,
     };
+    // A half-specified session lookup would fall through to remembered
+    // and answer for a different folder's files.
+    if data_dir.is_some() != session_id.is_some() {
+        return Err("data_dir and session_id must come together".into());
+    }
     // Asked for a session's config and it isn't there — the remembered
     // fallback must not report a different folder's files as the answer.
-    if data_dir.is_some() && session_id.is_some() && from_session.is_none() {
+    if data_dir.is_some() && session_id.is_some() && from_session.is_none() && explicit.is_none() {
         return Err("that session has no configuration folder".into());
     }
     let chosen = explicit
@@ -218,9 +223,18 @@ pub fn save_folder(
         };
         // A failed source list would empty `kept` and delete every file at
         // dest — fail the save instead.
-        let kept: std::collections::HashSet<String> = list_tree(source)?.into_iter().collect();
+        // Compare on lowercase keys: the filesystem resolves
+        // case-insensitively, so dest/a.xml is covered by source/A.xml —
+        // a case-sensitive compare would delete the file it just copied.
+        let kept: std::collections::HashSet<String> = list_tree(source)?
+            .into_iter()
+            .map(|rel| rel.to_lowercase())
+            .collect();
         copy_tree(source, dest, 0)?;
-        for rel in stale.iter().filter(|rel| !kept.contains(*rel)) {
+        for rel in stale
+            .iter()
+            .filter(|rel| !kept.contains(&rel.to_lowercase()))
+        {
             if let Ok(stale) = under(dest, rel) {
                 let _ = fs::remove_file(&stale);
                 let _ = fs::remove_file(sidecar_path(&stale));
@@ -288,6 +302,7 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
     if found.is_empty() {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
+    found.dedup();
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
     if !params.is_object() {
         return Err("params must be an object".to_owned());
@@ -302,7 +317,7 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
     };
     let mut result = run_tune(workflow, &xml, &spots, &params, &label)?;
     if let Some(list) = result.get_mut("warnings").and_then(Value::as_array_mut) {
-        for warning in warnings {
+        for warning in warnings.into_iter().rev() {
             list.insert(0, json!(warning));
         }
     }
@@ -349,6 +364,7 @@ pub fn diff(input: &Value) -> Result<Value, String> {
     if found.is_empty() {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
+    found.dedup();
     let base_root = diff_root(loaded_dir);
     let mut base_files = walk_files(&base_root)?;
     // The open file diffs its in-memory text (form edits applied) so pending
@@ -1225,7 +1241,15 @@ fn under(root: &Path, rel: &str) -> Result<PathBuf, String> {
             Component::Normal(part) => Some(part),
             _ => None,
         })
-        .any(|part| dos(Path::new(part).file_stem().unwrap_or(part)))
+        .any(|part| {
+            let text = part.to_string_lossy();
+            let stem = text
+                .trim_end_matches(['.', ' '])
+                .split('.')
+                .next()
+                .unwrap_or_default();
+            dos(std::ffi::OsStr::new(stem))
+        })
     {
         return Err(format!("config path uses a reserved name: {rel}"));
     }
