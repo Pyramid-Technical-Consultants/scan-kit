@@ -25,6 +25,7 @@ function board() {
       acquire={async () => {
         throw new Error("the canvas has no size");
       }}
+      release={() => undefined}
       onChange={() => undefined}
       onAction={() => undefined}
       onReady={() => undefined}
@@ -70,6 +71,7 @@ it("tries a canvas again after its plot failed to open", async () => {
             }
             return plot as never;
           }}
+          release={() => undefined}
           onChange={() => undefined}
           onAction={() => undefined}
           onReady={(panel) => ready.push(panel)}

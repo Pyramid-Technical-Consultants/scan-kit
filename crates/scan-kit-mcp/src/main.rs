@@ -112,16 +112,11 @@ impl ScanKit {
         let spec = spec.trim();
         // `\\?\` verbatim and `\\.\` device paths are local — except
         // `\\?\UNC\`, which is a verbatim spelling of a share.
-        if spec
-            .get(..4)
-            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\.\"))
-        {
-            return false;
-        }
-        if spec
-            .get(..4)
-            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\?\"))
-        {
+        if spec.get(..4).is_some_and(|head| {
+            head.eq_ignore_ascii_case(r"\\.\") || head.eq_ignore_ascii_case(r"\\?\")
+        }) {
+            // Both prefixes spell the object-manager root — a UNC tail
+            // under either one reaches the same redirector.
             return spec
                 .get(4..8)
                 .is_some_and(|rest| rest.eq_ignore_ascii_case("UNC\\"));
@@ -144,20 +139,26 @@ impl ScanKit {
     /// Walks every string in the input; a JSON-in-JSON value such as
     /// options.scanners (a string carrying an array) is walked too.
     fn remote_in(value: &Value, name: &str) -> bool {
-        Self::remote_in_at(value, true, name)
+        Self::remote_in_at(value, true, name, 0)
     }
 
-    fn remote_in_at(value: &Value, top: bool, name: &str) -> bool {
+    fn remote_in_at(value: &Value, top: bool, name: &str, depth: u8) -> bool {
+        // Each string is re-parsed as JSON — serde caps one document's
+        // nesting but not a doc-inside-string chain. An arg needing more
+        // than a few re-parse levels is adversarial; gate it.
+        if depth >= 4 {
+            return true;
+        }
         match value {
             Value::String(spec) => {
                 Self::remote_spec(spec)
                     || serde_json::from_str::<Value>(spec)
                         .ok()
-                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false, name))
+                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false, name, depth + 1))
             }
             Value::Array(items) => items
                 .iter()
-                .any(|item| Self::remote_in_at(item, false, name)),
+                .any(|item| Self::remote_in_at(item, false, name, depth)),
             // `note` is the one free-text field in the tool surface — a note
             // that *is* a URL must not trip the path gate. The exemption is
             // top-level only and scoped to the one tool that takes a note:
@@ -167,7 +168,7 @@ impl ScanKit {
             Value::Object(map) => map.iter().any(|(key, value)| {
                 Self::remote_spec(key)
                     || !(top && name == "scan_kit_set_note" && key == "note" && value.is_string())
-                        && Self::remote_in_at(value, false, name)
+                        && Self::remote_in_at(value, false, name, depth)
             }),
             _ => false,
         }
@@ -193,7 +194,9 @@ fn catalog_specs() -> Vec<scan_kit_core::ToolSpec> {
     specs.extend_from_slice(scan_kit_compute::tools());
     specs.extend_from_slice(scan_kit_dicom::tools());
     // A name collision across catalogs would shadow the later tool.
-    debug_assert_eq!(
+    // Release too — a duplicate name would list a tool the first-match
+    // dispatch can never reach.
+    assert_eq!(
         specs
             .iter()
             .map(|tool| tool.name)
@@ -354,6 +357,11 @@ impl ServerHandler for ScanKit {
                 // tools (index scans) roll back instead of running to
                 // completion in a detached task.
                 let ct = context.ct;
+                // Cancelled while queued on the semaphore or mid-validation —
+                // do not spawn work the client already abandoned.
+                if ct.is_cancelled() {
+                    return Err(McpError::internal_error("cancelled", None));
+                }
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let flag = cancel.clone();
                 let tool = name.clone();
@@ -400,7 +408,11 @@ impl ServerHandler for ScanKit {
                 };
                 // rmcp silently discards response lines over 16 MiB — a
                 // full-dim run_view frame would hang the client, not fail it.
-                const MAX_RESULT: usize = 12 << 20;
+                // CallToolResult::structured duplicates the payload — once
+                // as structuredContent, once escaped inside content[].text
+                // — so the wire line runs up to ~3x the measured size
+                // against the 16 MiB transport cap.
+                const MAX_RESULT: usize = 5 << 20;
                 let oversized = serde_json::to_vec(&value)
                     .map(|bytes| bytes.len() > MAX_RESULT)
                     .unwrap_or(true);
@@ -461,17 +473,20 @@ mod tests {
         assert!(!ScanKit::remote_in_at(
             &json!({"note": "sftp://device.invalid/data"}),
             true,
-            "scan_kit_set_note"
+            "scan_kit_set_note",
+            0
         ));
         assert!(ScanKit::remote_in_at(
             &json!({"args": {"note": "sftp://device.invalid/data"}}),
             true,
-            "scan_kit_set_note"
+            "scan_kit_set_note",
+            0
         ));
         assert!(ScanKit::remote_in_at(
             &json!({"note": {"path": "sftp://device.invalid/data"}}),
             true,
-            "scan_kit_set_note"
+            "scan_kit_set_note",
+            0
         ));
     }
 
@@ -482,7 +497,8 @@ mod tests {
         assert!(ScanKit::remote_in_at(
             &json!({"note": "sftp://device.invalid/data"}),
             true,
-            "scan_kit_run_view"
+            "scan_kit_run_view",
+            0
         ));
     }
 
@@ -491,7 +507,8 @@ mod tests {
         assert!(ScanKit::remote_in_at(
             &json!({"sftp://host.invalid/share": "x"}),
             true,
-            "scan_kit_run_view"
+            "scan_kit_run_view",
+            0
         ));
     }
 

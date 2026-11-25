@@ -202,6 +202,11 @@ pub fn write_npz(path: &Path, entries: &[(String, Npy)]) -> Result<(), String> {
         if name.contains(['/', '\\']) {
             return Err(format!("npz entry name holds a separator: {name}"));
         }
+        // An empty name writes `.npy`, which the reader's basename strip
+        // silently drops — refuse it instead.
+        if name.is_empty() {
+            return Err("npz entry name is empty".into());
+        }
         writer
             .start_file(format!("{name}.npy"), options)
             .map_err(|err| err.to_string())?;

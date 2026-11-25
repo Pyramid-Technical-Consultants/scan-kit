@@ -180,18 +180,27 @@ pub fn encode_plot_reusing(
     let kept_sessions = keep_cubes(&scene.volume.sessions, &mut cube_count, &mut cube_voxels);
     let kept_plans = keep_cubes(&scene.volume.plans, &mut cube_count, &mut cube_voxels);
     let kept_companions = keep_cubes(&scene.volume.companions, &mut cube_count, &mut cube_voxels);
+    // serde_json writes NaN/inf as null, which the decoder refuses — a
+    // non-finite scene float would sink the whole frame. Clamp at encode.
+    fn finite(value: f32) -> f32 {
+        if value.is_finite() {
+            value
+        } else {
+            0.0
+        }
+    }
     let header = PlotHeader {
         title: scene.title.clone(),
         controls: scene.controls.clone(),
         table: scene.table.clone(),
         panels: header_panels(&scene.panels),
         columns: scene.columns,
-        column_weights: scene.column_weights.clone(),
-        row_weights: scene.row_weights.clone(),
-        row_splits: scene.row_splits.clone(),
+        column_weights: scene.column_weights.iter().copied().map(finite).collect(),
+        row_weights: scene.row_weights.iter().copied().map(finite).collect(),
+        row_splits: scene.row_splits.iter().copied().map(finite).collect(),
         side: scene.side,
-        background,
-        foreground,
+        background: background.map(finite),
+        foreground: foreground.map(finite),
         quality: quality.into(),
         line_token: stamp.token.to_string(),
         reuse_lines: reuse,
@@ -208,22 +217,22 @@ pub fn encode_plot_reusing(
             // cube bound — would desync or be refused on decode.
             [0, 0, 0]
         },
-        volume_origin: scene.volume.origin,
-        volume_voxel: scene.volume.voxel,
-        volume_spacing: scene.volume.spacing,
+        volume_origin: scene.volume.origin.map(finite),
+        volume_voxel: finite(scene.volume.voxel),
+        volume_spacing: scene.volume.spacing.map(finite),
         volume_ramp: scene.volume.ramp,
-        volume_lo: scene.volume.lo,
-        volume_hi: scene.volume.hi,
-        volume_base_lo: scene.volume.base_lo,
-        volume_base_hi: scene.volume.base_hi,
-        volume_gain: scene.volume.gain,
-        volume_opacity: scene.volume.opacity,
+        volume_lo: finite(scene.volume.lo),
+        volume_hi: finite(scene.volume.hi),
+        volume_base_lo: finite(scene.volume.base_lo),
+        volume_base_hi: finite(scene.volume.base_hi),
+        volume_gain: finite(scene.volume.gain),
+        volume_opacity: finite(scene.volume.opacity),
         volume_mode: scene.volume.mode,
         volume_filter: scene.volume.filter,
-        volume_gantry: scene.volume.gantry,
+        volume_gantry: finite(scene.volume.gantry),
         volume_unit: scene.volume.unit.clone(),
         volume_phantom: scene.volume.show_phantom,
-        volume_field: scene.volume.field,
+        volume_field: scene.volume.field.map(finite),
         volume_ct: scene.volume.ct.len() >= voxels,
         volume_labels: scene.volume.labels.len() >= voxels,
         volume_sessions: kept_sessions.len() as u32,
@@ -239,6 +248,7 @@ pub fn encode_plot_reusing(
         volume_colors: kept_sessions
             .iter()
             .filter_map(|&index| scene.volume.session_colors.get(index).copied())
+            .map(|color| color.map(finite))
             .collect(),
     };
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;

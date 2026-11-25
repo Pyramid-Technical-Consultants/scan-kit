@@ -222,8 +222,13 @@ pub(super) fn limit_name(parts: &[String], max_length: usize) -> String {
     if minimal.len() <= max_stem {
         return format!("{minimal}{suffix}");
     }
-    let cut = minimal.chars().take(max_stem).collect::<String>();
-    format!("{cut}{suffix}")
+    // max_stem is a byte budget — take(max_stem) chars can overrun it on
+    // a multibyte stem. Cut on a char boundary instead.
+    let mut end = max_stem.min(minimal.len());
+    while !minimal.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &minimal[..end])
 }
 
 pub(super) fn energy_compact(part: &str) -> String {

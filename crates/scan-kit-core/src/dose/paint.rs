@@ -191,6 +191,11 @@ pub fn painted_unit(unit: &str, mode: u8, gamma: bool) -> String {
 }
 
 pub fn trim_number(value: f32) -> String {
+    // A non-finite bound would emit the bare literal "inf"/"NaN" into the
+    // slider's number fields.
+    if !value.is_finite() {
+        return "0".into();
+    }
     if (value - value.round()).abs() < 1e-4 && value.abs() < 1.0e6 {
         format!("{}", value.round() as i32)
     } else {

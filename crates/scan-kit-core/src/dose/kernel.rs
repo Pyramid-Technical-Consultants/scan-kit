@@ -298,7 +298,7 @@ pub(super) fn layer_energies(energy: &[f32]) -> Vec<f32> {
     let raw: Vec<f64> = energy
         .iter()
         .copied()
-        .filter(|e| e.is_finite() && *e > 1.0)
+        .filter(|e| e.is_finite() && *e > 1.0 && *e <= 400.0)
         .map(f64::from)
         .collect();
     if raw.is_empty() {

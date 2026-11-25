@@ -26,6 +26,7 @@ function DoseCell({
   toolbar,
   plots,
   acquire,
+  release,
   onReady,
   onInput,
   onError,
@@ -36,6 +37,7 @@ function DoseCell({
   toolbar: ReactNode;
   plots: { current: (Plotter | null)[] };
   acquire: (node: HTMLCanvasElement) => Promise<Plotter>;
+  release: (node: HTMLCanvasElement) => void;
   onReady: (panel: number) => void;
   onInput: (panel: number) => void;
   onError: (reason: unknown) => void;
@@ -191,6 +193,7 @@ function DoseCell({
     return () => {
       live = false;
       slots[panel] = null;
+      release(node);
       observer.disconnect();
       unwatchDpr();
       node.removeEventListener("wheel", onWheel);
@@ -202,7 +205,7 @@ function DoseCell({
       node.removeEventListener("keydown", onKey);
       node.removeEventListener("contextmenu", onMenu);
     };
-  }, [shown, panel, plots, acquire]);
+  }, [shown, panel, plots, acquire, release]);
 
   return (
     <div style={{ flex: `${grow} 1 0px` }} className="flex min-h-0 min-w-0 flex-col">
@@ -220,6 +223,7 @@ export function DoseBoard({
   resolved,
   plots,
   acquire,
+  release,
   onChange,
   onAction,
   onReady,
@@ -232,6 +236,7 @@ export function DoseBoard({
   resolved: Readonly<Record<string, string>>;
   plots: { current: (Plotter | null)[] };
   acquire: (node: HTMLCanvasElement) => Promise<Plotter>;
+  release: (node: HTMLCanvasElement) => void;
   onChange: (id: string, value: string) => void;
   onAction: (panel: number, action: string) => void;
   onReady: (panel: number) => void;
@@ -322,6 +327,7 @@ export function DoseBoard({
                     shown={shown}
                     plots={plots}
                     acquire={acquire}
+                    release={release}
                     onReady={onReady}
                     onInput={onInput}
                     onError={onError}

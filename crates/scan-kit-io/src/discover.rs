@@ -441,6 +441,16 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
         if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
             return None;
         }
+        // symlink_metadata only inspects the leaf — a symlinked `config/` or
+        // `ic_hv_toggle/` component reads outside the session dir too.
+        if path
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| *ancestor != root)
+            .any(|ancestor| ancestor.is_symlink())
+        {
+            return None;
+        }
         return fs::File::open(path)
             .ok()
             .and_then(|mut file| read_capped(&mut file, filename, MAX_MEMBER_BYTES).ok());
@@ -762,6 +772,11 @@ pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
 fn normalize_member(name: &str) -> String {
     let name = name.replace('\\', "/");
     let name = name.trim_start_matches("./");
+    // An absolute member is a second tree member_root cannot see — the
+    // suffix matcher would still serve it.
+    if name.starts_with('/') {
+        return String::new();
+    }
     // A mid-path `..` escapes the tree — the member must not bind to a file
     // it only reaches by traversal.
     if name.split('/').any(|part| part == "..") {

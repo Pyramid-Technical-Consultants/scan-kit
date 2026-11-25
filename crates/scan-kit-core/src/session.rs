@@ -120,6 +120,7 @@ impl SessionMeta {
     pub fn short_time(&self) -> String {
         match self.treatment_time_s {
             Some(seconds) => {
+                let seconds = seconds.max(0);
                 let minutes = seconds.div_euclid(60);
                 let remain = seconds.rem_euclid(60);
                 format!("{minutes}:{remain:02}")

@@ -262,6 +262,14 @@ function plotterFor(node: HTMLCanvasElement): Promise<Plotter> {
   return pending;
 }
 
+function releasePlotter(node: HTMLCanvasElement): void {
+  const pending = plotters.get(node);
+  if (pending != null) {
+    plotters.delete(node);
+    pending.then((plot) => plot.free()).catch(() => {});
+  }
+}
+
 function parseColor(value: string): [number, number, number, number] {
   const canvas = document.createElement("canvas");
   canvas.width = 1;
@@ -772,6 +780,9 @@ export function AnalysisView({
       unwatchDpr();
       creating.current = null;
       plotter.current = null;
+      // Free the device now — WebPlot::drop runs device.destroy but only on
+      // GC, and a switched-back view must not reuse a stale cache entry.
+      releasePlotter(node);
       cancelAnimationFrame(frame.current);
       frame.current = 0;
     };
@@ -1517,6 +1528,7 @@ export function AnalysisView({
             resolved={resolved}
             plots={dosePlots}
             acquire={plotterFor}
+            release={releasePlotter}
             onChange={apply}
             onAction={(panel, action) => {
               dosePlots.current[panel]?.dose_action(panel, action);
