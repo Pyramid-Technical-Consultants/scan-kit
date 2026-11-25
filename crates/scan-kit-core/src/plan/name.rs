@@ -69,13 +69,15 @@ pub(super) fn energy_part(template: &str, params: &Value) -> String {
         }
     }
     if energies.len() <= 4 {
+        // "+" keeps the list from reading as a contiguous Ehi-Elo range —
+        // [250, 70] would otherwise collide with the full 250->70 run.
         return format!(
             "E{}",
             energies
                 .iter()
                 .map(|energy| num(*energy, 3))
                 .collect::<Vec<_>>()
-                .join("-")
+                .join("+")
         );
     }
     format!(
@@ -95,7 +97,7 @@ pub(super) fn geometry_part(template: &str, params: &Value, dicom_label: Option<
                 sanitize(&path_stem(&text(params, "dicom_path", "")))
             }
         }
-        "zero_field" => format!("Sp{}", int_param(params, "spots_per_layer", 0)),
+        "zero_field" => format!("Sp{}", int_param(params, "spots_per_layer", 100)),
         "rectangular_field" => {
             let mut segments = Vec::new();
             let center_x = number(params, "center_x_mm", 0.0);
@@ -103,15 +105,17 @@ pub(super) fn geometry_part(template: &str, params: &Value, dicom_label: Option<
             if center_x != 0.0 || center_y != 0.0 {
                 segments.push(format!("C{}x{}", num(center_x, 3), num(center_y, 3)));
             }
+            // Defaults match field.rs — a null param generates these
+            // values, so the filename must not say 0 for them.
             segments.push(format!(
                 "{}x{}mm",
-                num(number(params, "field_width_mm", 0.0), 3),
-                num(number(params, "field_height_mm", 0.0), 3)
+                num(number(params, "field_width_mm", 100.0), 3),
+                num(number(params, "field_height_mm", 100.0), 3)
             ));
             segments.push(format!(
                 "G{}x{}",
-                int_param(params, "spots_x", 0),
-                int_param(params, "spots_y", 0)
+                int_param(params, "spots_x", 33),
+                int_param(params, "spots_y", 33)
             ));
             segments.join("_")
         }
@@ -124,11 +128,11 @@ pub(super) fn weight_part(template: &str, params: &Value) -> String {
         return String::new();
     }
     match text(params, "spot_weight_method", "fixed").as_str() {
-        "fixed" => format!("Wfix{}", num(number(params, "spot_weight_mu", 0.0), 4)),
+        "fixed" => format!("Wfix{}", num(number(params, "spot_weight_mu", 0.02), 4)),
         "random_range" => format!(
             "Wrng{}-{}",
-            num(number(params, "spot_weight_min_mu", 0.0), 4),
-            num(number(params, "spot_weight_max_mu", 0.0), 4)
+            num(number(params, "spot_weight_min_mu", 0.002), 4),
+            num(number(params, "spot_weight_max_mu", 0.1), 4)
         ),
         "layer_even_range" => {
             let prefix = if bool_param(params, "spot_weight_layer_shuffle", false) {
@@ -138,24 +142,26 @@ pub(super) fn weight_part(template: &str, params: &Value) -> String {
             };
             format!(
                 "{prefix}{}-{}",
-                num(number(params, "spot_weight_min_mu", 0.0), 4),
-                num(number(params, "spot_weight_max_mu", 0.0), 4)
+                num(number(params, "spot_weight_min_mu", 0.002), 4),
+                num(number(params, "spot_weight_max_mu", 0.1), 4)
             )
         }
         "even_total" => format!(
             "Wtot{}",
-            num(number(params, "spot_weight_total_mu", 0.0), 4)
+            num(number(params, "spot_weight_total_mu", 1.0), 4)
         ),
         "random_total_variance" => format!(
             "Wtot{}v{}",
-            num(number(params, "spot_weight_total_mu", 0.0), 4),
-            num(number(params, "spot_weight_variance_pct", 0.0), 1)
+            num(number(params, "spot_weight_total_mu", 1.0), 4),
+            num(number(params, "spot_weight_variance_pct", 10.0), 1)
         ),
         _ => "W".into(),
     }
 }
 
 pub(super) fn num(value: f64, decimals: usize) -> String {
+    // Normalize -0 so a negative sub-decimal value can't emit a "-" segment.
+    let value = if value == 0.0 { 0.0 } else { value };
     let text = trim_zeros(&format!("{value:.decimals$}"));
     if text.is_empty() {
         "0".into()
@@ -220,8 +226,13 @@ pub(super) fn limit_name(parts: &[String], max_length: usize) -> String {
     if minimal.len() <= max_stem {
         return format!("{minimal}{suffix}");
     }
-    let cut = minimal.chars().take(max_stem).collect::<String>();
-    format!("{cut}{suffix}")
+    // max_stem is a byte budget — take(max_stem) chars can overrun it on
+    // a multibyte stem. Cut on a char boundary instead.
+    let mut end = max_stem.min(minimal.len());
+    while !minimal.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &minimal[..end])
 }
 
 pub(super) fn energy_compact(part: &str) -> String {

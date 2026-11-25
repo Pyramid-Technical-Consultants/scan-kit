@@ -260,6 +260,7 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
         PlotKind::Gamma => {
             let (title, series) = gamma_panel(space);
             let y_label = match space.gamma {
+                Some((_, rate)) if rate.is_nan() => "Voxels · —".into(),
                 Some((_, rate)) => {
                     format!("Voxels · {:.0}% {}", rate.floor(), gamma_verdict(rate))
                 }
@@ -305,6 +306,11 @@ fn gamma_verdict(rate: f32) -> &'static str {
 }
 
 fn gamma_heading(rate: f32) -> String {
+    // Zero scored voxels is "not evaluated" — TG-218 pass/fail asserts a
+    // comparison happened, and there was none.
+    if rate.is_nan() {
+        return "Gamma Histogram  —".into();
+    }
     // Truncate — 94.6% rounding up to "95" would cross the action boundary
     // the verdict itself cites.
     format!(
@@ -532,18 +538,25 @@ fn span(series: &[Series]) -> (f32, f32, f32, f32) {
             }
             Series::Bars { edges, counts, .. } => {
                 for edge in edges {
-                    xmin = xmin.min(*edge);
-                    xmax = xmax.max(*edge);
+                    if edge.is_finite() {
+                        xmin = xmin.min(*edge);
+                        xmax = xmax.max(*edge);
+                    }
                 }
                 for count in counts {
-                    ymin = ymin.min(0.0);
-                    ymax = ymax.max(*count);
+                    if count.is_finite() {
+                        ymin = ymin.min(0.0);
+                        ymax = ymax.max(*count);
+                    }
                 }
             }
             _ => {}
         }
     }
     if !xmin.is_finite() {
+        return (0.0, 1.0, 0.0, 1.0);
+    }
+    if !(xmin <= xmax && ymin <= ymax) {
         return (0.0, 1.0, 0.0, 1.0);
     }
     if (xmax - xmin).abs() < 1e-4 {
@@ -645,6 +658,12 @@ pub(crate) fn overlay_sessions(
     volumes: &[Volume],
     at: [f32; 3],
     gamma: &[Volume],
+    // Under compare:gamma|difference `volumes` is a residual field — DVH
+    // needs the measured cubes.
+    measured: &[Volume],
+    // The gamma-to-lateral fallback retitles the panel; the dose label is
+    // not derivable from the cubes.
+    dose_label: &str,
 ) {
     if volumes.len() < 2 {
         return;
@@ -657,13 +676,20 @@ pub(crate) fn overlay_sessions(
         panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("dvh") {
-        panel.series = volumes.iter().map(dvh_line).collect();
+        panel.series = measured.iter().map(dvh_line).collect();
         fit_panel(panel);
-    } else if title.starts_with("gamma") && gamma.len() <= 1 {
-        // No gamma metric (analytic run, no TPS dose, beam filter) - the
-        // second default cell would otherwise be a permanently blank panel.
+    } else if title.starts_with("gamma")
+        && gamma
+            .iter()
+            .all(|v| !v.values.iter().any(|x| x.is_finite()))
+    {
+        // No scored gamma (analytic run, no TPS dose, beam filter) - the
+        // second default cell would otherwise draw flat zero "curves" that
+        // read as a passing gamma.
         panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
         panel.title = "Lateral".into();
+        panel.y_label = dose_label.into();
+        panel.x_label = "Across the beam from the crosshair (mm)".into();
         fit_panel(panel);
     } else if title.starts_with("gamma") {
         panel.series = gamma_lines(gamma);
@@ -764,7 +790,8 @@ mod tests {
             x_labels: Vec::new(),
             equal: false,
         };
-        overlay_sessions(&mut panel, &[low, high], [0.5, 0.5, 0.5], &[]);
+        let volumes = [low, high];
+        overlay_sessions(&mut panel, &volumes, [0.5, 0.5, 0.5], &[], &volumes, "Dose");
         assert_eq!(panel.series.len(), 2);
         assert!(panel.ymax >= 8.0, "{}", panel.ymax);
     }
@@ -858,10 +885,10 @@ mod tests {
             };
             let (panels, mark) = assemble(space);
             assert_eq!(panels.len(), 6, "{kind:?}");
-            assert!(
-                !panels[4].series.is_empty() || kind == PlotKind::Gamma,
-                "{kind:?}"
-            );
+            // The fixture supplies gamma data, so the panel must carry
+            // series for every kind — no carve-out for the one case that
+            // could actually regress.
+            assert!(!panels[4].series.is_empty(), "{kind:?}");
             assert_eq!(mark.values.len(), 8);
             assert!(panels.iter().any(|panel| panel.title.starts_with("3D")));
             assert_eq!(panels[0].x_label, "X (mm)");

@@ -40,7 +40,7 @@ export async function driveTask(
   args: Record<string, unknown>,
   onUpdate: (report: Report, payload: Uint8Array | null) => void,
   stop: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
   const started = await invoke<{ task: number; generation: number; superseded?: boolean }>(
     "scan_kit_start",
     args,
@@ -48,22 +48,27 @@ export async function driveTask(
   // A superseded ticket belongs to another view's task — polling it would
   // settle this view on unrelated work, and it is not ours to cancel.
   if (started.superseded) {
-    return;
+    return false;
   }
   if (stop()) {
     await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
-    return;
+    return true;
   }
   let misses = 0;
   for (;;) {
     if (stop()) {
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
-      return;
+      return true;
     }
     let parsed;
     try {
       const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task, generation: started.generation });
       parsed = parsePoll(bytesOf(raw));
+      // A malformed frame must throw inside the cancel guard — dereferencing
+      // a bad report outside it leaves the backend task running unpolled.
+      if (parsed.report == null || typeof parsed.report !== "object") {
+        throw new Error("bad poll frame");
+      }
     } catch (reason) {
       // The backend task keeps running without a poller — cancel it, then propagate.
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation }).catch(() => {});
@@ -80,7 +85,7 @@ export async function driveTask(
     misses = 0;
     if (stop()) {
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
-      return;
+      return true;
     }
     try {
       onUpdate(parsed.report, parsed.payload);
@@ -96,7 +101,7 @@ export async function driveTask(
       if (parsed.report.phase !== "done") {
         throw new Error(`the task ended ${parsed.report.phase}`);
       }
-      return;
+      return true;
     }
     // An unpaced loop spins thousands of IPC round-trips per second for the
     // task's whole duration — each one serializes a report and schedules a

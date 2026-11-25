@@ -11,8 +11,8 @@ use serde_json::Value;
 use crate::histogram::{bin_button, bins_control, hist_bin_count, histogram_panel};
 
 use super::{
-    col, control, drew_line, finite_col, flag, guide, labeled, panel, pick, placed, scene,
-    slice_table, spot_table, stroke, text, timeslice_metric, MARK,
+    col, consumes_slot, control, drew_line, finite_col, flag, guide, labeled, panel, pick, placed,
+    scene, slice_table, spot_table, stroke, text, timeslice_metric, MARK,
 };
 
 const DRAW_CHOICES: &[(&str, &str)] = &[
@@ -370,7 +370,10 @@ fn padded_span(values: &[f32]) -> (f32, f32) {
     // A constant column has no span to pad — pad around the value like
     // density_range, or every density/contour sample falls off-grid.
     if hi == lo {
-        return ((lo - 0.5).max(-f32::MAX), (hi + 0.5).min(f32::MAX));
+        // Same representability ceiling as uniform_edges — a fixed 0.5 pad
+        // rounds away for |lo| above ~2^23 and collapses x0 == x1.
+        let pad = (lo.abs() * f32::EPSILON).max(0.5);
+        return ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX));
     }
     let pad = ((hi - lo) * 0.04).max(1e-4);
     ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX))
@@ -619,18 +622,21 @@ fn column_scene(
             } else {
                 kept_pairs(table, x_key, y_key, segments, false)
             };
-            if xs.is_empty() {
-                continue;
+            if histograms {
+                // One entry per cloud — a session without timed pairs falls
+                // back to its full pairs, like the empty-windowed consumer.
+                let (hx, hy) = if times.is_empty() {
+                    (xs.clone(), ys.clone())
+                } else {
+                    let (hx, hy, _) = kept_pairs(table, x_key, y_key, segments, false);
+                    (hx, hy)
+                };
+                windowed.push((hx, hy));
             }
-            if histograms && !times.is_empty() {
-                let (hx, hy, _) = kept_pairs(table, x_key, y_key, segments, false);
-                if !hx.is_empty() {
-                    windowed.push((hx, hy));
-                }
-            }
+            // An empty cloud still holds this session's palette slot.
             clouds.push((xs, ys, times));
         }
-        if !clouds.is_empty() {
+        if clouds.iter().any(|(xs, _, _)| !xs.is_empty()) {
             columns.push(DrawnColumn {
                 name,
                 clouds,
@@ -705,7 +711,14 @@ fn column_scene(
             series.push(guide(vec![lo, hi], vec![lo, hi]));
         }
         for (xs, ys, times) in &column.clouds {
-            series.extend(cloud_series(xs, ys, times, kind));
+            let mut marks = cloud_series(xs, ys, times, kind);
+            // A contour too sparse to draw (or drawing only alpha-0
+            // isolines) still holds its palette slot — the placeholder
+            // also keeps those marks linked to this session's color.
+            if !marks.iter().any(consumes_slot) && matches!(kind, CloudDraw::Contour { .. }) {
+                marks.insert(0, stroke(Vec::new(), Vec::new(), false));
+            }
+            series.extend(marks);
         }
         let mut top = panel(String::new(), lo, hi, lo, hi, series);
         top.equal = true;
@@ -794,16 +807,19 @@ fn confidence_scene(
             for (slot, pass) in keep.iter_mut().zip(&other) {
                 *slot = *slot && *pass;
             }
+            // A shorter confidence table must not leave its tail
+            // peaks-only — masked_pairs reads a missing slot as pass.
+            for slot in keep.iter_mut().skip(other.len()) {
+                *slot = false;
+            }
             let (xs, ys) = masked_pairs(
                 peaks.get(peak_key).map(Vec::as_slice).unwrap_or(&[]),
                 confidence.get(conf_key).map(Vec::as_slice).unwrap_or(&[]),
                 &keep,
             );
-            if !xs.is_empty() {
-                clouds.push((xs, ys));
-            }
+            clouds.push((xs, ys));
         }
-        if clouds.is_empty() {
+        if clouds.iter().all(|(xs, _)| xs.is_empty()) {
             continue;
         }
         if draw == "density" || draw == "contour" {
@@ -830,7 +846,14 @@ fn confidence_scene(
             };
             let series = clouds
                 .iter()
-                .flat_map(|(xs, ys)| cloud_series(xs, ys, &[], kind))
+                .flat_map(|(xs, ys)| {
+                    let mut marks = cloud_series(xs, ys, &[], kind);
+                    if !marks.iter().any(consumes_slot) && matches!(kind, CloudDraw::Contour { .. })
+                    {
+                        marks.insert(0, stroke(Vec::new(), Vec::new(), false));
+                    }
+                    marks
+                })
                 .collect::<Vec<_>>();
             if !series.is_empty() {
                 panels.push(panel(title.to_owned(), x0, x1, y0, y1, series));
@@ -872,6 +895,9 @@ fn coverage_scene(root: &Path, session_ids: &[String], segments: &[Segment]) -> 
             let metrics =
                 spot_coverage_metrics(None, col(&table, x_key), col(&table, y_key), &keep);
             if metrics.is_empty() {
+                // A session with no coverage data draws nothing but must
+                // still hold its palette slot.
+                series.push(stroke(Vec::new(), Vec::new(), false));
                 continue;
             }
             series.push(stroke(
@@ -958,10 +984,11 @@ mod tests {
     #[test]
     fn extreme_finite_columns_produce_finite_limits() {
         let samples = vec![-f32::MAX, f32::MAX];
-        let (lo, hi) = distribution_limits("spots", &samples);
-        assert!(lo.is_finite() && hi.is_finite());
-        let (lo, hi) = padded_span(&samples);
-        assert!(lo.is_finite() && hi.is_finite());
+        assert_eq!(
+            distribution_limits("spots", &samples),
+            (-f32::MAX, f32::MAX)
+        );
+        assert_eq!(padded_span(&samples), (-f32::MAX, f32::MAX));
     }
 
     #[test]

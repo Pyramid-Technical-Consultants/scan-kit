@@ -391,6 +391,12 @@ fn rows_from_import(spots: &[ImportSpot], params: &Value) -> Result<Vec<Row>, St
     if spots.is_empty() {
         return Err("No planned spots with positive MU found in plan file".into());
     }
+    // Same budget validate_spot_budget applies to generated templates — a
+    // dense import would otherwise hang in layer grouping and produce an
+    // unbounded document.
+    if spots.len() > 1_000_000 {
+        return Err("Plan file declares more than 1,000,000 spots.".into());
+    }
     let order = text(params, "spot_order", "plan_order");
     let axis = text(params, "fast_axis", "x");
     let ordered = order_within_layers(spots, &order, &axis);
@@ -457,7 +463,12 @@ fn preview_row(index: usize, row: &Row) -> Vec<String> {
         trim_float(row.beam_size),
         trim_float(row.x),
         trim_float(row.y),
-        format!("{:.4}", row.charge),
+        // A sub-1e-4 MU spot is real — don't preview it as a literal zero.
+        if row.charge != 0.0 && format!("{:.4}", row.charge) == "0.0000" {
+            format!("{:.2e}", row.charge)
+        } else {
+            format!("{:.4}", row.charge)
+        },
         trim_float(row.velocity),
     ]
 }
@@ -485,7 +496,13 @@ fn csv_num(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
-    trim_zeros(&format!("{value:.12}"))
+    let fixed = trim_zeros(&format!("{value:.12}"));
+    // A nonzero sub-1e-12 magnitude would emit a literal "0" — a positive
+    // charge silently becoming a zero-charge row in the uploaded map.
+    if fixed.parse::<f64>() == Ok(0.0) {
+        return format!("{value:e}");
+    }
+    fixed
 }
 
 fn trim_float(value: f64) -> String {
@@ -528,13 +545,10 @@ fn format_summary(rows: &[Row], cap: usize) -> String {
 }
 
 fn unique_energies(rows: &[Row]) -> usize {
-    let mut seen = Vec::new();
-    for row in rows {
-        if !seen.contains(&row.energy) {
-            seen.push(row.energy);
-        }
-    }
-    seen.len()
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .filter(|row| seen.insert(row.energy.to_bits()))
+        .count()
 }
 
 fn format_delivery(seconds: f64) -> String {
@@ -619,6 +633,17 @@ fn validate_energies(params: &Value) -> Vec<String> {
     if list.map(|items| items.is_empty()).unwrap_or(true) {
         return vec!["Select at least one energy layer.".into()];
     }
+    // A value outside the catalog is dropped by selected_energies — a
+    // [good, bogus] selection must error, not silently generate only good.
+    if list.is_some_and(|items| {
+        items.iter().any(|item| {
+            item.as_f64()
+                .map(|energy| !STANDARD_ENERGIES_MEV.contains(&energy))
+                .unwrap_or(true)
+        })
+    }) {
+        return vec!["An energy layer is not in the catalog.".into()];
+    }
     if selected_energies(params).is_empty() {
         return vec!["Select at least one energy layer.".into()];
     }
@@ -626,19 +651,32 @@ fn validate_energies(params: &Value) -> Vec<String> {
 }
 
 fn validate_weights(params: &Value) -> Vec<String> {
+    if params
+        .get("spot_weight_method")
+        .is_some_and(|value| !value.is_string() && !value.is_null())
+    {
+        return vec!["Select a spot weight method.".into()];
+    }
     let method = text(params, "spot_weight_method", "fixed");
     match method.as_str() {
-        "fixed" => validate_min_float(params.get("spot_weight_mu"), "Spot Weight (MU)", 0.0001),
-        "even_total" => validate_min_float(
+        "fixed" => validate_bounded_float(
+            params.get("spot_weight_mu"),
+            "Spot Weight (MU)",
+            0.0001,
+            10_000.0,
+        ),
+        "even_total" => validate_bounded_float(
             params.get("spot_weight_total_mu"),
             "Target Total Weight (MU)",
             0.0001,
+            1_000_000.0,
         ),
         "random_total_variance" => {
-            let mut errors = validate_min_float(
+            let mut errors = validate_bounded_float(
                 params.get("spot_weight_total_mu"),
                 "Target Total Weight (MU)",
                 0.0001,
+                1_000_000.0,
             );
             if !errors.is_empty() {
                 return errors;
@@ -662,15 +700,17 @@ fn validate_weights(params: &Value) -> Vec<String> {
 }
 
 fn validate_weight_range(params: &Value) -> Vec<String> {
-    let mut errors = validate_min_float(
+    let mut errors = validate_bounded_float(
         params.get("spot_weight_min_mu"),
         "Minimum Weight (MU)",
         0.0001,
+        10_000.0,
     );
-    errors.extend(validate_min_float(
+    errors.extend(validate_bounded_float(
         params.get("spot_weight_max_mu"),
         "Maximum Weight (MU)",
         0.0001,
+        10_000.0,
     ));
     if !errors.is_empty() {
         return errors;
@@ -684,6 +724,10 @@ fn validate_weight_range(params: &Value) -> Vec<String> {
 }
 
 fn validate_variance(value: Option<&Value>) -> Vec<String> {
+    // The consumer defaults null, like the bounded floats do.
+    if value.is_some_and(Value::is_null) {
+        return Vec::new();
+    }
     let Some(number) = value.and_then(Value::as_f64) else {
         return vec!["Spot Variance (%) must be a number.".into()];
     };
@@ -701,6 +745,17 @@ fn validate_variance(value: Option<&Value>) -> Vec<String> {
 
 fn validate_spot_order(params: &Value) -> Vec<String> {
     let mut errors = Vec::new();
+    for key in ["spot_order", "fast_axis"] {
+        if params
+            .get(key)
+            .is_some_and(|value| !value.is_string() && !value.is_null())
+        {
+            errors.push(format!("{key} must be a string."));
+        }
+    }
+    if !errors.is_empty() {
+        return errors;
+    }
     let order = text(params, "spot_order", "plan_order");
     if order != "plan_order" && order != "minimize_travel" {
         errors.push("Spot order must be Plan Order or Minimize Travel.".into());
@@ -715,8 +770,8 @@ fn validate_spot_order(params: &Value) -> Vec<String> {
 }
 
 fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64) -> Vec<String> {
-    // The consumer defaults null the same as the bool fields do.
-    if value.is_some_and(Value::is_null) {
+    // The consumer defaults a missing key the same as an explicit null.
+    if value.is_none_or(Value::is_null) {
         return Vec::new();
     }
     let Some(number) = value.and_then(Value::as_f64) else {
@@ -729,22 +784,6 @@ fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64
     // center, so the edges themselves must pass.
     if number < min || number > max {
         return vec![format!("{label} must be at least {min} and at most {max}.")];
-    }
-    Vec::new()
-}
-
-fn validate_min_float(value: Option<&Value>, label: &str, min: f64) -> Vec<String> {
-    if value.is_some_and(Value::is_null) {
-        return Vec::new();
-    }
-    let Some(number) = value.and_then(Value::as_f64) else {
-        return vec![format!("{label} must be a number.")];
-    };
-    if !number.is_finite() {
-        return vec![format!("{label} must be a finite number.")];
-    }
-    if number < min {
-        return vec![format!("{label} must be at least {min}.")];
     }
     Vec::new()
 }
@@ -764,7 +803,8 @@ fn validate_spot_budget(params: &Value, per_layer: i64) -> Vec<String> {
 }
 
 fn validate_positive_int(value: Option<&Value>, label: &str, max: i64) -> Vec<String> {
-    if value.is_some_and(Value::is_null) {
+    // A missing key takes the catalog default, like an explicit null.
+    if value.is_none_or(Value::is_null) {
         return Vec::new();
     }
     let Some(number) = value.and_then(as_int) else {
@@ -1266,7 +1306,8 @@ mod tests {
         layer.sort_by(|left, right| left.partial_cmp(right).unwrap());
         assert!((layer[0] - 0.01).abs() < 1e-9);
         assert!((layer[1] - 0.04).abs() < 1e-9);
-        assert!((shuffled[2] - 0.01).abs() < 1e-9);
+        // A one-spot layer lands at the range midpoint, not the edge.
+        assert!((shuffled[2] - 0.025).abs() < 1e-9);
         let random = random_total(5, 1.0, 10.0).unwrap();
         let sum: f64 = random.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
@@ -1495,6 +1536,69 @@ mod tests {
         );
         assert!(short.len() <= 40);
         assert!(short.ends_with(".csv"));
+    }
+
+    #[test]
+    fn non_catalog_energies_are_rejected_not_dropped() {
+        // A [good, bogus] selection used to silently generate only good —
+        // the plan would ship fewer layers than the filename suggests.
+        assert!(!validate_plan(
+            "zero_field",
+            &serde_json::json!({"selected_energies": [100.0, 999.0]})
+        )
+        .is_empty());
+        // A non-numeric entry is also a reject, not a silent skip.
+        assert!(!validate_plan(
+            "zero_field",
+            &serde_json::json!({"selected_energies": [100.0, "100"]})
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_null_variance_uses_the_default_like_the_consumer() {
+        // The consumer defaults null to 10% — validation must not call it
+        // "not a number" while the generator proceeds.
+        let errors = validate_plan(
+            "zero_field",
+            &serde_json::json!({
+                "selected_energies": [100.0],
+                "spots_per_layer": 100,
+                "spot_weight_method": "random_total_variance",
+                "spot_weight_total_mu": 1.0,
+                "spot_weight_variance_pct": null,
+            }),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_wrong_type_enum_param_errors_instead_of_coercing() {
+        // spot_weight_method: 7 used to coerce to "fixed" everywhere.
+        let errors = validate_plan(
+            "zero_field",
+            &serde_json::json!({
+                "selected_energies": [100.0],
+                "spot_weight_method": 7,
+            }),
+        );
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn the_filename_echoes_the_generators_defaults() {
+        // Null params generate the catalog defaults — the name must say them.
+        let name = suggest_filename("zero_field", &serde_json::json!({}), None, 128);
+        assert!(name.contains("Sp100"), "{name}");
+        let name = suggest_filename(
+            "rectangular_field",
+            &serde_json::json!({"spot_weight_method": "fixed"}),
+            None,
+            128,
+        );
+        assert!(name.contains("Wfix0.02"), "{name}");
+        assert!(name.contains("100x100mm"), "{name}");
+        assert!(name.contains("G33x33"), "{name}");
     }
 
     #[test]

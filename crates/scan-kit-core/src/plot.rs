@@ -10,18 +10,38 @@ pub enum CloudStyle {
     Contour,
 }
 
+/// serde_json writes non-finite floats as `null`; read them back as NaN so a
+/// `PlotScene` (isoline separators, masked cells) survives the JSON round-trip.
+mod nan_seq {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<Option<f32>>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.unwrap_or(f32::NAN))
+            .collect())
+    }
+}
+
 /// One drawable series in data coordinates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Series {
     Polyline {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         xs: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         ys: Vec<f32>,
         color: [f32; 4],
         thickness: f32,
     },
     Points {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         xs: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         ys: Vec<f32>,
         color: [f32; 4],
         radius: f32,
@@ -29,10 +49,13 @@ pub enum Series {
         /// A live scatter fills this so playback can hide rows outside the playhead
         /// without building the cloud again.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         times: Vec<f32>,
     },
     Bars {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         edges: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         counts: Vec<f32>,
         color: [f32; 4],
     },
@@ -40,6 +63,7 @@ pub enum Series {
     /// `color` from clear to that ink. `lo` and `hi` are the color window;
     /// `hi <= lo` stretches each image to its own min and max.
     Heatmap {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         values: Vec<f32>,
         cols: u32,
         rows: u32,
@@ -54,21 +78,29 @@ pub enum Series {
     },
     /// Filled rectangles in data coordinates. `x` and `y` are the lower-left corner.
     Rects {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         x: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         y: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         w: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         h: Vec<f32>,
         color: [f32; 4],
     },
     /// Filled triangles in data coordinates. `xs` and `ys` are groups of three corners.
     Triangles {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         xs: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         ys: Vec<f32>,
         color: [f32; 4],
     },
     /// A polyline the shell palette leaves alone. Reference lines use this.
     Guide {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         xs: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         ys: Vec<f32>,
         color: [f32; 4],
         thickness: f32,
@@ -77,8 +109,11 @@ pub enum Series {
     /// draw these as dots. A playhead step counts the visible window into the
     /// heatmap or contour that precedes this series.
     Cloud {
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         xs: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         ys: Vec<f32>,
+        #[serde(deserialize_with = "nan_seq::deserialize")]
         times: Vec<f32>,
         x0: f32,
         x1: f32,

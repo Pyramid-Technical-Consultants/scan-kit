@@ -192,7 +192,9 @@ fn flog(x: f32) -> f32 {
 }
 
 fn quanta(e_ev: f32) -> i32 {
-    return i32(floor(e_ev / QUANTUM + urand() - 1e-7));
+    // |e_ev| past ~2.1e11 eV makes the i32 conversion indeterminate — clamp
+    // so a runaway deposit saturates instead of adding arbitrary tallies.
+    return i32(clamp(floor(e_ev / QUANTUM + urand()), -2.0e9, 2.0e9));
 }
 
 fn add_tally(slot: u32, v: i32) {
@@ -332,8 +334,12 @@ fn bsearch(v: f32, base: i32, n: i32) -> i32 {
 
 // ---------------------------------------------------------------- geometry
 fn voxel_index(x: vec3f) -> i32 {
-    let c = vec3i(floor((x - vec3f(P.ox, P.oy, P.oz)) / vec3f(P.vx, P.vy, P.vz)));
-    if (any(c < vec3i(0)) || any(c >= vec3i(P.nx, P.ny, P.nz))) { return -1; }
+    // Cast first and a NaN/inf position can land on an indeterminate-but-
+    // in-bounds index — bounds-check in the float domain instead.
+    let f = floor((x - vec3f(P.ox, P.oy, P.oz)) / vec3f(P.vx, P.vy, P.vz));
+    let d = vec3f(f32(P.nx), f32(P.ny), f32(P.nz));
+    if (any(!(f >= vec3f(0.0) & f < d))) { return -1; }
+    let c = vec3i(f);
     return c.x + P.nx * (c.y + P.ny * c.z);
 }
 
@@ -656,7 +662,7 @@ fn inelastic(e: i32, idx: i32, p: ptr<function, Particle>, pushed: ptr<function,
         let cb = cum_d(r0, r1, si + 1, E, Ek0, Ek1);
         let ea = F[F_SE + r0 + si];
         let eb = F[F_SE + r0 + si + 1];
-        var Ts = lerp(r, ca, cb, ea, eb);
+        var Ts = select(ea, lerp(r, ca, cb, ea, eb), cb > ca);
         Ts = (E / Ek0) * UMEV * Ts;
         if (!(Ts >= ECUT)) {
             dE += Ms * Ts / (*p).M;
@@ -668,7 +674,7 @@ fn inelastic(e: i32, idx: i32, p: ptr<function, Particle>, pushed: ptr<function,
             let d1 = lerp(E, Ek0, Ek1, F[F_SDD + 13 * (r0 + si) + j], F[F_SDD + 13 * (r1 + si) + j]);
             let d2 = lerp(E, Ek0, Ek1, F[F_SDD + 13 * (r0 + si + 1) + j], F[F_SDD + 13 * (r1 + si + 1) + j]);
             // Matches MCsquare: Ts is in eV here while the row energies are in MeV.
-            dd[j] = lerp(Ts, ea, eb, d1, d2);
+            dd[j] = select(d1, lerp(Ts, ea, eb, d1, d2), eb > ea);
         }
         let ra = urand() * dd[12];
         var alo = -1;
@@ -986,7 +992,7 @@ fn into_patient(pp: ptr<function, Particle>, b: i32) -> bool {
             g_leak += p.M * p.T;
             return false;
         }
-        let t = max(tn, 0.0) + 1e-4;
+        let t = min(max(tn, 0.0) + 1e-4, tf);
         let loss = air_stop(p.T, p.mass, p.charge) * t;
         p.x += t * p.d;
         if (p.T - loss < ECUT) {

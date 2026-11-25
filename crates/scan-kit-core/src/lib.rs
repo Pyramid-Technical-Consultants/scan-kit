@@ -73,8 +73,8 @@ pub use tune::{run_tune, tune_catalog, TuneSpots};
 pub use xml_dom::{parse_xml, write_xml, Elem};
 
 pub use schema::{
-    column_is_integer, column_scale_factor, concept_column_candidates, normalize_column_name,
-    resolve_column_name, resolve_concept_column, resolve_requested_column,
+    column_is_integer, column_scale_factor, concept_column_candidates, concept_of,
+    normalize_column_name, resolve_column_name, resolve_concept_column, resolve_requested_column,
     timeslice_amplifier_field_columns, ConceptAlias, DerivedSum, CONCEPT_ALIASES, DERIVED_SUMS,
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
@@ -183,8 +183,12 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
             // remove+rename gap used to leave neither artifact nor payload when
             // the retry failed.
             Err(err)
-                if err.kind() == std::io::ErrorKind::PermissionDenied
-                    || err.kind() == std::io::ErrorKind::AlreadyExists =>
+                if (err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.kind() == std::io::ErrorKind::AlreadyExists)
+                    // A directory named *.csv would rename aside fine and
+                    // then lose to remove_file — silently displaced. Only a
+                    // real file is movable.
+                    && path.is_file() =>
             {
                 let mut bak = path.as_os_str().to_os_string();
                 bak.push(format!(".{}.{}.bak", std::process::id(), seq));
@@ -216,10 +220,14 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
                         let _ = std::fs::remove_file(&part);
                     })
             }
-            Err(err) => Err(err).inspect_err(|_| {
-                let _ = std::fs::remove_file(&part);
-            }),
+            Err(err) => Err(err),
         });
+    // Failures before the rename stage (disk-full write, dead fsync) used to
+    // leak the .part sibling; the inner arms keep their own removes only
+    // where an error message needs them.
+    let write = write.inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    });
     write.map_err(|err| format!("{}: {err}", path.display()))
 }
 
@@ -455,9 +463,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let bins = match input.get("bins") {
                 None | Some(Value::Null) => 8,
                 Some(value) => value
-                    .as_u64()
-                    .ok_or_else(|| InvokeError::Message("bins must be an integer".into()))?
-                    as usize,
+                    .as_f64()
+                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= u64::MAX as f64)
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        InvokeError::Message("bins must be a non-negative integer".into())
+                    })?,
             };
             json!({ "edges": quantile_edges(&values, bins) })
         }
@@ -466,9 +477,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let bins = match input.get("bins") {
                 None | Some(Value::Null) => 16,
                 Some(value) => value
-                    .as_u64()
-                    .ok_or_else(|| InvokeError::Message("bins must be an integer".into()))?
-                    as usize,
+                    .as_f64()
+                    .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= u64::MAX as f64)
+                    .map(|v| v as usize)
+                    .ok_or_else(|| {
+                        InvokeError::Message("bins must be a non-negative integer".into())
+                    })?,
             };
             let (edges, counts) = histogram(&values, bins);
             json!({ "edges": edges, "counts": counts })

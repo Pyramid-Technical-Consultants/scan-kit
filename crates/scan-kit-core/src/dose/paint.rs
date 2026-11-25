@@ -119,9 +119,11 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
     }
     if difference {
         let reach = if percent {
-            base_hi.abs().max(1e-6) * level.unwrap_or(10.0).clamp(0.1, 100.0) / 100.0
+            base_hi.abs().max(1e-6) * level.unwrap_or(10.0).clamp(1.0, 100.0) / 100.0
         } else {
-            level.unwrap_or(0.2).abs().max(1e-6)
+            // Same rule as the gain branch: a level outside the Full Scale
+            // slider's range must not apply a window the control can't show.
+            level.unwrap_or(0.2).abs().clamp(0.01, 5.0)
         };
         let span = if percent {
             slider("Percent", 1.0, 100.0, 1.0, 10.0, level)
@@ -140,7 +142,9 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
         };
     }
     if auto {
-        let gain = level.unwrap_or(1.0).clamp(0.05, 8.0);
+        // The Gain slider spans 0.25..=4.0 — an out-of-range level must
+        // not apply a gain the control can't express.
+        let gain = level.unwrap_or(1.0).clamp(0.25, 4.0);
         return Wash {
             lo: base_lo,
             hi: base_hi,
@@ -154,7 +158,7 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
     }
     let data = base_hi.abs().max(base_lo.abs()).max(1.0);
     let limit = data * 2.0;
-    let hi = level.unwrap_or(base_hi).clamp(1e-6, limit);
+    let hi = level.unwrap_or(base_hi).max(1e-6).clamp(1e-6, limit);
     Wash {
         lo: 0.0,
         hi,
@@ -187,6 +191,11 @@ pub fn painted_unit(unit: &str, mode: u8, gamma: bool) -> String {
 }
 
 pub fn trim_number(value: f32) -> String {
+    // A non-finite bound would emit the bare literal "inf"/"NaN" into the
+    // slider's number fields.
+    if !value.is_finite() {
+        return "0".into();
+    }
     if (value - value.round()).abs() < 1e-4 && value.abs() < 1.0e6 {
         format!("{}", value.round() as i32)
     } else {

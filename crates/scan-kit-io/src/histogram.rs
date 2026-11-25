@@ -43,7 +43,13 @@ pub(crate) fn count_choice(raw: &str) -> Option<usize> {
         // silently snapping to 32.
         let parsed = raw
             .parse::<usize>()
-            .or_else(|_| raw.parse::<f64>().map(|value| value.round() as usize))
+            .ok()
+            .or_else(|| {
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(|value| value.round() as usize)
+            })
             .unwrap_or(32);
         Some(
             BIN_STEPS
@@ -129,8 +135,12 @@ pub(crate) fn histogram_panel(
         } else {
             histogram(column, bins)
         };
-        lo = lo.min(edges.first().copied().unwrap_or(0.0));
-        hi = hi.max(edges.last().copied().unwrap_or(1.0));
+        // A placeholder column is all-zero counts — its edges must not
+        // stretch the axis to the 0..1 default.
+        if !column.is_empty() {
+            lo = lo.min(edges.first().copied().unwrap_or(0.0));
+            hi = hi.max(edges.last().copied().unwrap_or(1.0));
+        }
         let total = counts.iter().sum::<f32>().max(1.0);
         let percent: Vec<f32> = counts.iter().map(|count| count / total * 100.0).collect();
         peak = peak.max(percent.iter().copied().fold(0.0, f32::max));
@@ -172,8 +182,14 @@ fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
     // The span subtracts in f64 — a finite range wider than f32::MAX would
     // otherwise overflow to +inf and NaN the first edge.
     let span = f64::from(hi) - f64::from(lo);
-    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || span.abs() < 1e-12 {
-        (lo - 0.5, (lo - 0.5) + 1.0)
+    // Relative flat test like scan_kit_core::histogram — an absolute 1e-12
+    // calls a real 1e-13-wide column flat and bins it onto a ±0.5 axis.
+    let scale = f64::from(hi.abs().max(lo.abs())).max(1e-30);
+    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || span.abs() <= 1e-12 * scale {
+        // A fixed 0.5 pad is unrepresentable above |lo| ~= 2^23 (ulp > 1) —
+        // scale the pad to the magnitude so the edges stay distinct.
+        let pad = (lo.abs() * f32::EPSILON).max(0.5);
+        ((lo - pad).max(-f32::MAX), (lo + pad).min(f32::MAX))
     } else {
         (lo, hi)
     };

@@ -77,7 +77,7 @@ fn glyph(atlas: &Atlas, ch: char) -> Option<&Glyph> {
 
 /// Non-ASCII glyphs the renderers emit: minus sign, multiplication, middle
 /// dot, superscript digits and minus for x10^n axis offsets.
-const EXTRA: &str = "\u{2212}\u{d7}\u{b7}\u{2070}\u{b9}\u{b2}\u{b3}\u{2074}\u{2075}\u{2076}\u{2077}\u{2078}\u{2079}\u{207b}";
+const EXTRA: &str = "\u{2212}\u{d7}\u{b7}\u{2070}\u{b9}\u{b2}\u{b3}\u{2074}\u{2075}\u{2076}\u{2077}\u{2078}\u{2079}\u{207b}\u{3b3}";
 
 fn build() -> Atlas {
     let font =
@@ -105,6 +105,13 @@ fn build() -> Atlas {
                 pixels[dest..dest + w as usize].copy_from_slice(&bitmap[src..src + w as usize]);
             }
         }
+        // A glyph the atlas ran out of rows for carries no pixels - zero the
+        // size so layout skips it instead of blitting out-of-bounds reads.
+        let (w, h) = if w > 0 && h > 0 && cursor_y + h >= ATLAS {
+            (0, 0)
+        } else {
+            (w, h)
+        };
         let top = -(metrics.ymin + metrics.height as i32) as f32;
         let glyph = Glyph {
             advance: metrics.advance_width,

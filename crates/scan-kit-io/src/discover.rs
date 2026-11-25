@@ -58,6 +58,9 @@ pub(crate) fn discover(
     if crate::location::is_remote_location(&text) {
         return crate::location::discover_remote(&text, keep);
     }
+    if !keep(0, 0) {
+        return Err("cancelled".into());
+    }
     let mut entries = Vec::new();
     let mut skipped = Vec::new();
     let mut archives = Vec::new();
@@ -76,7 +79,7 @@ pub(crate) fn discover(
                 "",
             );
         }
-    } else if let Some(exam) = exam_in(root, &mut walk_failed) {
+    } else if let Some(exam) = exam_in(root, &mut walk_failed, keep) {
         add_exam(&mut exams, &mut skipped, exam, "");
     } else {
         walk_local(
@@ -113,6 +116,9 @@ fn walk_local(
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<(), String> {
     if depth >= crate::location::NEST_DEPTH {
+        // An unvisited subtree is not an empty one — flag it like an
+        // unreadable dir so delete_missing can't prune below the cap.
+        *walk_failed = true;
         return Ok(());
     }
     // The remote walk honours keep at every recursion — a slow local share
@@ -169,6 +175,7 @@ fn walk_local(
     }
     for child in &children {
         let Ok(kind) = child.file_type() else {
+            *walk_failed = true;
             continue;
         };
         if kind.is_symlink() || !kind.is_file() {
@@ -189,6 +196,7 @@ fn walk_local(
     }
     for child in &children {
         let Ok(kind) = child.file_type() else {
+            *walk_failed = true;
             continue;
         };
         // A leftover download staging dir holds a bare "session/" tree that
@@ -203,8 +211,11 @@ fn walk_local(
         {
             continue;
         }
+        if !keep(0, 0) {
+            return Err("cancelled".into());
+        }
         let path = child.path();
-        if let Some(exam) = exam_in(&path, walk_failed) {
+        if let Some(exam) = exam_in(&path, walk_failed, keep) {
             add_exam(exams, skipped, exam, &relative(library, &path));
             continue;
         }
@@ -225,8 +236,14 @@ fn walk_local(
 
 /// True when an unpacked session lives anywhere below `dir` within the
 /// discovery depth — such a directory is a container, never an exam.
-fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
-    if depth >= crate::location::NEST_DEPTH {
+fn holds_session(
+    dir: &Path,
+    depth: u32,
+    walk_failed: &mut bool,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> bool {
+    // A cancelled probe answers false; the walk's next keep check aborts.
+    if depth >= crate::location::NEST_DEPTH || !keep(0, 0) {
         return false;
     }
     if is_unpacked_session(dir, walk_failed) {
@@ -248,7 +265,7 @@ fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
         };
         if kind.is_dir()
             && !kind.is_symlink()
-            && holds_session(&entry.path(), depth + 1, walk_failed)
+            && holds_session(&entry.path(), depth + 1, walk_failed, keep)
         {
             return true;
         }
@@ -256,10 +273,14 @@ fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
     false
 }
 
-fn exam_in(dir: &Path, walk_failed: &mut bool) -> Option<ExamHit> {
+fn exam_in(
+    dir: &Path,
+    walk_failed: &mut bool,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Option<ExamHit> {
     // A stray .dcm beside session folders does not make this an exam — the
     // walk must keep descending or the nested sessions disappear.
-    if holds_session(dir, 0, walk_failed) {
+    if holds_session(dir, 0, walk_failed, keep) || !keep(0, 0) {
         return None;
     }
     let folder_name = file_name(dir)?;
@@ -374,43 +395,76 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
     if crate::location::is_remote_location(&text) {
         return crate::location::remote_fingerprint(&text, session_id);
     }
+    // The files hydrate reads (input_map.csv, spot_data.csv) feed the
+    // sealed geom — xor their stamps in so a rewrite of either still
+    // invalidates the row once the summary's mtime is the primary probe.
+    let mut extras: Vec<PathBuf> = Vec::new();
     let target = if storage.is_dir() {
+        // Stat the file the reader serves — session_directory resolves the
+        // nested root when its marker holds, so the served summary is
+        // probed first and a rewrite always invalidates the cache.
+        let root = session_directory(storage, session_id);
+        for base in [&root, &storage.to_path_buf()] {
+            extras.push(base.join("input_map.csv"));
+            extras.push(base.join("spot_data.csv"));
+        }
+        // Flat layout has root == storage — each probe pushed twice would
+        // xor itself out of the fingerprint.
+        extras.sort();
+        extras.dedup();
+        let served = root.join("termination_summary.txt");
         let outer = storage.join("termination_summary.txt");
-        let inner = if valid_session_id(session_id) {
-            storage.join(session_id).join("termination_summary.txt")
-        } else {
-            storage.join("termination_summary.txt")
-        };
         // The inner dir's mtime freezes once the layer/run dirs exist —
         // input_map.csv moves on every row write, so probe it too.
+        let served_rows = root.join("input_map.csv");
         let outer_rows = storage.join("input_map.csv");
-        let inner_rows = if valid_session_id(session_id) {
-            storage.join(session_id).join("input_map.csv")
-        } else {
-            storage.join("input_map.csv")
-        };
-        if outer.is_file() {
+        // Stat every marker candidate, not only the probed target — an
+        // mtime-preserving swap between slots would alias the tuple.
+        extras.extend([served.clone(), outer.clone()]);
+        // When session_directory resolved the nested root, the nested tree
+        // is authoritative — a flat outer file is not what the reader serves.
+        let nested = root != storage;
+        if served.is_file() {
+            served
+        } else if !nested && outer.is_file() {
             outer
-        } else if inner.is_file() {
-            inner
-        } else if outer_rows.is_file() {
+        } else if served_rows.is_file() {
+            served_rows
+        } else if !nested && outer_rows.is_file() {
             outer_rows
-        } else if inner_rows.is_file() {
-            inner_rows
         } else {
             // Still capturing: the inner session dir changes, the outer does not.
-            session_directory(storage, session_id)
+            root
         }
     } else {
         storage.to_path_buf()
     };
     let meta = fs::metadata(&target).ok()?;
     let modified = meta.modified().ok()?;
-    let nanos = modified
+    let mut nanos = modified
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_nanos();
-    Some((i64::try_from(nanos).ok()?, i64::try_from(meta.len()).ok()?))
+    let mut size = meta.len();
+    extras.sort();
+    extras.dedup();
+    for probe in extras {
+        // Xor rather than max: a rewrite that does not take the newest mtime
+        // still moves the fingerprint.
+        if probe != target {
+            if let Ok(meta) = fs::metadata(&probe) {
+                if let Some(extra) = meta
+                    .modified()
+                    .ok()
+                    .and_then(|stamp| stamp.duration_since(std::time::UNIX_EPOCH).ok())
+                {
+                    nanos ^= extra.as_nanos();
+                    size ^= meta.len();
+                }
+            }
+        }
+    }
+    Some((i64::try_from(nanos).ok()?, i64::try_from(size).ok()?))
 }
 
 pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Option<Vec<u8>> {
@@ -420,64 +474,119 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     }
     if storage.is_dir() {
         let root = directory_session_root(storage, session_id);
-        return fs::File::open(root.join(filename))
+        // Links are refused the same way the walk refuses them — a planted
+        // spot_data.csv symlink must not read outside the session dir.
+        let path = root.join(filename);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+            return None;
+        }
+        // symlink_metadata only inspects the leaf — a symlinked `config/` or
+        // `ic_hv_toggle/` component reads outside the session dir too.
+        if path
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| *ancestor != root)
+            .any(|ancestor| ancestor.is_symlink())
+        {
+            return None;
+        }
+        return fs::File::open(path)
             .ok()
             .and_then(|mut file| read_capped(&mut file, filename, MAX_MEMBER_BYTES).ok());
     }
     let primary = format!("{session_id}/{filename}");
     let suffix = format!("/{filename}");
-    let members = archive_members(storage, &|name| {
+    let (members, roots) = archive_members(storage, &|name| {
         let name = normalize_member(name);
         name == primary || name == filename || name.ends_with(&suffix)
     })
     .ok()?;
-    for want in [&primary, &filename.to_owned()] {
-        if let Some((_, bytes)) = members
-            .iter()
-            .find(|(name, _)| normalize_member(name) == **want)
-        {
-            return Some(bytes.clone());
-        }
-    }
-    // A wrapped archive whose folder name was not picked up as the session id
-    // (tars keep the zip filename) still resolves by the inner path suffix —
-    // but only when the archive holds one session tree, else the suffix could
-    // serve a sibling session's file under this id.
-    let roots: std::collections::BTreeSet<String> = members
+    if let Some((_, bytes)) = members
         .iter()
-        .filter_map(|(name, _)| {
-            normalize_member(name)
-                .split('/')
-                .next()
-                .filter(|root| !root.is_empty())
-                .map(str::to_owned)
-        })
-        .collect();
-    if roots.len() != 1 {
+        .find(|(name, _)| normalize_member(name) == primary)
+    {
+        return Some(bytes.clone());
+    }
+    // Bare-name and suffix matches are only safe when the archive holds one
+    // session tree — a stray root-level file can't stand in for a sibling's.
+    if roots.len() > 1 {
         return None;
+    }
+    if let Some((_, bytes)) = members
+        .iter()
+        .find(|(name, _)| normalize_member(name) == filename)
+    {
+        return Some(bytes.clone());
     }
     members
         .into_iter()
-        .find(|(name, _)| normalize_member(name).ends_with(&suffix))
+        .find(|(name, _)| {
+            let name = normalize_member(name);
+            // The fallback exists for the nested `sess/sess/` layout —
+            // deeper paths are per-run files, not the session marker.
+            name.ends_with(&suffix) && name.split('/').count() <= 3
+        })
         .map(|(_, bytes)| bytes)
 }
 
-pub fn read_timeslices(storage: &Path) -> Vec<Vec<u8>> {
-    read_timeslice_frames(storage)
-        .into_iter()
-        .map(|(_, bytes)| bytes)
-        .collect()
+/// Timeslice files scoped to `session_id`. A directory storage walks only
+/// `session_directory` (never the library root for a foreign id). In an
+/// archive, members must live under `{session_id}/`, or the archive must
+/// hold a single session tree — the same rule read_session_file uses for
+/// its suffix fallback, so a multi-session zip cannot merge a sibling
+/// session's rows under this id.
+pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
+    if storage.is_dir() {
+        let root = session_directory(storage, session_id);
+        let mut found = Vec::new();
+        walk_files(&root, &root, 0, &is_timeslice, &mut found);
+        found.sort_by_key(|member| timeslice_key(&member.0));
+        return found.into_iter().map(|(_, bytes)| bytes).collect();
+    }
+    let (mut members, roots) =
+        archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default();
+    let prefix = format!("{session_id}/");
+    if members
+        .iter()
+        .any(|(name, _)| normalize_member(name).starts_with(&prefix))
+    {
+        members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
+    } else if roots.len() > 1 {
+        // No member carries this session's prefix — a multi-tree archive
+        // can't tell which tree is this session's, a single flat tree can.
+        members.clear();
+    }
+    members.sort_by_key(|member| timeslice_key(&member.0));
+    members.into_iter().map(|(_, bytes)| bytes).collect()
 }
 
 /// Timeslice files in layer/run order. The index is the `layer-N` folder, or
 /// `-1` when the path has no layer folder.
-pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
+pub fn read_timeslice_frames(storage: &Path, session_id: &str) -> Vec<(i64, Vec<u8>)> {
     let mut members = if storage.is_dir() {
+        // Resolve the same way read_timeslices_for does — a library root +
+        // id must not merge sibling sessions' timeslices under one id.
+        let root = session_directory(storage, session_id);
         let mut found = Vec::new();
-        walk_files(storage, storage, 0, &is_timeslice, &mut found);
+        walk_files(&root, &root, 0, &is_timeslice, &mut found);
         found
     } else {
-        archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default()
+        // The dir branch already walks only the session dir; the archive
+        // branch needs the same rule read_timeslices_for uses — a single
+        // tree, or members under the session's own prefix.
+        let (mut members, roots) =
+            archive_members(storage, &|name| is_timeslice(&normalize_member(name)))
+                .unwrap_or_default();
+        let prefix = format!("{session_id}/");
+        if members
+            .iter()
+            .any(|(name, _)| normalize_member(name).starts_with(&prefix))
+        {
+            members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
+        } else if roots.len() > 1 {
+            members.clear();
+        }
+        members
     };
     members.sort_by_key(|member| timeslice_key(&member.0));
     members
@@ -485,7 +594,10 @@ pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
         .map(|(name, bytes)| {
             let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
             let dir = &name[..dir_end];
-            let index = if dir.contains("layer-") {
+            let index = if dir
+                .split(['/', '\\'])
+                .any(|part| part.starts_with("layer-"))
+            {
                 number_after(dir, "layer-")
             } else {
                 -1
@@ -561,16 +673,19 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if let Some(catalog) = crate::location::catalog_directory(library, session_id) {
         return catalog;
     }
-    if let Some(recorded) = crate::location::recorded_anywhere(session_id) {
-        return recorded;
-    }
     // The root resolves only for the session it actually is — a data dir
     // that is itself a session must not answer every session id with its
     // files (a foreign id reaching here reads the wrong session's map).
+    // It runs before recorded_anywhere: that helper parses the "a · b"
+    // display-key form, and a real folder literally named "a · b" must not
+    // be split onto a different session's directory.
     if library.file_name().is_some_and(|name| name == session_id)
         && marker_file(&library.join("input_map.csv"))
     {
         return library.to_path_buf();
+    }
+    if let Some(recorded) = crate::location::recorded_anywhere(session_id) {
+        return recorded;
     }
     flat
 }
@@ -614,6 +729,7 @@ fn zip_session_dir(path: &Path) -> Option<String> {
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let mut tops = std::collections::HashSet::new();
     let mut markers = std::collections::HashSet::new();
+    let mut flat = false;
     for index in 0..archive.len() {
         let Ok(entry) = archive.by_index(index) else {
             continue;
@@ -623,6 +739,7 @@ fn zip_session_dir(path: &Path) -> Option<String> {
         };
         let name = normalize_member(&name);
         let Some((top, _)) = name.split_once('/') else {
+            flat = true;
             continue;
         };
         if !valid_session_id(top) {
@@ -636,7 +753,10 @@ fn zip_session_dir(path: &Path) -> Option<String> {
     if markers.len() == 1 {
         return markers.into_iter().next();
     }
-    if tops.len() == 1 {
+    // The single-top heuristic means "the session was wrapped in a folder".
+    // Root-level files alongside the dir mean a flat-layout archive instead —
+    // the lone dir is layer-N, not a session id.
+    if tops.len() == 1 && !flat {
         return tops.into_iter().next();
     }
     None
@@ -650,6 +770,8 @@ fn file_name(path: &Path) -> Option<String> {
 pub(crate) use scan_kit_core::valid_session_id;
 
 fn is_timeslice(name: &str) -> bool {
+    // Run-index prefixes ("000_timeslice_...") are real frame names —
+    // match the leaf's suffix.
     normalize_member(name).ends_with("timeslice_data_device_units.csv")
 }
 
@@ -659,7 +781,10 @@ fn timeslice_key(name: &str) -> (i64, i64, String) {
     let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
     let dir = &name[..dir_end];
     (
-        if dir.contains("layer-") {
+        if dir
+            .split(['/', '\\'])
+            .any(|part| part.starts_with("layer-"))
+        {
             number_after(dir, "layer-")
         } else {
             -1
@@ -670,10 +795,15 @@ fn timeslice_key(name: &str) -> (i64, i64, String) {
 }
 
 pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
-    let Some(index) = path.rfind(marker) else {
+    // Only a path component that starts with the marker counts — a session
+    // named "player-2" or "rerun-3" is not a numbered layer or run.
+    let Some(tail) = path
+        .split(['/', '\\'])
+        .rev()
+        .find_map(|part| part.strip_prefix(marker))
+    else {
         return 0;
     };
-    let tail = &path[index + marker.len()..];
     let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     // "layer-x" / "layer-2b" / a digit overflow is not a numbered layer -
     // collapsing it into 0 merges unrelated folders into layer 0.
@@ -691,6 +821,11 @@ pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
 fn normalize_member(name: &str) -> String {
     let name = name.replace('\\', "/");
     let name = name.trim_start_matches("./");
+    // An absolute member is a second tree member_root cannot see — the
+    // suffix matcher would still serve it.
+    if name.starts_with('/') {
+        return String::new();
+    }
     // A mid-path `..` escapes the tree — the member must not bind to a file
     // it only reaches by traversal.
     if name.split('/').any(|part| part == "..") {
@@ -708,9 +843,10 @@ fn walk_files(
 ) {
     // The archive branch caps members and the aggregate; a local session tree
     // is the same trust boundary — bound both before the bytes land.
-    // ponytail: a tree over the cap drops the rest silently (the archive path
-    // errors instead) — a tail-truncated session still parses as complete.
+    // ponytail: a tree over the cap drops the rest silently, and the archive
+    // readers do the same — a tail-truncated session still parses as complete.
     let mut total = 0u64;
+    let mut failed = false;
     visit_files(
         root,
         dir,
@@ -729,6 +865,7 @@ fn walk_files(
             }
         },
         &mut |_| {},
+        &mut failed,
     );
 }
 
@@ -795,6 +932,7 @@ fn refresh_slice(storage: &Path) -> u128 {
         }
     }
     let mut found = Vec::new();
+    let mut failed = false;
     let mut dirs = vec![(storage.to_path_buf(), meta_stamp(storage))];
     // Stamp every directory the walk visits, not just ancestors of matches —
     // a layer dir created after a poll must itself bump the stamp or a
@@ -812,6 +950,7 @@ fn refresh_slice(storage: &Path) -> u128 {
                 dirs.push((dir.to_path_buf(), meta_stamp(dir)));
             }
         },
+        &mut failed,
     );
     found.sort_by_key(|item| timeslice_key(&item.0));
     let paths = found
@@ -819,7 +958,10 @@ fn refresh_slice(storage: &Path) -> u128 {
         .map(|(name, path, _)| {
             let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
             let dir = &name[..dir_end];
-            let index = if dir.contains("layer-") {
+            let index = if dir
+                .split(['/', '\\'])
+                .any(|part| part.starts_with("layer-"))
+            {
                 number_after(dir, "layer-")
             } else {
                 -1
@@ -838,6 +980,12 @@ fn refresh_slice(storage: &Path) -> u128 {
         stamp ^= file_stamp.wrapping_mul(count | 1);
     }
     stamp ^= count.rotate_left(17);
+    // A partial listing is a wrong answer, not a stable one — caching it
+    // would freeze the missing subtree out until the recorded paths change,
+    // and for a finished session they never do.
+    if failed {
+        return stamp;
+    }
     let mut cache = slice_watches()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -878,20 +1026,29 @@ fn visit_files(
     want: &dyn Fn(&str) -> bool,
     visit: &mut dyn FnMut(&str, &Path),
     dirs: &mut dyn FnMut(&Path),
+    failed: &mut bool,
 ) {
     if depth > 6 {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
+        *failed = true;
         return;
     };
-    let mut children: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    let mut children = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => children.push(entry),
+            Err(_) => *failed = true,
+        }
+    }
     children.sort_by_key(|entry| entry.file_name());
     for child in children {
         let path = child.path();
         // `is_dir`/`is_file` follow links; the library walk does not. A session
         // symlink must not pull timeslice files in from outside the session.
         let Ok(kind) = child.file_type() else {
+            *failed = true;
             continue;
         };
         if kind.is_symlink() {
@@ -899,7 +1056,7 @@ fn visit_files(
         }
         if kind.is_dir() {
             dirs(&path);
-            visit_files(root, &path, depth + 1, want, visit, dirs);
+            visit_files(root, &path, depth + 1, want, visit, dirs, failed);
         } else if kind.is_file() {
             let name = path
                 .strip_prefix(root)
@@ -913,10 +1070,19 @@ fn visit_files(
     }
 }
 
-fn archive_members(
-    path: &Path,
-    want: &dyn Fn(&str) -> bool,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
+type Members = (Vec<(String, Vec<u8>)>, std::collections::BTreeSet<String>);
+
+fn member_root(name: &str) -> Option<String> {
+    // Flat members carry no tree root — a flat zip is one tree, not one
+    // root per filename.
+    let name = normalize_member(name);
+    name.split('/')
+        .next()
+        .filter(|root| name.contains('/') && !root.is_empty())
+        .map(str::to_owned)
+}
+
+fn archive_members(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String> {
     let name = file_name(path).unwrap_or_default().to_ascii_lowercase();
     if name.ends_with(".zip") {
         read_zip(path, want)
@@ -925,10 +1091,11 @@ fn archive_members(
     }
 }
 
-fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|err| err.to_string())?;
     let mut out = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
     let mut total = 0u64;
     for index in 0..archive.len() {
         // One unsupported-compression or undecodable member must not brick
@@ -942,19 +1109,36 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         let Ok(name) = entry.name().map(|name| name.into_owned()) else {
             continue;
         };
+        // Dedup and `want` must see the same normalized name the consumers
+        // do — raw-name dedup let "a" and "a/b" survive as two entries
+        // and served the stale first instead of the winning last.
+        let name = normalize_member(&name);
+        if let Some(root) = member_root(&name) {
+            roots.insert(root);
+        }
         if !want(&name) {
             continue;
         }
         // Bound the allocation by the remaining aggregate budget — reading a
-        // full member first would spend the cap twice over.
-        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))?;
+        // full member first would spend the cap twice over. A corrupt member
+        // loses only itself; zip entries decode independently.
+        let Ok(bytes) = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))
+        else {
+            continue;
+        };
         total = total.saturating_add(bytes.len() as u64);
-        out.push((name.clone(), bytes));
+        // A writer updating in place can carry the member twice — last wins,
+        // like extraction semantics.
+        if let Some((_, have)) = out.iter_mut().find(|(have, _)| *have == name) {
+            *have = bytes;
+        } else {
+            out.push((name, bytes));
+        }
     }
-    Ok(out)
+    Ok((out, roots))
 }
 
-fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let name = file_name(path).unwrap_or_default().to_ascii_lowercase();
     let decoder: Box<dyn Read> = if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
@@ -967,7 +1151,8 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         Box::new(file)
     };
     let mut archive = tar::Archive::new(decoder);
-    let mut out = Vec::new();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
     let mut total = 0u64;
     let entries = archive.entries().map_err(|err| err.to_string())?;
     for entry in entries {
@@ -977,21 +1162,49 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         let Ok(mut entry) = entry else {
             break;
         };
-        if !entry.header().entry_type().is_file() {
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && kind != tar::EntryType::Link {
             continue;
         }
         let Ok(path) = entry.path() else {
             continue;
         };
-        let name = path.to_string_lossy().into_owned();
+        let name = normalize_member(&path.to_string_lossy());
+        if let Some(root) = member_root(&name) {
+            roots.insert(root);
+        }
         if !want(&name) {
             continue;
         }
-        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))?;
+        // A hardlink member carries no bytes — clone the linked target's.
+        // GNU tar writes the target first, so it is already in `out`.
+        if kind == tar::EntryType::Link {
+            let target = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|t| normalize_member(&t.to_string_lossy()))
+                .unwrap_or_default();
+            if let Some((_, bytes)) = out.iter().find(|(n, _)| *n == target) {
+                let bytes = bytes.clone();
+                out.push((name, bytes));
+            }
+            continue;
+        }
+        // A mid-entry read failure can leave the tar stream desynced —
+        // keep what was read and stop rather than drop the whole archive.
+        let Ok(bytes) = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))
+        else {
+            break;
+        };
         total = total.saturating_add(bytes.len() as u64);
-        out.push((name.clone(), bytes));
+        if let Some((_, have)) = out.iter_mut().find(|(have, _)| *have == name) {
+            *have = bytes;
+        } else {
+            out.push((name, bytes));
+        }
     }
-    Ok(out)
+    Ok((out, roots))
 }
 
 /// Session members are CSV/XML/JSON — none legitimately approach this. A
@@ -1001,7 +1214,7 @@ pub(crate) const MAX_MEMBER_BYTES: u64 = 4 << 30;
 pub(crate) fn read_capped(member: &mut impl Read, name: &str, max: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     member
-        .take(max + 1)
+        .take(max.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|err| err.to_string())?;
     if bytes.len() as u64 > max {
@@ -1218,6 +1431,44 @@ mod tests {
     }
 
     #[test]
+    fn a_sibling_tree_in_the_archive_is_not_served_as_this_session() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-ziptwo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        write_zip(
+            &root.join("bundle.zip"),
+            &[
+                (
+                    "sessA/input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "other/spot_data.csv",
+                    b"s
+2
+",
+                ),
+            ],
+        )
+        .unwrap();
+        let storage = root.join("bundle.zip");
+        // The single-tree suffix fallback must count every member's root —
+        // a sibling tree means the archive is multi-session and no file may
+        // resolve across the boundary.
+        assert!(read_session_file(&storage, "sessA", "spot_data.csv").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn traversal_members_do_not_become_the_session_id() {
         let root = std::env::temp_dir().join(format!(
             "scan-kit-ziptrav-{}-{}",
@@ -1309,11 +1560,12 @@ mod tests {
         #[cfg(not(any(unix, windows)))]
         let linked: std::io::Result<()> = Ok(());
         let Ok(()) = linked else {
+            eprintln!("skipping: symlink_dir needs a privileged context");
             let _ = fs::remove_dir_all(&root);
             return;
         };
 
-        let frames = read_timeslice_frames(&session);
+        let frames = read_timeslice_frames(&root, "sess");
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].0, 0);
         let _ = fs::remove_dir_all(&root);
@@ -1361,8 +1613,40 @@ mod tests {
 ",
         )
         .unwrap();
-        let err = discover(&root, &mut |_, _| false).err().unwrap();
+        let mut calls = 0u32;
+        let err = discover(&root, &mut |_, _| {
+            calls += 1;
+            calls == 1
+        })
+        .err()
+        .unwrap();
         assert!(err.contains("cancelled"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslices_from_a_sibling_session_are_not_merged() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for session in ["sess-a", "sess-b"] {
+            let layer = root.join(session).join("layer-1");
+            fs::create_dir_all(&layer).unwrap();
+            fs::write(root.join(session).join("input_map.csv"), "spot_no\n1\n").unwrap();
+            fs::write(
+                layer.join("timeslice_data_device_units.csv"),
+                format!("session\n{session}\n"),
+            )
+            .unwrap();
+        }
+        let files = read_timeslices_for(&root, "sess-a");
+        assert_eq!(files.len(), 1);
+        assert!(String::from_utf8_lossy(&files[0]).contains("sess-a"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

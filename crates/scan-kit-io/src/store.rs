@@ -40,8 +40,12 @@ static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn default_db_path() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
+        // ponytail: env-bare hosts get a CWD-relative store — a service
+        // account could mint a db under its launch dir; erroring instead
+        // would brick every tool on such hosts.
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".scan-kit").join("scan-kit.sqlite")
 }
@@ -72,9 +76,12 @@ pub fn open_connection(path: &Path) -> Result<Connection, String> {
         }
     }
     let conn = Connection::open(path).map_err(|err| err.to_string())?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|err| err.to_string())?;
+    // busy_timeout first: journal_mode needs an exclusive lock on a
+    // non-WAL file, and without the timeout armed a busy peer fails it
+    // instantly.
     conn.pragma_update(None, "busy_timeout", 5000)
+        .map_err(|err| err.to_string())?;
+    conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|err| err.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| err.to_string())?;
@@ -101,7 +108,9 @@ pub fn canonical_local(path: &Path) -> String {
 }
 
 pub fn last_data_dir(conn: &Connection) -> Result<Option<String>, String> {
-    Ok(prefs_get(conn, PREF_LAST_DATA_DIR)?.and_then(|value| value.as_str().map(str::to_owned)))
+    Ok(prefs_get(conn, PREF_LAST_DATA_DIR)?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|dir| !dir.is_empty()))
 }
 
 pub fn window_geometry(conn: &Connection) -> Result<Value, String> {
@@ -281,21 +290,42 @@ pub fn set_scanners(conn: &Connection, scanners: &[(String, String)]) -> Result<
     prefs_patch(conn, PREF_APP_SETTINGS, &json!({ "scanners": list }))
 }
 
-pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> Result<(), String> {
+pub fn set_note(
+    conn: &Connection,
+    root: &str,
+    session_id: &str,
+    text: &str,
+    legacy: Option<&LegacyFiles>,
+) -> Result<(), String> {
     if !scan_kit_core::valid_session_id(session_id) {
         return Err("invalid session id".to_owned());
     }
     let lib_id = ensure_library(conn, root)?;
-    import_legacy(conn, lib_id, Path::new(root))?;
+    if !crate::location::is_remote_location(root) {
+        import_legacy(conn, lib_id, Path::new(root), legacy)?;
+    }
     // Store the trimmed text — the command response already reports the
     // trimmed form, so the two must agree about what persisted.
     let note = text.trim();
+    // Upsert is deliberate — a user can note a session before a scan makes
+    // its row (tests pin the row surviving trash/re-import).
     conn.execute(
         "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, ?2, ?3)
          ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note",
         params![lib_id, session_id, note],
     )
     .map_err(|err| err.to_string())?;
+    if note.is_empty() {
+        // A whitespace note on an unscanned session creates a row with no
+        // note and no storage — delete_missing keeps NULL-storage rows, so
+        // it would list forever. Only truly-empty ghosts go.
+        conn.execute(
+            "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2
+             AND storage_path IS NULL AND note = ''",
+            params![lib_id, session_id],
+        )
+        .map_err(|err| err.to_string())?;
+    }
     Ok(())
 }
 
@@ -303,18 +333,24 @@ pub fn set_selected(
     conn: &Connection,
     root: &str,
     session_ids: &[String],
+    legacy: Option<&LegacyFiles>,
 ) -> Result<Vec<String>, String> {
     let mut unique = Vec::new();
     for session_id in session_ids {
+        if !scan_kit_core::valid_session_id(session_id) {
+            return Err(format!("invalid session id: {session_id}"));
+        }
         if !unique.contains(session_id) {
             unique.push(session_id.clone());
+            if unique.len() > 5 {
+                return Err("at most five sessions can be selected".to_owned());
+            }
         }
     }
-    if unique.len() > 5 {
-        return Err("at most five sessions can be selected".to_owned());
-    }
     let lib_id = ensure_library(conn, root)?;
-    import_legacy(conn, lib_id, Path::new(root))?;
+    if !crate::location::is_remote_location(root) {
+        import_legacy(conn, lib_id, Path::new(root), legacy)?;
+    }
     let encoded = serde_json::to_string(&unique).map_err(|err| err.to_string())?;
     conn.execute(
         "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
@@ -358,6 +394,11 @@ pub fn sync_entry(
         .optional()
         .map_err(|err| err.to_string())?;
 
+    // ponytail: the fingerprint was stat'ed before STORE_LOCK while the
+    // caller walked storage — a file replaced in that window gets the new
+    // path with the old stamp. The ceiling is one scan interval; the next
+    // scan's fingerprint mismatch rehydrates. Closing it would need the
+    // stat inside the lock, which puts remote connects under STORE_LOCK.
     let path = entry.storage_path.to_string_lossy().to_string();
     if let Some(existing) = existing {
         if fingerprint.is_none() {
@@ -429,11 +470,10 @@ pub fn record_meta(
     // The UPDATE below leaves size/mtime_ns alone: sync_entry stamps them
     // before hydrate reads any bytes, and restatting now would certify
     // content the row does not hold — a stored fingerprint newer than the
-    // hydrated bytes pins stale meta instead of re-reading it.
-    let (mtime_ns, size) = match fingerprint {
-        Some((mtime, size)) => (Some(mtime), Some(size)),
-        None => (None, None),
-    };
+    // hydrated bytes pins stale meta instead of re-reading it. The WHERE
+    // clause binds the fingerprint hydrate certified: a peer that restamped
+    // the row to newer bytes takes 0 rows and stays retryable.
+    let (fp_mtime, fp_size) = fingerprint.unzip();
     let path = entry.storage_path.to_string_lossy().to_string();
     let date = meta.and_then(SessionMeta::date_iso);
     // A meta=None row only seals (checked=1) when hydrate found the storage
@@ -443,28 +483,45 @@ pub fn record_meta(
     // UPDATE only — the row exists by the time meta lands (sync_entry made
     // it inside the committed tx). An INSERT would resurrect a row deleted
     // in the autocommit window with hydrated meta and a stale fingerprint.
+    if checked == 0 {
+        // Meta read from newer bytes than the stamp certifies must not be
+        // written under the old fingerprint — keep the path current and
+        // leave the row retryable for a certifying hydrate.
+        conn.execute(
+            "UPDATE sessions SET storage_path = ?3, kind = ?4, map_geom_checked = 0
+             WHERE library_id = ?1 AND session_id = ?2
+               AND size IS ?5 AND mtime_ns IS ?6",
+            params![
+                lib_id,
+                entry.session_id,
+                path,
+                entry.kind,
+                fp_size,
+                fp_mtime
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
     conn.execute(
         "UPDATE sessions SET
             storage_path = ?3,
             kind = ?4,
-            size = ?5,
-            mtime_ns = ?6,
-            date = ?7,
-            primary_mu = ?8,
-            treatment_time_s = ?9,
-            room_number = ?10,
-            config_name = ?11,
-            map_extent_mm = ?12,
-            layer_count = ?13,
-            map_geom_checked = ?14
-         WHERE library_id = ?1 AND session_id = ?2",
+            date = ?5,
+            primary_mu = ?6,
+            treatment_time_s = ?7,
+            room_number = ?8,
+            config_name = ?9,
+            map_extent_mm = ?10,
+            layer_count = ?11,
+            map_geom_checked = ?12
+         WHERE library_id = ?1 AND session_id = ?2
+           AND size IS ?13 AND mtime_ns IS ?14",
         params![
             lib_id,
             entry.session_id,
             path,
             entry.kind,
-            size,
-            mtime_ns,
             date,
             meta.and_then(|item| item.primary_mu),
             meta.and_then(|item| item.treatment_time_s),
@@ -473,6 +530,8 @@ pub fn record_meta(
             meta.and_then(|item| item.map_extent_mm),
             meta.and_then(|item| item.layer_count),
             checked,
+            fp_size,
+            fp_mtime,
         ],
     )
     .map_err(|err| err.to_string())?;
@@ -483,7 +542,11 @@ pub fn record_meta(
 ///
 /// ponytail: runs only when this library has no notes at all, so deleting one
 /// note does not revive the JSON. Clearing every note would.
-pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Result<(), String> {
+pub fn backfill_blank_notes(
+    conn: &Connection,
+    lib_id: i64,
+    notes_raw: Option<&Value>,
+) -> Result<(), String> {
     let filled: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sessions WHERE library_id = ?1 AND note != ''",
@@ -494,9 +557,7 @@ pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Resu
     if filled > 0 {
         return Ok(());
     }
-    let Some(notes) =
-        read_json(root.join("session_notes.json")).and_then(|value| value.as_object().cloned())
-    else {
+    let Some(notes) = notes_raw.and_then(|value| value.as_object()) else {
         return Ok(());
     };
     for (session_id, text) in notes {
@@ -516,9 +577,15 @@ pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Resu
     Ok(())
 }
 
-pub fn prepare_library(conn: &Connection, root: &str) -> Result<i64, String> {
+pub fn prepare_library(
+    conn: &Connection,
+    root: &str,
+    legacy: Option<&LegacyFiles>,
+) -> Result<i64, String> {
     let lib_id = ensure_library(conn, root)?;
-    import_legacy(conn, lib_id, Path::new(root))?;
+    if !crate::location::is_remote_location(root) {
+        import_legacy(conn, lib_id, Path::new(root), legacy)?;
+    }
     Ok(lib_id)
 }
 
@@ -598,11 +665,23 @@ pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
     // Fill only while the pref is still absent - an unconditional write
     // could resurrect a directory a peer just forgot mid-scan.
     let raw = serde_json::to_string(&json!(dirs)).map_err(|err| err.to_string())?;
-    conn.execute(
-        "INSERT INTO prefs(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
-        params![PREF_DATA_DIRS, raw],
-    )
-    .map_err(|err| err.to_string())?;
+    // The fill is a one-time migration — a pure-read caller must not fail
+    // on a busy store for it; the fallback is returned and the fill lands
+    // on the next uncontended call.
+    if conn
+        .execute(
+            "INSERT INTO prefs(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![PREF_DATA_DIRS, raw],
+        )
+        .is_err()
+    {
+        return Ok(dirs);
+    }
+    // A peer may have committed the real list between our read and the
+    // insert — return what is stored, not our one-item fallback.
+    if let Some(value) = prefs_get(conn, PREF_DATA_DIRS)?.filter(|value| value.is_array()) {
+        return Ok(string_list(&value));
+    }
     Ok(dirs)
 }
 
@@ -760,9 +839,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             "this library was written by a newer Scan Kit (schema v{version}); upgrade to open it"
         ));
     }
-    if version < 1 {
-        conn.execute_batch(
-            "
+    // The CREATEs heal every version — a versioned file missing a table
+    // (torn creation, foreign partial write) self-repairs like an unstamped
+    // one instead of failing every later open.
+    conn.execute_batch(
+        "
             CREATE TABLE IF NOT EXISTS prefs (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -799,10 +880,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                 UNIQUE(library_id, session_id)
             );
             ",
-        )
+    )
+    .map_err(|err| err.to_string())?;
+    conn.execute_batch(EXAMS_TABLE)
         .map_err(|err| err.to_string())?;
-        conn.execute_batch(EXAMS_TABLE)
-            .map_err(|err| err.to_string())?;
+    if version < 1 {
         // Tables that predate version stamping keep their older shape —
         // heal the later columns the same way a versioned DB does.
         migrate_columns(
@@ -838,6 +920,40 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                 ("note", "TEXT NOT NULL DEFAULT ''"),
             ],
         )?;
+        // Tables that predate version stamping may lack the UNIQUE
+        // constraints the ON CONFLICT upserts resolve against — dedupe
+        // then index or every session/exam write fails on such a DB.
+        // Rows dangling on a deleted/never-written libraries row get NULL
+        // from the repoint subquery and fail NOT NULL — sweep them first.
+        conn.execute_batch(
+            "DELETE FROM sessions WHERE library_id NOT IN (SELECT id FROM libraries);
+             DELETE FROM exams WHERE library_id NOT IN (SELECT id FROM libraries);
+             UPDATE sessions SET library_id = (
+                SELECT keep.id FROM libraries l1
+                JOIN libraries keep
+                    ON keep.root_path = l1.root_path
+                WHERE l1.id = sessions.library_id
+                ORDER BY keep.id LIMIT 1);
+             UPDATE exams SET library_id = (
+                SELECT keep.id FROM libraries l1
+                JOIN libraries keep
+                    ON keep.root_path = l1.root_path
+                WHERE l1.id = exams.library_id
+                ORDER BY keep.id LIMIT 1);
+             DELETE FROM sessions WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM sessions GROUP BY library_id, session_id);
+             DELETE FROM exams WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM exams GROUP BY library_id, study_uid);
+             DELETE FROM libraries WHERE id NOT IN (
+                SELECT MIN(id) FROM libraries GROUP BY root_path);
+             CREATE UNIQUE INDEX IF NOT EXISTS sessions_unique
+                ON sessions(library_id, session_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS exams_unique
+                ON exams(library_id, study_uid);
+             CREATE UNIQUE INDEX IF NOT EXISTS libraries_root_unique
+                ON libraries(root_path);",
+        )
+        .map_err(|err| err.to_string())?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|err| err.to_string())?;
         return Ok(());
@@ -873,6 +989,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if version < 4 {
         conn.execute_batch(EXAMS_TABLE)
             .map_err(|err| err.to_string())?;
+        // An exams table that exists with a stale column set (partial
+        // creation at the same version) heals like sessions/libraries do.
+        migrate_columns(
+            conn,
+            "exams",
+            &[
+                ("folder_name", "TEXT NOT NULL DEFAULT ''"),
+                ("storage_path", "TEXT"),
+                ("patient_name", "TEXT NOT NULL DEFAULT ''"),
+                ("patient_id", "TEXT NOT NULL DEFAULT ''"),
+                ("study_date", "TEXT"),
+                ("study_description", "TEXT NOT NULL DEFAULT ''"),
+                ("file_count", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
     }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -910,6 +1041,20 @@ fn migrate_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> 
 }
 
 pub(crate) fn ensure_library(conn: &Connection, root: &str) -> Result<i64, String> {
+    // SELECT first: INSERT OR IGNORE only ignores when the UNIQUE
+    // constraint exists — a table that predates version stamping may lack
+    // it, and then every call leaks a duplicate row.
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM libraries WHERE root_path = ?1",
+            params![root],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+    {
+        return Ok(id);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO libraries(root_path) VALUES (?1)",
         params![root],
@@ -923,17 +1068,26 @@ pub(crate) fn ensure_library(conn: &Connection, root: &str) -> Result<i64, Strin
     .map_err(|err| err.to_string())
 }
 
-pub(crate) fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), String> {
-    let (notes_done, views_done) = conn
-        .query_row(
-            "SELECT notes_imported, view_settings_imported FROM libraries WHERE id = ?1",
-            params![lib_id],
-            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
-        )
-        .map_err(|err| err.to_string())?;
-    if notes_done && views_done {
-        return Ok(());
+/// The legacy JSON lives on the library root — for a UNC share these reads
+/// can stall for the OS timeout, so lock-sensitive callers prefetch before
+/// STORE_LOCK and pass the files in.
+#[derive(Clone)]
+pub(crate) struct LegacyFiles {
+    settings_ok: bool,
+    notes_ok: bool,
+    settings: Value,
+    notes_raw: Option<Value>,
+}
+
+impl LegacyFiles {
+    /// The prefetched session_notes.json, parsed — lets the backfill reuse
+    /// it instead of re-reading inside STORE_LOCK.
+    pub(crate) fn notes(&self) -> Option<&Value> {
+        self.notes_raw.as_ref()
     }
+}
+
+pub fn legacy_files(base: &Path) -> LegacyFiles {
     let settings_path = base.join("settings.json");
     let settings_raw = read_json(settings_path.clone());
     // A corrupt legacy file is not an empty one — retry the import on the
@@ -948,17 +1102,61 @@ pub(crate) fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Resu
     // corrupt one — stamping notes_imported would discard it forever.
     let notes_ok = notes_raw
         .as_ref()
-        .map(|value| value.is_object())
+        .map(|value| {
+            value
+                .as_object()
+                .map(|map| map.values().all(Value::is_string))
+                .unwrap_or(false)
+        })
         .unwrap_or(!notes_path.exists());
-    let settings = settings_raw.unwrap_or_else(|| json!({}));
-    if !notes_done && notes_ok && settings_ok {
-        if let Some(notes) = notes_raw.and_then(|value| value.as_object().cloned()) {
+    LegacyFiles {
+        settings_ok,
+        notes_ok,
+        settings: settings_raw.unwrap_or_else(|| json!({})),
+        notes_raw,
+    }
+}
+
+pub(crate) fn import_legacy(
+    conn: &Connection,
+    lib_id: i64,
+    base: &Path,
+    legacy: Option<&LegacyFiles>,
+) -> Result<(), String> {
+    let (notes_done, views_done) = conn
+        .query_row(
+            "SELECT notes_imported, view_settings_imported FROM libraries WHERE id = ?1",
+            params![lib_id],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+        )
+        .map_err(|err| err.to_string())?;
+    if notes_done && views_done {
+        return Ok(());
+    }
+    let owned;
+    let files = match legacy {
+        Some(files) => files,
+        None => {
+            owned = legacy_files(base);
+            &owned
+        }
+    };
+    let LegacyFiles {
+        settings_ok,
+        notes_ok,
+        settings,
+        notes_raw,
+    } = files;
+    // The notes import does not depend on a healthy settings.json — gating
+    // on settings_ok used to wedge a good notes file behind a corrupt one.
+    if !notes_done && *notes_ok {
+        if let Some(notes) = notes_raw.as_ref().and_then(|value| value.as_object()) {
             for (session_id, text) in notes {
                 let Some(text) = text.as_str() else {
                     continue;
                 };
                 let text = text.trim();
-                if text.is_empty() || !scan_kit_core::valid_session_id(&session_id) {
+                if text.is_empty() || !scan_kit_core::valid_session_id(session_id) {
                     continue;
                 }
                 // Update only - an absent session keeps no row, so a stale
@@ -993,7 +1191,7 @@ pub(crate) fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Resu
         )
         .map_err(|err| err.to_string())?;
     }
-    if !views_done && settings_ok {
+    if !views_done && *settings_ok {
         let bg_subtract = settings
             .get("bg_subtract")
             .and_then(Value::as_bool)
@@ -1050,9 +1248,18 @@ fn import_app_settings_once(conn: &Connection, db_path: &Path) -> Result<(), Str
     if marked.is_some() {
         return Ok(());
     }
+    // The legacy file sits beside the database — a custom db imports its
+    // own profile, not the default one's. Read before the write tx: a
+    // stalled share must not sit inside BEGIN IMMEDIATE.
+    let path = db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("app_settings.json");
+    let exists = path.exists();
+    let value = exists.then(|| read_json(path)).flatten();
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|err| err.to_string())?;
-    let result = import_app_settings_body(conn, db_path);
+    let result = import_app_settings_body(conn, exists, value);
     if result.is_err() {
         let _ = conn.execute_batch("ROLLBACK");
         return result;
@@ -1060,15 +1267,13 @@ fn import_app_settings_once(conn: &Connection, db_path: &Path) -> Result<(), Str
     conn.execute_batch("COMMIT").map_err(|err| err.to_string())
 }
 
-fn import_app_settings_body(conn: &Connection, db_path: &Path) -> Result<(), String> {
-    // The legacy file sits beside the database — a custom db imports its own
-    // profile, not the default one's.
-    let path = db_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("app_settings.json");
-    if path.exists() {
-        let Some(value) = read_json(path.clone()).filter(|value| value.is_object()) else {
+fn import_app_settings_body(
+    conn: &Connection,
+    exists: bool,
+    value: Option<Value>,
+) -> Result<(), String> {
+    if exists {
+        let Some(value) = value.filter(|value| value.is_object()) else {
             // A corrupt file is not an empty one — retry the import on the
             // next open instead of stamping the flag and losing the data
             // forever (same rule as import_legacy).
@@ -1099,22 +1304,33 @@ pub(crate) fn delete_missing(
     found: &HashSet<String>,
 ) -> Result<(), String> {
     let mut statement = conn
-        .prepare("SELECT session_id FROM sessions WHERE library_id = ?1")
+        .prepare("SELECT session_id, storage_path IS NOT NULL FROM sessions WHERE library_id = ?1")
         .map_err(|err| err.to_string())?;
-    let ids = statement
-        .query_map(params![lib_id], |row| row.get::<_, String>(0))
+    let rows = statement
+        .query_map(params![lib_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
         .map_err(|err| err.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
-    let gone: Vec<_> = ids.into_iter().filter(|id| !found.contains(id)).collect();
-    for session_id in &gone {
+    let gone: Vec<_> = rows
+        .into_iter()
+        .filter(|(id, _)| !found.contains(id))
+        .collect();
+    for (session_id, had_storage) in &gone {
         // A case-only rename on a case-insensitive filesystem yields a new
         // id for the same file - rekey the row instead of losing the note.
-        if let Some(renamed) = found
+        // Two same-case-insensitive ids can legitimately coexist on a
+        // case-sensitive filesystem — rekeying on an arbitrary match could
+        // attach this row's note to the wrong survivor.
+        let mut matches = found
             .iter()
-            .find(|id| id.eq_ignore_ascii_case(session_id))
-            .cloned()
-        {
+            .filter(|id| id.eq_ignore_ascii_case(session_id));
+        let renamed = match (matches.next(), matches.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        };
+        if let Some(renamed) = renamed {
             let survives: bool = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -1151,11 +1367,16 @@ pub(crate) fn delete_missing(
             }
             continue;
         }
-        conn.execute(
-            "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
-            params![lib_id, session_id],
-        )
-        .map_err(|err| err.to_string())?;
+        // A note-before-scan row has no storage_path — it was never an
+        // indexed session, so a scan that misses the files must not GC the
+        // user's note. Rows that did index a file GC as before.
+        if *had_storage {
+            conn.execute(
+                "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
+                params![lib_id, session_id],
+            )
+            .map_err(|err| err.to_string())?;
+        }
     }
     // last_scan_at marks the last scan, not the last scan that deleted a row.
     let selected = selected_list(conn, lib_id)?.into_iter().filter_map(|id| {
@@ -1163,7 +1384,13 @@ pub(crate) fn delete_missing(
         if found.contains(&id) {
             Some(id)
         } else {
-            found.iter().find(|f| f.eq_ignore_ascii_case(&id)).cloned()
+            // Same rule as the row rekey above — an ambiguous case match
+            // must not hand the selection to an arbitrary survivor.
+            let mut matches = found.iter().filter(|f| f.eq_ignore_ascii_case(&id));
+            match (matches.next(), matches.next()) {
+                (Some(only), None) => Some(only.clone()),
+                _ => None,
+            }
         }
     });
     let mut seen = std::collections::HashSet::new();
@@ -1362,7 +1589,11 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                // Only a Normal component pops — popping RootDir/Prefix
+                // would yield a relative path stored as canonical.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
             }
             other => out.push(other.as_os_str()),
         }
@@ -1383,8 +1614,8 @@ mod tests {
         std::fs::write(base.join("settings.json"), "{}").unwrap();
         std::fs::write(base.join("session_notes.json"), r#"{"s1": "legacy note"}"#).unwrap();
         let root = base.to_string_lossy().to_string();
-        let lib_id = prepare_library(&conn, &root).unwrap();
-        set_note(&conn, &root, "s1", "user note").unwrap();
+        let lib_id = prepare_library(&conn, &root, None).unwrap();
+        set_note(&conn, &root, "s1", "user note", None).unwrap();
         // A crash before the flag commit replays the import — the upsert must
         // fill blanks only, never revert a live note to the legacy text.
         conn.execute(
@@ -1392,7 +1623,7 @@ mod tests {
             params![lib_id],
         )
         .unwrap();
-        set_note(&conn, &root, "s2", "other").unwrap();
+        set_note(&conn, &root, "s2", "other", None).unwrap();
         let note: String = conn
             .query_row(
                 "SELECT note FROM sessions WHERE library_id = ?1 AND session_id = 's1'",
@@ -1484,7 +1715,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         // The command reports the trimmed text — the row must agree with it.
-        set_note(&conn, &root, "s1", "  padded note  ").unwrap();
+        set_note(&conn, &root, "s1", "  padded note  ", None).unwrap();
         let note: String = conn
             .query_row(
                 "SELECT note FROM sessions WHERE session_id = 's1'",
@@ -1504,10 +1735,10 @@ mod tests {
         let path = dir.join("store.db");
         let conn = open_connection(&path).unwrap();
         prefs_set(&conn, PREF_APP_SETTINGS, &json!({"window": "live"})).unwrap();
-        std::fs::write(dir.join("app_settings.json"), r#"{"window": "stale"}"#).unwrap();
+        // (The file body is what import prefetches — passed directly.)
         // A DB that predates the import marker must not have its live
         // settings reverted by the stale legacy file.
-        import_app_settings_body(&conn, &path).unwrap();
+        import_app_settings_body(&conn, true, Some(json!({"window": "stale"}))).unwrap();
         assert_eq!(
             prefs_get(&conn, PREF_APP_SETTINGS).unwrap(),
             Some(json!({"window": "live"}))
@@ -1531,7 +1762,7 @@ mod tests {
         let lib_id = ensure_library(&conn, &root).unwrap();
         // Parsed-but-wrong-shape is corrupt — stamping notes_imported would
         // discard it forever instead of retrying a fixed file.
-        import_legacy(&conn, lib_id, Path::new(&root)).unwrap();
+        import_legacy(&conn, lib_id, Path::new(&root), None).unwrap();
         let stamped: i64 = conn
             .query_row(
                 "SELECT notes_imported FROM libraries WHERE id = ?1",
@@ -1677,7 +1908,7 @@ mod tests {
         let root = path.with_file_name("lib");
         std::fs::create_dir_all(&root).unwrap();
         let conn = open_connection(&path).unwrap();
-        let lib_id = prepare_library(&conn, &root.to_string_lossy()).unwrap();
+        let lib_id = prepare_library(&conn, &root.to_string_lossy(), None).unwrap();
         let entry = Discovered {
             session_id: "s1".to_owned(),
             storage_path: path.with_file_name("no-such-session.zip"),
@@ -1717,7 +1948,7 @@ mod tests {
         let root = path.with_file_name("lib");
         std::fs::create_dir_all(&root).unwrap();
         let conn = open_connection(&path).unwrap();
-        let lib_id = prepare_library(&conn, &root.to_string_lossy()).unwrap();
+        let lib_id = prepare_library(&conn, &root.to_string_lossy(), None).unwrap();
         let entry = Discovered {
             session_id: "keep".to_owned(),
             storage_path: root.join("keep.zip"),

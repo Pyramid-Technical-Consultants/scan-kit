@@ -20,7 +20,9 @@
 pub struct FiniteReduce {
     pub min: f32,
     pub max: f32,
-    pub sum: f32,
+    /// f64: sequential f32 accumulation stalls once ulp(sum) exceeds each
+    /// term — 1e7 ones would pin at 2^24 and report a wrong mean.
+    pub sum: f64,
     pub count: u32,
 }
 
@@ -43,7 +45,7 @@ pub fn reduce_finite(samples: &[f32]) -> FiniteReduce {
             out.min = out.min.min(value);
             out.max = out.max.max(value);
         }
-        out.sum += value;
+        out.sum += f64::from(value);
         out.count += 1;
     }
     out
@@ -58,7 +60,7 @@ pub fn finite_minmax(samples: &[f32]) -> Option<(f32, f32)> {
 /// Mean of the finite samples. `None` when no sample is finite.
 pub fn mean_finite(samples: &[f32]) -> Option<f32> {
     let reduced = reduce_finite(samples);
-    (reduced.count > 0).then_some(reduced.sum / reduced.count as f32)
+    (reduced.count > 0).then_some((reduced.sum / f64::from(reduced.count)) as f32)
 }
 
 fn cmp_f32(left: &f32, right: &f32) -> std::cmp::Ordering {
@@ -115,6 +117,9 @@ pub fn percentile_linear(values: &mut [f32], q: f64) -> f32 {
     let hi = pos.ceil().min((values.len() - 1) as f64) as usize;
     let frac = (pos - lo as f64) as f32;
     let (low, high) = select_ranks(values, lo, hi);
+    if lo == hi {
+        return low;
+    }
     low * (1.0 - frac) + high * frac
 }
 
@@ -148,10 +153,18 @@ pub fn quantiles_at(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
     let last = values.len() - 1;
     qs.iter()
         .map(|q| {
+            // NaN as usize saturates to 0 — a NaN q would return the
+            // minimum instead of propagating like percentile_nearest.
+            if !q.is_finite() {
+                return f32::NAN;
+            }
             let pos = f64::from(q.clamp(0.0, 1.0)) * last as f64;
             let lo = (pos.floor() as usize).min(last);
             let hi = (pos.ceil() as usize).min(last);
             let frac = (pos - lo as f64) as f32;
+            if lo == hi {
+                return values[lo];
+            }
             values[lo] * (1.0 - frac) + values[hi] * frac
         })
         .collect()
@@ -235,6 +248,13 @@ mod tests {
         assert!(quantiles_at(&mut [], &qs)
             .iter()
             .all(|value| value.is_nan()));
+        // The sort oracle shares the function's convention — only literal
+        // values pin the interpolation rule itself.
+        let mut four = vec![0.0, 10.0, 20.0, 30.0];
+        assert_eq!(
+            quantiles_at(&mut four, &[0.25, 0.5, 0.75]),
+            [7.5, 15.0, 22.5]
+        );
     }
 
     #[test]
@@ -252,5 +272,14 @@ mod tests {
         assert_eq!(median_unstable(&mut values), 3e38);
         let mut values = [-3e38f32, -3e38];
         assert_eq!(median_unstable(&mut values), -3e38);
+    }
+
+    #[test]
+    fn a_long_run_of_ones_means_one() {
+        // Sequential f32 accumulation stalls once ulp(sum) exceeds each
+        // term: 1e7 ones used to pin at 2^24 and report ~1.68.
+        let samples = vec![1.0f32; 10_000_000];
+        assert_eq!(mean_finite(&samples), Some(1.0));
+        assert_eq!(reduce_finite(&samples).sum, 10_000_000.0);
     }
 }

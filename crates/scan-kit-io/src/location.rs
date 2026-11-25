@@ -172,7 +172,7 @@ pub(crate) fn discover_remote(
             },
             root_name,
         );
-    } else if let Some(exam) = remote_exam(&mut *fs, &remote.path, root_name, canonical)? {
+    } else if let Some(exam) = remote_exam(&mut *fs, &remote.path, root_name, canonical, keep)? {
         discover::add_exam(&mut exams, &mut skipped, exam, root_name);
     } else {
         walk_remote(
@@ -211,9 +211,25 @@ pub(crate) fn read_remote_session_file(
     }
     let mut fs = crate::remote::connect(&remote, &password_of(&remote)).ok()?;
     let base = remote.path.trim_end_matches('/');
-    let mut candidates = vec![format!("{base}/{filename}")];
-    if discover::valid_session_id(session_id) {
+    // Nested first — resolve_container prefers the inner dir when both
+    // layouts exist; a flat-first remote read would diverge from local.
+    let mut candidates = Vec::new();
+    // The nested candidate must carry the session marker — a stray
+    // {id}/{id}/ dir with no input_map.csv cannot steal the read, the same
+    // way the local session_directory gates nested on marker_file.
+    if discover::valid_session_id(session_id)
+        && matches!(
+            fs.read(&format!("{base}/{session_id}/input_map.csv")),
+            Ok(Some(_))
+        )
+    {
         candidates.push(format!("{base}/{session_id}/{filename}"));
+    } else {
+        // No nested marker — the flat file is what the reader serves. When
+        // the marker does hold the nested tree is authoritative instead: a
+        // stale flat file must not hydrate what the nested layout lacks,
+        // matching session_directory locally.
+        candidates.push(format!("{base}/{filename}"));
     }
     for path in candidates {
         if let Ok(Some(bytes)) = fs.read(&path) {
@@ -228,26 +244,58 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
     let mut fs = crate::remote::connect(&remote, &password_of(&remote)).ok()?;
     let base = remote.path.trim_end_matches('/');
     let mut candidates = vec![base.to_owned()];
-    if !archive_name(&remote.path) {
-        candidates.insert(0, format!("{base}/termination_summary.txt"));
-        if discover::valid_session_id(session_id) {
-            candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
-            // Still-capturing sessions have no summary and their inner dir's
-            // mtime freezes once the layer/run dirs exist — input_map.csv
-            // moves on every row write (same probes as remote_stamp).
-            candidates.insert(2, format!("{base}/input_map.csv"));
-            candidates.insert(3, format!("{base}/{session_id}/input_map.csv"));
-            candidates.insert(4, format!("{base}/{session_id}"));
+    if !archive_name(&remote.path) && discover::valid_session_id(session_id) {
+        let nested = format!("{base}/{session_id}");
+        // Reads serve the nested file only when the nested marker exists —
+        // probe in the order the reader resolves so the fingerprint
+        // certifies the file that is actually read.
+        let inner_first = matches!(fs.stat(&format!("{nested}/input_map.csv")), Ok(Some(_)));
+        // With the nested marker the nested tree is authoritative — probing
+        // the flat files would fingerprint bytes the reader never serves.
+        if inner_first {
+            candidates.splice(
+                0..0,
+                [
+                    format!("{nested}/termination_summary.txt"),
+                    format!("{nested}/input_map.csv"),
+                ],
+            );
+            // Before `base`, mirroring remote_stamp — the container's frozen
+            // mtime would freeze the fingerprint on a growing session.
+            candidates.insert(2, nested);
+        } else {
+            candidates.splice(
+                0..0,
+                [
+                    format!("{base}/termination_summary.txt"),
+                    format!("{base}/input_map.csv"),
+                ],
+            );
         }
+    } else if !archive_name(&remote.path) {
+        candidates.insert(0, format!("{base}/termination_summary.txt"));
     }
     let mut dir_stat = None;
     for path in candidates {
         // A miss on one candidate must not end the search — the nested
-        // session layout stores the marker under {base}/{id}/{id}/.
-        let Ok(Some(stat)) = fs.stat(&path) else {
+        // session layout stores the marker under {base}/{id}/{id}/. An
+        // Err is not a miss either: remote_stamp aborts on the same
+        // failure, so skipping here would fingerprint a different marker
+        // than the copy validates (and None already reads as "retry").
+        let stat = match fs.stat(&path) {
+            Ok(stat) => stat,
+            Err(_) => return None,
+        };
+        let Some(stat) = stat else {
             continue;
         };
         if archive_name(&remote.path) || !stat.dir {
+            // mtime 0 means the protocol stat couldn't certify the file
+            // (SFTP without mtime, FTP LIST without a modify fact) — an
+            // unverifiable fingerprint must not seal stale meta.
+            if stat.mtime_ns == 0 {
+                return None;
+            }
             return Some((stat.mtime_ns, i64::try_from(stat.size).ok()?));
         }
         // First dir hit wins: the inner session dir tracks a live capture's
@@ -259,6 +307,9 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
     // A still-capturing session has no summary yet — its own directory's
     // metadata still distinguishes it from nothing.
     let stat = dir_stat?;
+    if stat.mtime_ns == 0 {
+        return None;
+    }
     Some((stat.mtime_ns, i64::try_from(stat.size).ok()?))
 }
 
@@ -319,9 +370,14 @@ pub(crate) fn replace_catalog(entries: &[(String, String, String, String)]) {
     }
 }
 
-pub(crate) fn replace_sessions(library: &str, places: &[(String, String)]) {
+/// `complete` is false on a partial walk — replacing then would drop the
+/// bindings of every session under an unlistable directory, the same blind
+/// delete delete_missing is guarded against.
+pub(crate) fn replace_sessions(library: &str, places: &[(String, String)], complete: bool) {
     let mut map = sessions().lock().unwrap_or_else(|err| err.into_inner());
-    map.retain(|(root, _), _| root != library);
+    if complete {
+        map.retain(|(root, _), _| root != library);
+    }
     for (session_id, place) in places {
         map.insert((library.to_owned(), session_id.clone()), place.clone());
     }
@@ -334,6 +390,10 @@ pub(crate) fn drop_sessions(library: &str) {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .retain(|(root, _), _| root != library);
+    // A forgotten remote library would orphan its whole materialized
+    // cache (up to MAX_COPY_BYTES each) - clear it under the copy lock.
+    let _copy = copy_lock();
+    let _ = std::fs::remove_dir_all(cache_directory(library));
 }
 
 pub(crate) fn cache_directory(library_canonical: &str) -> PathBuf {
@@ -362,31 +422,67 @@ pub(crate) fn fixture_copies(spec: &str) -> u32 {
     crate::remote::fixture_copies(&remote.canonical)
 }
 
-fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
-    // ponytail: one global lock serializes every remote copy — copies are rare
-    // and a per-dest keyed guard is not worth the bookkeeping. Without it two
-    // copies of one session can interleave: the first writes the stamp, the
-    // second overwrites files under a matching stamp, poisoning the cache.
-    static COPY: OnceLock<Mutex<()>> = OnceLock::new();
-    let _copy = COPY
-        .get_or_init(|| Mutex::new(()))
+// ponytail: one global lock serializes every remote copy — copies are rare
+// and a per-dest keyed guard is not worth the bookkeeping. Without it two
+// copies of one session can interleave: the first writes the stamp, the
+// second overwrites files under a matching stamp, poisoning the cache.
+// delete_storage's cache removal takes the same lock so a trashed session
+// cannot be resurrected by an in-flight copy stamping the remains.
+static COPY: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn copy_lock() -> std::sync::MutexGuard<'static, ()> {
+    COPY.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|err| err.into_inner());
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
+    let _copy = copy_lock();
+    // A forget_data_dir or rescan can drop the binding between the caller's
+    // lookup and this copy - re-check under the copy lock so an orphaned
+    // session isn't re-downloaded into a cache nothing resolves. The
+    // archive-file case (library == session URL) has no map binding.
+    let bound = library_canonical == session_url
+        || sessions()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .any(|((root, _), place)| root == library_canonical && place == session_url)
+        || catalog()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .any(|row| row.library == library_canonical && row.place == session_url);
+    if !bound {
+        return Err("session binding was dropped".into());
+    }
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
     // Only plain relative segments may join the cache — a `..` escapes it, and
     // on Windows `join("C:/evil")` discards the base entirely. A name that can
     // never exist locally (illegal char, DOS stem) fails the copy every time.
-    if !Path::new(&relative).components().all(|part| {
-        matches!(part, std::path::Component::Normal(name)
-            if !crate::remote::unsafe_local_name(&name.to_string_lossy()))
-    }) {
+    // A backslash in the remote path is one character there but a
+    // separator locally on Windows — a name like a-backslash-b
+    // materializes as a/b and collides with a real a/b session
+    // dir and stamp.
+    if relative.contains('\\')
+        || !Path::new(&relative).components().all(|part| {
+            matches!(part, std::path::Component::Normal(name)
+                if !crate::remote::unsafe_local_name(&name.to_string_lossy()))
+        })
+    {
         return Err("remote session path escapes the cache directory".into());
     }
-    let dest = cache_directory(library_canonical).join(&relative);
+    let dest = cache_dest(library_canonical, &relative);
     let stamp_text = remote_stamp(&session)?;
     let stamp_path = stamp_file(&dest);
-    if dest.exists() && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp_text.as_str())
+    // "0\n0" means the remote could not be stat'ed (a HEAD-less HTTP server,
+    // an FTP dir with no MLST facts, or a deleted session) — it carries no
+    // freshness information, so it must never validate the cache. On those
+    // servers every open re-copies; stale-forever is the worse failure.
+    if stamp_text != "0\n0"
+        && dest.exists()
+        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp_text.as_str())
     {
         return Ok(dest);
     }
@@ -394,25 +490,51 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     let mut fs = crate::remote::connect(&session, &password_of(&session))?;
-    // Files the remote tree lost must not survive in the cache — replace the
-    // copy, never merge over it. A failed clear must error out here: merging
-    // over a surviving tree and then stamping it would pin stale files in
-    // the cache permanently.
-    // The remote's type can flip (a file now sits where a dir was cached) —
-    // remove_dir_all would then error forever and wedge the cache entry.
-    let cleared = if dest.is_dir() {
-        fs::remove_dir_all(&dest)
-    } else {
-        fs::remove_file(&dest)
-    };
-    if let Err(err) = cleared {
-        // A first materialize has nothing to clear; a removal that left any
-        // of the tree behind must not be stamped over.
-        if dest.exists() {
-            return Err(err.to_string());
+    // Copy into a sibling then swap: a failed download keeps the last good
+    // tree, and a half-written copy is never stamped or served. A leftover
+    // tmp from a killed process is reclaimed on entry; the rename makes the
+    // replace atomic to in-process readers — a peer process mid-read can
+    // still see the swap (the per-dest lockfile is the full fix).
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(".{name}.part-{}", std::process::id()));
+    let old = parent.join(format!(".{name}.old-{}", std::process::id()));
+    if tmp.exists() {
+        let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
+    }
+    // Orphan backups from crashed runs (any pid suffix). A live peer's
+    // .part-pid staging is not reclaimed here — the COPY lock is
+    // process-local and deleting it would fail that peer's copy.
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let stale = entry.file_name().to_string_lossy().into_owned();
+            if stale.starts_with(&format!(".{name}.old-")) {
+                let _ = fs::remove_dir_all(entry.path()).or_else(|_| fs::remove_file(entry.path()));
+            }
         }
     }
-    fs.copy_to(&session.path, &dest)?;
+    if let Err(err) = fs.copy_to(&session.path, &tmp) {
+        let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
+        return Err(err);
+    }
+    if dest.exists() {
+        if old.exists() {
+            let _ = fs::remove_dir_all(&old).or_else(|_| fs::remove_file(&old));
+        }
+        fs::rename(&dest, &old).map_err(|err| {
+            let _ = fs::remove_dir_all(&tmp).or_else(|_| fs::remove_file(&tmp));
+            format!("could not swap the remote cache: {err}")
+        })?;
+    }
+    if let Err(err) = fs::rename(&tmp, &dest) {
+        // The old tree must come back — the cache is not allowed to go
+        // missing over a rename failure.
+        let _ = fs::rename(&old, &dest);
+        return Err(format!("could not swap the remote cache: {err}"));
+    }
+    if old.exists() {
+        let _ = fs::remove_dir_all(&old).or_else(|_| fs::remove_file(&old));
+    }
     if let Some(parent) = stamp_path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -429,21 +551,40 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
     let base = session.path.trim_end_matches('/');
     let leaf = base.rsplit('/').next().unwrap_or(base);
     let mut dir_stat = None;
-    // Flat markers first, mirroring remote_fingerprint and the local
-    // storage_fingerprint — disagreeing orders would record one stat at
-    // fingerprint time and another at materialize time, a perpetual re-copy.
-    for marker in [
-        format!("{base}/termination_summary.txt"),
-        format!("{base}/{leaf}/termination_summary.txt"),
-        format!("{base}/input_map.csv"),
-        format!("{base}/{leaf}/input_map.csv"),
-        format!("{base}/{leaf}"),
-        base.to_owned(),
-    ] {
+    // Same resolved order remote_fingerprint and the local
+    // storage_fingerprint use — the nested files first when the nested
+    // marker exists, because that is the file the reader serves.
+    let inner_first = matches!(
+        fs.stat(&format!("{base}/{leaf}/input_map.csv")),
+        Ok(Some(_))
+    );
+    // With the nested marker the nested tree is authoritative — probing
+    // the flat markers would stamp bytes the reader never serves.
+    let markers: Vec<String> = if inner_first {
+        vec![
+            format!("{base}/{leaf}/termination_summary.txt"),
+            format!("{base}/{leaf}/input_map.csv"),
+            format!("{base}/{leaf}"),
+            base.to_owned(),
+        ]
+    } else {
+        vec![
+            format!("{base}/termination_summary.txt"),
+            format!("{base}/input_map.csv"),
+            base.to_owned(),
+        ]
+    };
+    for marker in markers {
         let Some(stat) = fs.stat(&marker)? else {
             continue;
         };
         if !stat.dir {
+            // mtime 0 means the server gave no timestamp - certifying
+            // size alone seals a same-size replace forever (the
+            // fingerprint layer already refuses this).
+            if stat.mtime_ns == 0 {
+                return Ok("0\n0".into());
+            }
             return Ok(format!("{}\n{}", stat.mtime_ns, stat.size));
         }
         if dir_stat.is_none() {
@@ -455,7 +596,35 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
         size: 0,
         mtime_ns: 0,
     });
+    if stat.mtime_ns == 0 {
+        return Ok("0\n0".into());
+    }
     Ok(format!("{}\n{}", stat.mtime_ns, stat.size))
+}
+
+/// The local cache path for a remote session — a case-insensitive NTFS
+/// can't hold Foo and foo side by side, so the relative path's hash joins
+/// the leaf and case-only-distinct remotes never share a dest or stamp.
+fn cache_dest(library_canonical: &str, relative: &str) -> PathBuf {
+    let base = cache_directory(library_canonical);
+    let hash = &crate::location::hex_sha256(relative)[..8];
+    // The archive readers key the format (zip vs tar) and the decoder off
+    // the filename suffix — the hash must join the stem, not follow the
+    // suffix, or a cached run.zip@hash reads as an uncompressed tar.
+    let leaf_name = |leaf: &str| {
+        let lower = leaf.to_ascii_lowercase();
+        for (suffix, _) in discover::ARCHIVE_SUFFIXES {
+            if lower.ends_with(suffix) {
+                let stem = &leaf[..leaf.len() - suffix.len()];
+                return format!("{stem}@{hash}{}", &leaf[leaf.len() - suffix.len()..]);
+            }
+        }
+        format!("{leaf}@{hash}")
+    };
+    match relative.rsplit_once('/') {
+        Some((parent, leaf)) => base.join(parent).join(leaf_name(leaf)),
+        None => base.join(leaf_name(relative)),
+    }
 }
 
 fn stamp_file(dest: &Path) -> PathBuf {
@@ -536,6 +705,9 @@ fn walk_remote(
         return Err("cancelled".into());
     }
     if depth >= NEST_DEPTH {
+        // An unvisited subtree is not an empty one — flag it like the local
+        // walk so delete_missing can't prune below the cap.
+        *walk_failed = true;
         return Ok(());
     }
     let mut dirs = Vec::new();
@@ -544,7 +716,7 @@ fn walk_remote(
     // walk — skip it instead of failing the whole discovery.
     let items = match fs.list(path) {
         Ok(items) => items,
-        Err(err) if depth == 0 => return Err(err),
+        Err(err) if depth == 0 => return Err(format!("cannot list {path}: {err}")),
         Err(_) => {
             *walk_failed = true;
             skipped.push(rel.to_owned());
@@ -558,8 +730,13 @@ fn walk_remote(
         if item.name.is_empty()
             || item.name == "."
             || item.name == ".."
-            || item.name.contains(['/', '\\'])
+            || crate::remote::unsafe_remote_name(&item.name)
         {
+            continue;
+        }
+        // Same staging exclusion the local walk makes — a half-written
+        // tree must not surface as a session.
+        if item.name.starts_with(".session_staging-") {
             continue;
         }
         if item.dir {
@@ -618,16 +795,24 @@ fn walk_remote(
         if skipped.contains(&join_rel(rel, name)) {
             continue;
         }
+        if !keep(0, 0) {
+            return Err("cancelled".into());
+        }
         let child = join_path(path, name);
         let child_rel = join_rel(rel, name);
         let url = join_rel(library_url, &encode_path(&child_rel));
-        match remote_exam(fs, &child, name, &url) {
+        match remote_exam(fs, &child, name, &url, keep) {
             Ok(Some(exam)) => {
                 discover::add_exam(exams, skipped, exam, &child_rel);
                 continue;
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(err) => {
+                // remote_exam's keep() cancel is a real abort, not a
+                // skipped directory.
+                if err == "cancelled" {
+                    return Err(err);
+                }
                 *walk_failed = true;
                 skipped.push(child_rel);
                 continue;
@@ -655,6 +840,7 @@ fn remote_exam(
     path: &str,
     folder_name: &str,
     storage_url: &str,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<Option<discover::ExamHit>, String> {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -663,8 +849,13 @@ fn remote_exam(
         if item.name.is_empty()
             || item.name == "."
             || item.name == ".."
-            || item.name.contains(['/', '\\'])
+            || crate::remote::unsafe_remote_name(&item.name)
         {
+            continue;
+        }
+        // Same staging exclusion the local walk makes — a half-written
+        // tree must not surface as a session.
+        if item.name.starts_with(".session_staging-") {
             continue;
         }
         if item.dir {
@@ -690,9 +881,12 @@ fn remote_exam(
     // walk must keep descending or the nested sessions disappear.
     for name in &dirs {
         let child = join_path(path, name);
-        if remote_holds_session(fs, &child, 0)? {
+        if remote_holds_session(fs, &child, 0, keep)? {
             return Ok(None);
         }
+    }
+    if !keep(0, 0) {
+        return Err("cancelled".into());
     }
     // An unreadable sample is no exam at all - fabricating one from empty
     // bytes writes a phantom record with the folder name as its uid.
@@ -733,9 +927,13 @@ fn remote_holds_session(
     fs: &mut dyn crate::remote::Fs,
     path: &str,
     depth: u32,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<bool, String> {
     if depth >= NEST_DEPTH {
         return Ok(false);
+    }
+    if !keep(0, 0) {
+        return Err("cancelled".into());
     }
     if is_file(fs, &join_path(path, "input_map.csv"))? {
         return Ok(true);
@@ -745,10 +943,10 @@ fn remote_holds_session(
             && !item.name.is_empty()
             && item.name != "."
             && item.name != ".."
-            && !item.name.contains(['/', '\\'])
+            && !crate::remote::unsafe_remote_name(&item.name)
         {
             let child = join_path(path, &item.name);
-            if remote_holds_session(fs, &child, depth + 1)? {
+            if remote_holds_session(fs, &child, depth + 1, keep)? {
                 return Ok(true);
             }
         }
@@ -857,6 +1055,14 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     // The path is percent-decoded — the host needs it too, or
     // `sftp://h%6fst/...` can never resolve.
     let host = percent_decode(&host).to_ascii_lowercase();
+    // A decoded host holding a URL-structural char reparses to a
+    // different host/path - the persisted canonical retargets.
+    if host.bytes().any(|byte| {
+        matches!(byte, b'/' | b'\\' | b'@' | b'?' | b'#' | b'[' | b']' | b'%')
+            || byte.is_ascii_whitespace()
+    }) {
+        return Err("the URL holds a host that cannot round-trip".into());
+    }
     let mut path = percent_decode(raw_path);
     // Decoded control chars would land verbatim in the canonical key, which
     // is persisted and logged — CR/LF forges fake log lines.
@@ -873,9 +1079,18 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     if !path.starts_with('/') {
         path.insert(0, '/');
     }
-    if path.len() > 1 {
-        path = path.trim_end_matches('/').to_owned();
+    // Every downstream guard treats `..` as traversal - refuse the
+    // spelling at parse; `.` and `//` collapse to one canonical.
+    if path.split('/').any(|part| part == "..") {
+        return Err("the URL path holds a .. segment".into());
     }
+    let path: String = {
+        let parts: Vec<&str> = path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        format!("/{}", parts.join("/"))
+    };
     let mut remote = Remote {
         canonical: String::new(),
         query: query.to_owned(),
@@ -1039,6 +1254,12 @@ pub fn file_uri_path(rest: &str) -> PathBuf {
             file_uri_path(&format!("/{path}"))
         }
         Some((host, path)) if !host.is_empty() => {
+            // The client collapses `..` on the share - same rule as smb://.
+            if path.split('/').any(|part| part == "..") {
+                // An empty path resolves to the cwd — emit a host that
+                // cannot resolve so callers error instead.
+                return PathBuf::from("\\\\file-uri-invalid\\..");
+            }
             PathBuf::from(format!("\\\\{host}\\{}", path.replace('/', "\\")))
         }
         _ if !rest.is_empty() => {
@@ -1192,6 +1413,9 @@ pub(crate) fn under_root(canonical: &str, key: &str) -> bool {
 }
 
 pub(crate) fn password_of(remote: &Remote) -> String {
+    if let Some(password) = &remote.password {
+        return password.clone();
+    }
     let map = passwords().lock().unwrap_or_else(|err| err.into_inner());
     if let Some(password) = map.get(&remote.canonical) {
         return password.clone();
@@ -1287,7 +1511,10 @@ fn connect_smb(remote: &Remote) -> Result<PathBuf, String> {
 #[cfg(windows)]
 fn unc_path(remote: &Remote) -> Result<PathBuf, String> {
     let path = remote.path.trim_start_matches('/').replace('/', "\\");
-    if remote.host.is_empty() || path.is_empty() {
+    // Every other remote path in this file rejects .. after decoding — UNC
+    // is the one place the client (not the server) does the collapsing, so
+    // smb://h/share/../other would reach a different share.
+    if remote.host.is_empty() || path.is_empty() || path.split('\\').any(|part| part == "..") {
         return Err("the smb URL needs a host and a share".into());
     }
     Ok(PathBuf::from(format!("\\\\{}\\{path}", remote.host)))
@@ -1368,9 +1595,10 @@ fn add_windows_connection(share: &str, username: &str, password: &str) -> Result
         return Ok(());
     }
     if code == 1219 {
-        return Err(auth_error(
-            "a Windows session to that server already exists under different credentials",
-        ));
+        return Err(
+            "a Windows session to that server already exists under different credentials              - close it in Explorer or run 'net use /delete', no password can fix this"
+                .into(),
+        );
     }
     if matches!(code, 5 | 86 | 1323 | 1326 | 2202) {
         return Err(auth_error("the share refused the password"));
@@ -1399,7 +1627,13 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
             // A stale/corrupt recorded binding could point outside the opened
             // library — delete_storage sends every returned path to trash.
-            if local_under_root(root, &place) && Path::new(&place).exists() {
+            // The name probe below verifies a zip wraps this session id
+            // before trusting it — a repointed recorded binding must clear
+            // the same bar or trash could take a different session's file.
+            let proven = Path::new(&place).is_dir()
+                || discover::archive_identity(Path::new(&place))
+                    .is_some_and(|(id, _)| id == session_id);
+            if local_under_root(root, &place) && Path::new(&place).exists() && proven {
                 found.push(place);
             }
         }
@@ -1418,16 +1652,34 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             // sibling archives like other remotes do.
             if let Some(place) = recorded(root, session_id) {
                 if let Ok(child) = require_remote(&place) {
+                    // An index written before smb opened locally may still
+                    // carry the remote spec — map it onto the UNC tree.
                     let child_path = child.path.trim_end_matches('/');
                     let root_path = remote.path.trim_end_matches('/');
                     let rel = child_path
                         .strip_prefix(root_path)
-                        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+                        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+                        // Windows normalizes .. client-side on UNC paths —
+                        // an escape here would probe a different share.
+                        .filter(|rest| !rest.split('/').any(|part| part == ".."));
                     if let Some(rel) = rel {
                         let local = unc.join(rel.trim_start_matches('/'));
                         recorded_parent = local.parent().map(|dir| dir.to_path_buf());
                         if local.exists() {
                             found.push(local.to_string_lossy().into_owned());
+                        }
+                    }
+                } else {
+                    // Current indexes store the local UNC path — verify it
+                    // under the opened share like the local branch above.
+                    let unc_str = unc.to_string_lossy();
+                    let proven = Path::new(&place).is_dir()
+                        || discover::archive_identity(Path::new(&place))
+                            .is_some_and(|(id, _)| id == session_id);
+                    if local_under_root(&unc_str, &place) && proven {
+                        recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
+                        if Path::new(&place).exists() {
+                            found.push(place);
                         }
                     }
                 }
@@ -1439,10 +1691,15 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             // Verify a recorded remote spec too — same dead-spec hazard.
             if let Some(place) = recorded(root, session_id) {
                 if let Some(child) = require_remote(&place).ok().and_then(|child| {
-                    fs.stat(child.path.trim_end_matches('/'))
-                        .ok()
-                        .flatten()
-                        .map(|_| place.clone())
+                    let clean = child.path.trim_end_matches('/');
+                    // A recorded spec carrying .. resolves server-side outside
+                    // the root — probing it returns an undeletable out-of-root
+                    // spec. The delete path already refuses it; don't collect.
+                    if clean.split('/').any(|part| part == "..") {
+                        None
+                    } else {
+                        fs.stat(clean).ok().flatten().map(|_| place.clone())
+                    }
                 }) {
                     found.push(child);
                 }
@@ -1475,7 +1732,14 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                     // the local branch above does, so a remote `sess.zip`
                     // wrapping `other/` still counts as sess. The remote
                     // catalog discovers by filename stem the same way.
-                    if fs.stat(&format!("{base}/{name}"))?.is_some() {
+                    // Same discrimination as the local branch: the bare
+                    // id must be a dir, an archive name a file — a stray
+                    // `sess` file or `sess.zip` dir is not this session's
+                    // storage and must not be deleted.
+                    if fs
+                        .stat(&format!("{base}/{name}"))?
+                        .is_some_and(|stat| stat.dir == (*name == session_id))
+                    {
                         let rel = match base.strip_prefix(root_path) {
                             Some(rest) if rest.is_empty() || rest.starts_with('/') => {
                                 format!("{rest}/{name}")
@@ -1499,29 +1763,42 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     };
     let mut bases = vec![Path::new(&root).to_path_buf()];
     if let Some(parent) = recorded_parent {
-        if parent != bases[0] && parent.starts_with(&bases[0]) {
+        // starts_with is component-wise but .. still escapes — root/.. is a
+        // recorded spec outside the library, not a probe target.
+        let clean = !parent
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir));
+        if parent != bases[0] && parent.starts_with(&bases[0]) && clean {
             bases.push(parent);
         }
     }
     for base in &bases {
         for name in &names {
             let path = base.join(name);
+            // is_dir()/is_file() answer false on ANY metadata error — a
+            // denied stat would shrink the delete list so the row goes while
+            // the storage stays. Only NotFound is absence; the rest aborts.
+            let kind = match path.symlink_metadata() {
+                Ok(meta) => Some(meta.is_dir()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(format!("cannot stat {}: {err}", path.display())),
+            };
             let hit = if *name == session_id {
                 // A stray file carrying the id is not the session folder.
-                path.is_dir()
+                kind == Some(true)
             } else if name.ends_with(".zip") {
                 // A readable zip's identity is the folder it wraps — one
                 // wrapping another session is not this session's storage,
                 // and trashing must not destroy it. An unreadable file
                 // carries no wrapped id to contradict its name.
-                path.is_file()
+                kind == Some(false)
                     && match discover::archive_identity(&path) {
                         Some((id, _)) => id == session_id,
                         None => true,
                     }
             } else {
                 // Tars cannot peek cheaply — their filename stem IS the id.
-                path.is_file()
+                kind == Some(false)
             };
             let place = path.to_string_lossy().into_owned();
             if hit && !found.contains(&place) {
@@ -1608,10 +1885,12 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                     // A ".." segment survives percent-decoding and passes the
                     // prefix check while the server resolves it outside the
                     // root — reject it before the prefix test.
-                    if child.path.split('/').any(|part| part == "..")
+                    if child.path.split(['/', '\\']).any(|part| part == "..")
                         || (!root_path.is_empty()
-                            && !(child.path == root_path
-                                || child.path.starts_with(&format!("{root_path}/"))))
+                            // The connected root itself is not a delete
+                            // target — a marker at the remote root would
+                            // recursively remove the library.
+                            && !child.path.starts_with(&format!("{root_path}/")))
                     {
                         errors.push(format!("{spec}: outside the connected root"));
                         continue;
@@ -1624,11 +1903,20 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                         // guard as materialize: only plain segments join.
                         let relative = relative_remote(root, &child);
                         let safe = !relative.is_empty()
+                            // Same guard as materialize — `a\b` is one
+                            // Normal component here but two path segments
+                            // in the local cache.
+                            && !relative.contains('\\')
                             && Path::new(&relative)
                                 .components()
                                 .all(|part| matches!(part, std::path::Component::Normal(_)));
                         if safe {
-                            let cached = cache_directory(root).join(&relative);
+                            let cached = cache_dest(root, &relative);
+                            // materialize holds COPY for its whole
+                            // check/clear/copy/stamp — take it here too or
+                            // the copy can re-create and stamp what delete
+                            // removed.
+                            let _copy = copy_lock();
                             let _ = std::fs::remove_dir_all(&cached);
                             let _ = std::fs::remove_file(stamp_file(&cached));
                         }
@@ -1667,7 +1955,17 @@ fn local_under_root(root: &str, path: &str) -> bool {
         return false;
     }
     let root = Path::new(root);
-    path == root || path.starts_with(root)
+    // Strictly inside — the opened root itself is never a delete target
+    // (a session marker at the library root would trash the library).
+    if path == root || !path.starts_with(root) {
+        return false;
+    }
+    // A spec routed through a symlinked ancestor inside the library resolves
+    // outside it at delete time - compare resolved paths when both exist.
+    if let (Ok(root), Ok(path)) = (fs::canonicalize(root), fs::canonicalize(path)) {
+        return path.starts_with(&root);
+    }
+    true
 }
 
 fn trash_path(path: &str) -> Result<(), String> {
@@ -1915,19 +2213,38 @@ mod tests {
         // `/a/bcd` shares the `/a/b` string prefix without being inside it.
         let sibling = require_remote("sftp://u@h/a/bcd/x").unwrap();
         assert_eq!(relative_remote(&library.canonical, &sibling), "a/bcd/x");
-        let climbing = require_remote("sftp://u@h/a/b/../evil").unwrap();
-        let relative = relative_remote(&library.canonical, &climbing);
-        assert!(
-            relative.split(['/', '\\']).any(|part| part == ".."),
-            "{relative}"
-        );
+        // A `..` segment is refused at parse so it can never reach the
+        // relative/cache paths to climb.
+        assert!(require_remote("sftp://u@h/a/b/../evil").is_err());
+        // `.` and `//` collapse to one canonical spelling.
+        let dotted = require_remote("sftp://u@h/a/./b//c").unwrap();
+        assert_eq!(relative_remote(&library.canonical, &dotted), "c");
     }
     #[test]
     fn forgetting_a_library_drops_its_recorded_sessions() {
-        replace_sessions("a-test-lib", &[("sess".to_owned(), "place".to_owned())]);
+        replace_sessions(
+            "a-test-lib",
+            &[("sess".to_owned(), "place".to_owned())],
+            true,
+        );
         assert!(recorded("a-test-lib", "sess").is_some());
         drop_sessions("a-test-lib");
         assert!(recorded("a-test-lib", "sess").is_none());
+    }
+
+    #[test]
+    fn a_partial_scan_merges_instead_of_wiping_unseen_sessions() {
+        // A walk that aborted mid-listing must not make every unvisited
+        // session look deleted — the binding map merges, never replaces.
+        let lib = "partial-scan-lib";
+        replace_sessions(lib, &[("a".to_owned(), "p1".to_owned())], true);
+        replace_sessions(lib, &[("b".to_owned(), "p2".to_owned())], false);
+        assert!(recorded(lib, "a").is_some());
+        assert!(recorded(lib, "b").is_some());
+        // A complete scan still drops the rows it no longer sees.
+        replace_sessions(lib, &[("b".to_owned(), "p2".to_owned())], true);
+        assert!(recorded(lib, "a").is_none());
+        drop_sessions(lib);
     }
 
     #[test]
@@ -2072,7 +2389,7 @@ mod tests {
     #[test]
     fn flat_and_nested_markers_stamp_the_same_one_they_fingerprint() {
         // Both markers present: fingerprint and stamp must pick the same one
-        // (flat first, like storage_fingerprint) or every scan re-copies.
+        // (nested first, like the remote probe order) or every scan re-copies.
         let url = format!(
             "sftp://u@host.invalid/both/{}/{}",
             std::process::id(),
@@ -2093,9 +2410,142 @@ mod tests {
         )
         .unwrap();
         let (mtime, size) = remote_fingerprint(&canonical, "sess").unwrap();
-        assert_eq!((mtime, size), (1_000_000_000, 5)); // "flat\n"
+        assert_eq!((mtime, size), (1_000_000_000, 14)); // "nested-marker\n"
         let remote = require_remote(&canonical).unwrap();
-        assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n5");
+        assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n14");
+    }
+
+    #[test]
+    fn the_nested_marker_makes_the_nested_tree_the_read_authority() {
+        // Both layouts present: the read must serve the nested file, and a
+        // file missing from the nested tree must not fall through to the
+        // stale flat copy — session_directory resolves it away locally too.
+        let url = format!(
+            "sftp://u@host.invalid/readnest/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = install_fixture(
+            &format!("{url}/sess"),
+            &[
+                (
+                    "input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "termination_summary.txt",
+                    b"flat
+",
+                ),
+                (
+                    "spot_data.csv",
+                    b"flat-only
+",
+                ),
+                (
+                    "sess/input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "sess/termination_summary.txt",
+                    b"nested
+",
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            read_remote_session_file(&canonical, "sess", "termination_summary.txt")
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            Some(
+                "nested
+"
+                .to_owned()
+            )
+        );
+        // Present only in the flat tree — the nested marker wins, so None.
+        assert!(read_remote_session_file(&canonical, "sess", "spot_data.csv").is_none());
+
+        // No nested marker: the flat file is what the reader serves.
+        let url = format!(
+            "sftp://u@host.invalid/readflat/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = install_fixture(
+            &format!("{url}/sess"),
+            &[
+                (
+                    "input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "termination_summary.txt",
+                    b"flat
+",
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            read_remote_session_file(&canonical, "sess", "termination_summary.txt")
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            Some(
+                "flat
+"
+                .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn the_cache_leaf_keeps_the_archive_suffix_after_the_hash() {
+        // archive_members keys zip-vs-tar and read_tar keys the decoder off
+        // the filename suffix — run.zip@hash would read as an uncompressed tar.
+        let zip = super::cache_dest("https://h/lib", "nested/run.zip");
+        let tgz = super::cache_dest("https://h/lib", "nested/run.tar.gz");
+        let dir = super::cache_dest("https://h/lib", "nested/run");
+        let zip_leaf = zip.file_name().unwrap().to_string_lossy().into_owned();
+        let tgz_leaf = tgz.file_name().unwrap().to_string_lossy().into_owned();
+        let dir_leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            zip_leaf.starts_with("run@") && zip_leaf.ends_with(".zip"),
+            "{zip_leaf}"
+        );
+        assert!(
+            tgz_leaf.starts_with("run@") && tgz_leaf.ends_with(".tar.gz"),
+            "{tgz_leaf}"
+        );
+        assert!(
+            !dir_leaf.ends_with(".zip") && dir_leaf.starts_with("run@"),
+            "{dir_leaf}"
+        );
+        // The suffix must be exactly what the archive readers match, and the
+        // hash must differ per relative path so case-only-distinct remotes
+        // never share a dest.
+        assert!(zip_leaf.ends_with(".zip") && zip_leaf.len() == "run@".len() + 8 + ".zip".len());
+        assert_eq!(
+            super::discover::archive_kind(&zip_leaf).map(|(_, kind)| kind),
+            Some("zip")
+        );
+        assert_eq!(
+            super::discover::archive_kind(&tgz_leaf).map(|(_, kind)| kind),
+            Some("tar")
+        );
     }
 
     #[test]

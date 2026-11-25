@@ -114,6 +114,41 @@ export function useScrub(
   const pending = useRef(false);
 
   useEffect(() => {
+    // A control value this hook didn't commit (option restore, foreign
+    // writer) must re-seed local state — on/speed/window would otherwise
+    // stay at the mount-time values forever.
+    const last = lastSent.current;
+    if (
+      last.on !== reported.on ||
+      last.speed !== reported.speed ||
+      last.window !== reported.window
+    ) {
+      const at = Math.min(Math.max(0, reported.at), reported.end);
+      lastSent.current = {
+        ...last,
+        on: reported.on,
+        speed: reported.speed,
+        window: reported.window,
+        at,
+      };
+      setPlay((current) => ({
+        ...current,
+        on: reported.on,
+        speed: reported.speed,
+        window: reported.window,
+        at,
+      }));
+      // The re-seeded state must reach onMove too — the consumer serializes
+      // its own playhead into the next task, and a stale mirror would send
+      // the pre-reseed value back and clobber the restore. Disarming also
+      // stops the rAF loop, which update() alone can't reach.
+      const next = { ...scrubRef.current, on: reported.on, speed: reported.speed, window: reported.window, at };
+      scrubRef.current = next;
+      onMoveRef.current(next);
+    }
+  }, [reported.on, reported.speed, reported.window, reported.at, reported.end]);
+
+  useEffect(() => {
     commitRef.current = commit;
   }, [commit]);
 
@@ -146,6 +181,9 @@ export function useScrub(
       layers: lastSent.current.layers,
     };
     if (controlValue == null) {
+      // The control vanished mid-commit — release the latch or every later
+      // commit is dropped until the next settled bump.
+      pending.current = false;
       return;
     }
     if (!cameraFollow) {
@@ -222,7 +260,15 @@ export function useScrub(
     let frame = 0;
     const step = (now: number) => {
       const current = scrubRef.current;
-      const dt = Math.max(0, (now - last) / 1000);
+      // A re-seed can disarm mid-play — stop at the next frame rather than
+      // driving the playhead to end under a scrub state that no longer is.
+      if (!current.on) {
+        setPlaying(false);
+        return;
+      }
+      // rAF pauses on hidden tabs — without a cap, the resume frame's dt
+      // is the whole hidden span and the playhead snaps to the end.
+      const dt = Math.min(0.25, Math.max(0, (now - last) / 1000));
       last = now;
       const at = Math.min(current.end, current.at + current.speed * dt);
       if (at !== current.at) {
@@ -243,6 +289,9 @@ export function useScrub(
 
   const update = (patch: Partial<Scrub>) => {
     const next = { ...scrubRef.current, ...patch };
+    // Keep the stored value inside the rendered clamp — an at > end would
+    // otherwise ride into follow()/commits forever past the tail.
+    next.at = Math.min(next.end, Math.max(0, next.at));
     if (!next.on || next.at !== scrubRef.current.at) {
       setPlaying(false);
     }

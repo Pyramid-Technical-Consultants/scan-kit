@@ -41,6 +41,9 @@ impl Elem {
 }
 
 pub fn parse_xml(input: &str) -> Result<Elem, String> {
+    // A UTF-8 BOM is not markup; without this the parser errors on a file
+    // an editor saved with one.
+    let input = input.trim_start_matches('\u{feff}');
     let mut parser = Parser {
         bytes: input.as_bytes(),
         index: 0,
@@ -75,6 +78,12 @@ fn write_elem(out: &mut String, elem: &Elem) {
         out.push_str(&escape_attr(value));
         out.push('"');
     }
+    // ponytail: the DOM keeps one text field plus children, so mixed
+    // content (text interleaved with elements) loses its original order —
+    // parse keeps both, write emits the text first. Ceiling: any config
+    // file with real mixed content round-trips reordered. Upgrade path is
+    // a Node enum recording positions, a bigger DOM change than a config
+    // writer needs.
     let text = elem.text.trim();
     if elem.children.is_empty() && text.is_empty() {
         out.push_str("/>");
@@ -402,15 +411,32 @@ fn decode_numeric(name: &str) -> Result<char, String> {
     } else {
         name.get(1..).unwrap_or("").parse::<u32>()
     };
+    // Legal XML chars only: C0 controls (bar \t\n\r) would round-trip
+    // into output the writer cannot legally encode.
     value
         .ok()
         .and_then(char::from_u32)
+        .filter(|ch| (*ch as u32) >= 0x20 || matches!(ch, '\t' | '\n' | '\r'))
         .ok_or_else(|| format!("bad XML character reference &{name};"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_utf8_bom_is_stripped_before_parsing() {
+        let root = parse_xml("\u{feff}<root/>").unwrap();
+        assert_eq!(root.name, "root");
+    }
+
+    #[test]
+    fn a_control_char_reference_is_rejected() {
+        // a control char is not legal XML — the writer could not emit it back.
+        assert!(parse_xml("<r>a&#8;b</r>").is_err());
+        assert!(parse_xml("<r>a&#9;b</r>").is_ok());
+        assert!(parse_xml("<r>a&#x1F600;</r>").is_ok());
+    }
 
     #[test]
     fn attributes_keep_document_order_and_round_trip() {

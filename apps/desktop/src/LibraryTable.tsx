@@ -191,6 +191,7 @@ export function LibraryTable({
   onHeaderCheck,
   onCommitNote,
   onOpenMenu,
+  pendingNotes,
 }: {
   rows: LibraryRow[];
   order: number[];
@@ -207,8 +208,11 @@ export function LibraryTable({
   onSort: (key: SortKey) => void;
   onRowCheck: (sessionId: string, checked: boolean) => void;
   onHeaderCheck: () => void;
-  onCommitNote: (edit: NoteEdit) => void;
+  onCommitNote: (edit: NoteEdit) => Promise<boolean>;
   onOpenMenu: (menu: SessionMenu) => void;
+  // Shared with the undo/redo writes in App — a note write from any path
+  // stays pending until rows reflect it.
+  pendingNotes: { current: Map<string, string> };
 }) {
   const lastRowToggle = useRef<{ row: string; at: number } | null>(null);
   const baseColumns = useMemo(() => libraryColumns(sort), [sort]);
@@ -227,21 +231,51 @@ export function LibraryTable({
     selectedVisible,
   );
 
-  const noteEdit = useRef<{ id: string; note: string; library: string } | null>(null);
+  const noteEdit = useRef<{ cell: Item; id: string; note: string; library: string } | null>(null);
+  // A committed note stays "after" until rows catch up with the write —
+  // a second edit opened in that window must not capture the stale cell
+  // as `before` (it would prefill the old text and corrupt the undo chain).
+  // session_id is not unique across locations — the pending map keys on
+    // the same composite noteEdit captures.
+  const noteKey = (library: string, id: string) => `${library}\0${id}`;
   const onCellActivated = useCallback(
     (cell: Item) => {
       const [col, rowIndex] = cell;
       const source = order[rowIndex];
       const row = source == null ? undefined : rows[source];
+      // rows caught up after a commit — drop entries the catalog reflects.
+      for (const [key, note] of pendingNotes.current) {
+        const at = key.indexOf("\0");
+        const current = rows.find(
+          (entry) =>
+            entry.session_id === key.slice(at + 1) &&
+            (entry.library ?? folder ?? "") === key.slice(0, at),
+        );
+        // Only a row that reflects the write clears the entry — an absent
+        // row is not proof the write landed, and dropping the entry here
+        // reopens the stale-before hole the map exists to close.
+        if (current != null && current.note === note) {
+          pendingNotes.current.delete(key);
+        }
+      }
       // Capture the session and its note when the editor opens — an
       // in-flight catalog refresh can move a different session into this
       // row before commit, and undo restores `before` verbatim.
+      const pending =
+        row == null
+          ? undefined
+          : pendingNotes.current.get(noteKey(row.library ?? folder ?? "", row.session_id));
       noteEdit.current =
         clickEditsNote(col) && row != null
-          ? { id: row.session_id, note: row.note, library: row.library ?? folder ?? "" }
+          ? {
+              cell,
+              id: row.session_id,
+              note: pending ?? row.note,
+              library: row.library ?? folder ?? "",
+            }
           : null;
     },
-    [folder, order, rows],
+    [folder, order, pendingNotes, rows],
   );
   const onCellEdited = useCallback(
     (cell: Item, newValue: EditableGridCell) => {
@@ -256,18 +290,37 @@ export function LibraryTable({
         onRowCheck(row.session_id, newValue.data === true);
         return;
       }
-      const edit = noteEdit.current;
+      // The activation capture only covers the cell that was activated —
+      // a bulk paste fires per target cell without activating each, so a
+      // mismatched cell must fall back to its own row, not the capture.
+      const edit =
+        noteEdit.current?.cell[0] === col && noteEdit.current.cell[1] === rowIndex
+          ? noteEdit.current
+          : null;
       const before = edit?.note ?? row.note;
       if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
-        onCommitNote({
+        const key = noteKey(
+          edit?.library ?? row.library ?? folder ?? "",
+          edit?.id ?? row.session_id,
+        );
+        pendingNotes.current.set(key, newValue.data);
+        // A rejected write must not poison the entry — an identical retry
+        // would compare against a note that never persisted.
+        void onCommitNote({
           sessionId: edit?.id ?? row.session_id,
           library: edit?.library ?? row.library ?? folder ?? "",
           before,
           after: newValue.data,
+        }).then((ok) => {
+          // Only clear the marker this commit left — a newer pending
+          // write to the same cell must survive a stale rejection.
+          if (ok === false && pendingNotes.current.get(key) === newValue.data) {
+            pendingNotes.current.delete(key);
+          }
         });
       }
     },
-    [folder, onCommitNote, onRowCheck, order, rows],
+    [folder, onCommitNote, onRowCheck, order, pendingNotes, rows],
   );
 
   const getCellContent = useCallback(

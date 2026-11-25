@@ -4,7 +4,8 @@
 //! poll is one window. Each later timed poll doubles that window and reads only
 //! the new bytes, until the picture passes four windows. That poll reads the
 //! rest once. `open_plot` drains the same stage with an unlimited budget, so a
-//! one-shot call still returns the scene it returns today.
+//! one-shot call still returns the scene it returns today. Volumetric views
+//! always load whole in one poll — the windowed path is analytic views only.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -156,6 +157,9 @@ pub fn start_task(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Value, String> {
+    if !options.is_null() && !options.is_object() {
+        return Err("options must be an object".into());
+    }
     let mut normalized = options.clone();
     scan_kit_io::normalize_options(&mut normalized);
     let options = &normalized;
@@ -194,6 +198,7 @@ pub fn start_task(
                 if task.stage.is_none() && !task.cancel.is_cancelled() {
                     task.stage = Some(stage);
                     task.generation = task.generation.saturating_add(1);
+                    task.last_report = None;
                     return Ok(json!({ "task": id, "generation": task.generation }));
                 }
             }
@@ -257,9 +262,14 @@ pub fn poll_task(id: u64, expect_generation: Option<u64>) -> Result<Vec<u8>, Str
             let report = driver
                 .ended_tasks
                 .iter()
-                .find(|report| report.task == id)
+                .find(|report| {
+                    report.task == id
+                        && expect_generation
+                            .map(|want| report.generation == want)
+                            .unwrap_or(true)
+                })
                 .cloned()
-                .unwrap_or_else(|| ended(id, 0, Phase::Cancelled, ""));
+                .unwrap_or_else(|| ended(id, expect_generation.unwrap_or(0), Phase::Cancelled, ""));
             return Ok(encode_poll(&report, None, true));
         };
         let Some(stage) = task.stage.take() else {
@@ -393,7 +403,11 @@ pub(crate) fn drain_plot(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
+    cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
+    if !options.is_null() && !options.is_object() {
+        return Err("options must be an object".into());
+    }
     let mut options = options.clone();
     scan_kit_io::normalize_options(&mut options);
     let mut stage = build_stage(
@@ -405,9 +419,10 @@ pub(crate) fn drain_plot(
         // poll_task treats the same call tree as panic-capable — an unwind
         // here would cross invoke() instead of surfacing an Err.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            stage.poll(Duration::MAX, &Cancel::new())
+            stage.poll(Duration::MAX, cancel)
         }));
         match result {
+            Ok(Poll::Ready(_)) if cancel.is_cancelled() => return Err("cancelled".into()),
             Ok(Poll::Ready(bytes)) => return Ok(bytes),
             Ok(Poll::Failed(message)) => return Err(message),
             Ok(Poll::Cancelled) => return Err("cancelled".into()),
@@ -429,8 +444,23 @@ pub(crate) fn drain_task(
     root: &Path,
     sessions: &[String],
     options: &Value,
+    cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
-    drain_plot(view, root, sessions, options, [0.0; 4], [0.0; 4], &[])
+    // A stage that ignores the poll budget (LibraryStage, CopyStage) would
+    // hot-spin the 64-iteration drive below — only export stages drain.
+    if !matches!(slot_of(view), Slot::Export) {
+        return Err(format!("{view} is not an export task"));
+    }
+    drain_plot(
+        view,
+        root,
+        sessions,
+        options,
+        [0.0; 4],
+        [0.0; 4],
+        &[],
+        cancel,
+    )
 }
 
 pub(crate) fn slot_of(view: &str) -> Slot {
@@ -797,7 +827,12 @@ impl Stage for SessionStage {
             };
         }
         if self.cached && self.view == "volumetric" && !unlimited && self.lattice == 0 {
-            return self.publish_volume_preview();
+            let poll = self.publish_volume_preview();
+            if cancel.is_cancelled() {
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
+            }
+            return poll;
         }
         // Dose is one picture. A window per poll deposited the cube again, so
         // the bar looked like a queue that never cleared.
@@ -806,6 +841,12 @@ impl Stage for SessionStage {
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.report = report_at(Phase::Done, total, total);
                     Poll::Ready(bytes)
@@ -859,6 +900,12 @@ impl Stage for SessionStage {
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.loaded = total;
                     self.report = report_at(Phase::Done, units, units);
@@ -875,6 +922,12 @@ impl Stage for SessionStage {
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.report = report_at(Phase::Done, self.units(), self.units());
                     Poll::Ready(bytes)
@@ -899,6 +952,9 @@ impl Stage for SessionStage {
             scan_kit_io::SliceTake::Spot { rows }
         };
         scan_kit_io::bind_slice(&self.root, &session.id, take);
+        // The `self.view == "volumetric"` early return above makes `preview`
+        // always false today; the coarse-preview path stays for when that arm
+        // is narrowed back to progressive volumetric loads.
         let preview = self.view == "volumetric" && self.lattice == 0 && !unlimited;
         if preview {
             self.lattice = 1;
@@ -950,6 +1006,12 @@ impl Stage for SessionStage {
             scan_kit_io::clear_slice();
             return match self.encode(&self.sessions.clone(), false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.loaded = total;
                     self.report = report_at(Phase::Done, self.units(), self.units());
@@ -1023,6 +1085,8 @@ struct McPlotStage {
     worker_done: bool,
     /// Preview sequence already painted. 0 means the view has not seen a cube.
     seen: u64,
+    /// bind_cancel ran — worker_cancel and a poll's `cancel` share the flag.
+    bound: bool,
     report: Report,
 }
 
@@ -1177,6 +1241,7 @@ impl McPlotStage {
             shared: Arc::new(mc_live()),
             worker: None,
             worker_cancel: Cancel::new(),
+            bound: false,
             worker_done: false,
             seen: 0,
             report: report_at(Phase::Chrome, 0, 0),
@@ -1197,6 +1262,10 @@ impl McPlotStage {
     /// The scene asks for its jobs in the same order `capture_job` saw them.
     fn paint(&self, results: &[McResult], quality: &str) -> Result<Vec<u8>, String> {
         let next = std::cell::Cell::new(0usize);
+        // volumetric maps a runner Err onto the analytic fallback — a
+        // missing job would paint a plausible analytic cube labelled MC.
+        // Record the first error and fail after, as the closure documents.
+        let missing = std::cell::RefCell::new(None::<String>);
         let mut scene = scan_kit_io::volumetric::volumetric(
             &self.root,
             &self.sessions,
@@ -1206,9 +1275,18 @@ impl McPlotStage {
                 next.set(at + 1);
                 // A missing job must fail, not paint a zero-dose cube that
                 // reads as a real result.
-                job_result(results, at)
+                match job_result(results, at) {
+                    Ok(job) => Ok(job),
+                    Err(err) => {
+                        missing.borrow_mut().get_or_insert(err.clone());
+                        Err(err)
+                    }
+                }
             }),
         );
+        if let Some(err) = missing.into_inner() {
+            return Err(err);
+        }
         self.pack(&mut scene, quality)
     }
 
@@ -1221,9 +1299,11 @@ impl McPlotStage {
     fn shutdown(&mut self) {
         self.worker_cancel.cancel();
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // No join — the worker can be inside McRun::open's adapter/device
+        // timeouts where neither cancel flag is observed, so joining here
+        // stalls the caller ~60s+ on exactly the wedged-driver path. The
+        // worker drops its own runs on exit; GPU buffers defer-destroy.
+        self.worker.take();
     }
 
     fn sync_report(&mut self, phase: Phase) {
@@ -1348,10 +1428,11 @@ impl McPlotStage {
             self.report = report_at(Phase::Done, 1, 1);
             return self.publish(&results, 1, true);
         }
-        let histories = job_histories(&jobs[0]);
-        // `satisfied` is min(delivered) across jobs, so a mixed-histories
-        // scene would never reach this target.
-        debug_assert!(jobs.iter().all(|job| job_histories(job) == histories));
+        // `satisfied` is min(delivered) across jobs, so the target must be
+        // the smallest request — jobs[0] is not necessarily it, and a
+        // larger target would never be reached (debug asserts are off in
+        // release: the task would poll Pending forever).
+        let histories = jobs.iter().map(job_histories).min().unwrap_or(0);
         self.shared
             .total
             .store(all_histories(&jobs), Ordering::Relaxed);
@@ -1389,6 +1470,10 @@ impl McPlotStage {
         }
         let mut results = Vec::with_capacity(jobs.len());
         for job in &jobs {
+            if cancel.is_cancelled() {
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
+            }
             let mut run = match McRun::open(job) {
                 Ok(run) => run,
                 Err(ComputeError::NoAdapter) => return self.fail("no GPU adapter".into()),
@@ -1422,6 +1507,7 @@ impl Stage for McPlotStage {
 
     fn bind_cancel(&mut self, cancel: Cancel) {
         self.worker_cancel = cancel;
+        self.bound = true;
     }
 
     fn retarget(
@@ -1460,7 +1546,11 @@ impl Stage for McPlotStage {
         if !same {
             return false;
         }
-        let histories = job_histories(&jobs[0]);
+        // The extend target must cover every job's request — runs cannot
+        // shrink, so under-delivery reports Ready at fewer histories than
+        // asked. (The publish gate's min is per-run satisfied; different
+        // scalar, different job.)
+        let histories = jobs.iter().map(job_histories).max().unwrap_or(0);
         self.shared.target.store(histories, Ordering::Relaxed);
         // Runs cannot shrink — a lower request still transports the old
         // count, so total never drops below what the worker reports.
@@ -1483,9 +1573,20 @@ impl Stage for McPlotStage {
         }
         if budget >= DRAIN {
             self.shutdown();
-            // worker_cancel is bound to `cancel`; drain with a fresh token or a
-            // bound stage reports Cancelled instead of draining.
-            return self.drain(&Cancel::new());
+            // A bound stage shares `cancel` with worker_cancel — shutdown just
+            // set it, so hand the drain a fresh token. drain_plot/drain_task
+            // stages are unbound, so the caller's flag still reaches Live and
+            // invoke_flag's "cancelled MCP request stops the drain" holds.
+            if cancel.is_cancelled() {
+                if self.bound {
+                    return self.drain(&Cancel::new());
+                }
+                // Unbound — the caller's flag just fired. A fresh token
+                // would run the whole transport for an abandoned request.
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
+            }
+            return self.drain(cancel);
         }
         self.follow()
     }
@@ -1555,7 +1656,11 @@ fn panic_note(payload: &dyn std::any::Any) -> String {
 
 fn blank_result(job: &McJob) -> McResult {
     let (origin, shape, spacing) = match job {
-        McJob::Slab(request) => (request.origin, request.shape, [request.voxel_mm; 3]),
+        McJob::Slab(request) => (
+            request.origin,
+            request.shape,
+            [request.voxel_mm.max(0.25); 3],
+        ),
         McJob::Patient(request) => (
             request.origin_mm,
             request.shape,
@@ -1581,6 +1686,8 @@ fn blank_result(job: &McJob) -> McResult {
             values,
         },
         uncertainty: 0.0,
+        // The placeholder never transported — 0 is the honest count.
+        histories: 0,
         ledger: [0.0; 6],
         let_d: Vec::new(),
     }
@@ -1701,8 +1808,10 @@ impl Stage for LibraryStage {
                     &scan_kit_io::default_db_path(),
                     &path,
                     &mut |done, total, preview| {
-                        shared.done.store(done, Ordering::Relaxed);
+                        // total first — a poll between the stores reads
+                        // done <= total either way round this order.
                         shared.total.store(total, Ordering::Relaxed);
+                        shared.done.store(done, Ordering::Relaxed);
                         if let Some(preview) = preview {
                             let mut slot =
                                 shared.preview.lock().unwrap_or_else(|err| err.into_inner());
@@ -1829,11 +1938,25 @@ impl Stage for CopyStage {
             let dest = self.dest.clone();
             let shared = Arc::clone(&self.shared);
             self.worker = Some(std::thread::spawn(move || {
-                let value = scan_kit_io::copy_runner(&dest, &mut |done, total| {
-                    shared.done.store(done, Ordering::Relaxed);
-                    shared.total.store(total, Ordering::Relaxed);
-                    !shared.stop.load(Ordering::SeqCst)
-                })?;
+                // download_with fails fast while another download holds the
+                // busy flag — a task should wait its turn, not report a copy
+                // failure the caller has to retry by hand.
+                let value = loop {
+                    match scan_kit_io::copy_runner(&dest, &mut |done, total| {
+                        // total first — see LibraryStage's callback.
+                        shared.total.store(total, Ordering::Relaxed);
+                        shared.done.store(done, Ordering::Relaxed);
+                        !shared.stop.load(Ordering::SeqCst)
+                    }) {
+                        Err(err) if err == scan_kit_io::DOWNLOAD_BUSY_ERR => {
+                            if shared.stop.load(Ordering::SeqCst) {
+                                break Err("cancelled".into());
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        other => break other,
+                    }
+                }?;
                 serde_json::to_vec(&value).map_err(|err| err.to_string())
             }));
         }
@@ -1905,7 +2028,6 @@ struct ExportStage {
     job: Option<McJob>,
     inputs: Option<Box<scan_kit_io::patient_view::PatientInputs>>,
     run: Option<McRun>,
-    cancel: Cancel,
 }
 
 impl ExportStage {
@@ -1936,7 +2058,6 @@ impl ExportStage {
             job: None,
             inputs: None,
             run: None,
-            cancel: Cancel::new(),
         }
     }
 
@@ -1948,23 +2069,26 @@ impl ExportStage {
 
     /// The transport finished: weight the dose, write the file, and keep the
     /// cube so a following view or export opens instantly.
-    fn finish(&mut self, result: McResult) -> Poll<Vec<u8>> {
+    fn finish(&mut self, result: McResult, cancel: &Cancel) -> Poll<Vec<u8>> {
         let Some(inputs) = self.inputs.as_ref() else {
             return self.fail("the export has no patient inputs".into());
         };
-        if self.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
         if let Some(job) = &self.job {
             keep_runs(std::slice::from_ref(job), std::slice::from_ref(&result));
         }
+        // A run that finished before the first Pending poll never set
+        // total — report 1 of 1 rather than 0 of 0.
+        self.report.total = self.report.total.max(1);
         self.report.done = self.report.total;
         let run = scan_kit_io::patient_view::dose_from_result(inputs, Some(result));
         let gpu = crate::mc::adapter_info();
         // A cancel landing while the dose was prepared must still win over
         // the destination write.
-        if self.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
@@ -1988,10 +2112,37 @@ impl ExportStage {
             )
         };
         match outcome {
-            Ok(value) => match serde_json::to_vec(&value) {
-                Ok(bytes) => Poll::Ready(bytes),
-                Err(err) => self.fail(err.to_string()),
-            },
+            Ok(value) => {
+                // Fingerprint what this task just wrote — the cancel delete
+                // below must not remove a replacement export's artifact or
+                // a file that merely shares the path (runner.rs's dest_was
+                // hazard).
+                let sidecar = crate::present::dvh_sidecar(Path::new(&self.dest));
+                let stamp = |path: &Path| {
+                    std::fs::metadata(path)
+                        .ok()
+                        .map(|meta| (meta.len(), meta.modified().ok()))
+                };
+                let wrote_dest = stamp(Path::new(&self.dest));
+                let wrote_side = stamp(&sidecar);
+                if cancel.is_cancelled() {
+                    if wrote_dest.is_some() && stamp(Path::new(&self.dest)) == wrote_dest {
+                        let _ = std::fs::remove_file(&self.dest);
+                    }
+                    if !self.dose && wrote_side.is_some() && stamp(&sidecar) == wrote_side {
+                        // finish_patient_report also commits a *_dvh.csv
+                        // sidecar — a cancelled report can't leave it
+                        // orphaned to pair with a different later PDF.
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
+                    self.report.phase = Phase::Cancelled;
+                    return Poll::Cancelled;
+                }
+                match serde_json::to_vec(&value) {
+                    Ok(bytes) => Poll::Ready(bytes),
+                    Err(err) => self.fail(err.to_string()),
+                }
+            }
             Err(message) => self.fail(message),
         }
     }
@@ -2000,10 +2151,6 @@ impl ExportStage {
 impl Stage for ExportStage {
     fn report(&self) -> Report {
         self.report.clone()
-    }
-
-    fn bind_cancel(&mut self, cancel: Cancel) {
-        self.cancel = cancel;
     }
 
     fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
@@ -2037,7 +2184,7 @@ impl Stage for ExportStage {
             if let Some(mut results) = kept_results(std::slice::from_ref(&job)) {
                 self.report.total = u64::from(inputs.histories);
                 self.job = Some(job);
-                return self.finish(results.swap_remove(0));
+                return self.finish(results.swap_remove(0), cancel);
             }
             self.job = Some(job.clone());
             self.run = match McRun::open(&job) {
@@ -2061,7 +2208,7 @@ impl Stage for ExportStage {
                     self.report.phase = Phase::Cancelled;
                     return Poll::Cancelled;
                 }
-                self.finish(result)
+                self.finish(result, cancel)
             }
             Poll::Cancelled => {
                 self.report.phase = Phase::Cancelled;
@@ -2872,6 +3019,39 @@ mod tests {
     }
 
     #[test]
+    fn a_non_object_options_is_an_error_not_defaults() {
+        // Every other boundary rejects the same payload — a scalar bag used
+        // to silently render the default scene and report success.
+        let root = scratch();
+        let options = json!("contour");
+        let error = start_task(
+            "distribution",
+            &root,
+            &[],
+            &options,
+            [0.0; 4],
+            [0.0; 4],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("options"), "{error}");
+        let started = start_task(
+            "distribution",
+            &root,
+            &[],
+            &json!(null),
+            [0.0; 4],
+            [0.0; 4],
+            &[],
+        )
+        .unwrap();
+        // A plot view claims the plot slot — release it or the next test
+        // sees a parked task.
+        cancel_task(started["task"].as_u64().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_second_export_replaces_the_first_and_leaves_the_plot_slot() {
         let root = scratch();
         let options = json!({
@@ -3067,9 +3247,12 @@ mod tests {
                 "study": root.join("missing").display().to_string(),
                 "dest": root.join("dose.dcm").display().to_string(),
             }),
+            &Cancel::new(),
         )
         .expect_err("a missing study cannot export");
         assert!(message.contains("missing"), "{message}");
+        // A dir walk that swallowed the failure would reach "no CT" instead.
+        assert!(!message.contains("no CT"), "{message}");
     }
 
     #[test]
@@ -3077,7 +3260,7 @@ mod tests {
         // The Tauri surface can start an export with no dest — it used to
         // run the whole Monte Carlo and only then fail on an empty path.
         let root = scratch();
-        let message = drain_task("write_dose", &root, &[], &json!({}))
+        let message = drain_task("write_dose", &root, &[], &json!({}), &Cancel::new())
             .expect_err("a missing dest cannot export");
         assert!(message.contains("dest is required"), "{message}");
         let _ = std::fs::remove_dir_all(&root);
@@ -3101,6 +3284,7 @@ mod tests {
                 [0.0; 4],
                 [0.0; 4],
                 &[],
+                &Cancel::new(),
             )
             .expect_err("task views never produce plot bytes");
             assert!(message.contains("not a plot"), "{view}: {message}");
@@ -3232,6 +3416,42 @@ mod tests {
         assert_eq!(report["phase"], "cancelled");
         // The successor's stage is still parked — nothing was consumed.
         assert!(lock().tasks.get(&id).unwrap().stage.is_some());
+    }
+
+    #[test]
+    fn an_ended_task_replay_filters_by_generation() {
+        // A stale-gen poller must not read the successor's terminal report —
+        // it gets cancelled-for-its-ticket, like a missed task.
+        struct Ready;
+        impl Stage for Ready {
+            fn poll(&mut self, _budget: Duration, _cancel: &Cancel) -> Poll<Vec<u8>> {
+                Poll::Ready(b"done".to_vec())
+            }
+            fn report(&self) -> Report {
+                report_at(Phase::Scene, 0, 0)
+            }
+        }
+        let id = {
+            let mut driver = lock();
+            let id = driver.next;
+            driver.next = driver.next.saturating_add(1);
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 2,
+                    cancel: Cancel::new(),
+                    stage: Some(Box::new(Ready)),
+                    last_report: None,
+                },
+            );
+            id
+        };
+        let report = poll_report(&poll_task(id, Some(2)).unwrap());
+        assert_eq!(report["phase"], "done");
+        // gen-1's poll replays cancelled, not the gen-2 done.
+        let report = poll_report(&poll_task(id, Some(1)).unwrap());
+        assert_eq!(report["phase"], "cancelled");
+        assert_eq!(report["generation"], 1);
     }
 
     #[test]

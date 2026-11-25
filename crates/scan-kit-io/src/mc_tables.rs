@@ -40,9 +40,42 @@ fn pack() -> Result<McTables, String> {
     let comp = files.get("m_comp").ok_or("m_comp")?.i32s()?;
     let kind = files.get("m_type").ok_or("m_type")?.i32s()?;
     let nm = media.len();
-    let width = files.get("m_comp").ok_or("m_comp")?.shape[1];
-    let stop_bins = files.get("m_stop").ok_or("m_stop")?.shape[1];
-    let nuc_bins = files.get("m_nuc").ok_or("m_nuc")?.shape[1];
+    // The table is a build-time asset, but a regenerated npz with the wrong
+    // layout must fail here, not index past its rows below.
+    let width = files
+        .get("m_comp")
+        .and_then(|f| f.shape.get(1))
+        .copied()
+        .ok_or("m_comp shape")?;
+    let stop_bins = files
+        .get("m_stop")
+        .and_then(|f| f.shape.get(1))
+        .copied()
+        .ok_or("m_stop shape")?;
+    let nuc_bins = files
+        .get("m_nuc")
+        .and_then(|f| f.shape.get(1))
+        .copied()
+        .ok_or("m_nuc shape")?;
+    if props.len() < nm * 3
+        || frac.len() < nm * width
+        || stop.len() < nm * stop_bins
+        || nuc.len() < nm * nuc_bins
+        || comp.len() < nm * width
+        || kind.len() < nm
+        || stop_bins <= 200
+    {
+        return Err("the material tables are truncated".into());
+    }
+    // mc_transport.wgsl bakes these offsets and counts — a regenerated npz
+    // with a different layout must fail here, not misalign every table read.
+    if width != 6
+        || stop_bins != 801
+        || nuc_bins != 250
+        || media.first().map(|name| name.as_str()) != Some("water")
+    {
+        return Err("material table layout doesn't match the shader's baked offsets".into());
+    }
     let m_stop = 3 + width;
     let m_nuc = m_stop + stop_bins;
     let stride = m_nuc + nuc_bins;
@@ -97,6 +130,9 @@ fn pack() -> Result<McTables, String> {
     let el_start = files.get("el_start").ok_or("el_start")?.i32s()?;
     let in_start = files.get("in_start").ok_or("in_start")?.i32s()?;
     let ne = e_type.len();
+    if el_start.len() != ne + 1 || in_start.len() != ne + 1 {
+        return Err("the material tables are truncated".into());
+    }
     let mut el = vec![0i32; ne * 5];
     for e in 0..ne {
         el[e * 5] = e_type[e];

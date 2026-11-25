@@ -122,7 +122,7 @@ fn timeline_event(message: &str) -> Option<LayerEvent> {
         return None;
     };
     let layer = between(message, "LAYER: ", " ")?.parse().ok()?;
-    let seconds = between(message, "T=", "s")?.parse().ok()?;
+    let seconds = between(message, "T=", "s")?.trim().parse().ok()?;
     Some(LayerEvent {
         layer,
         kind: kind.to_owned(),

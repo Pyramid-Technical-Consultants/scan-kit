@@ -120,6 +120,7 @@ impl SessionMeta {
     pub fn short_time(&self) -> String {
         match self.treatment_time_s {
             Some(seconds) => {
+                let seconds = seconds.max(0);
                 let minutes = seconds.div_euclid(60);
                 let remain = seconds.rem_euclid(60);
                 format!("{minutes}:{remain:02}")
@@ -162,7 +163,7 @@ impl SummaryDate {
         }
         let second: u32 = second_text.split('.').next()?.parse().ok()?;
         if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
+            || !(1..=days_in_month(year, month)).contains(&day)
             || hour > 23
             || minute > 59
             || second > 60
@@ -217,15 +218,15 @@ pub fn parse_termination_summary_text(text: &str) -> SessionMeta {
             }
         } else if line.starts_with("Primary total dose:") {
             if let Some(parsed) = labeled_number(line, "Primary total dose") {
-                primary_mu = Some(parsed);
+                primary_mu = (parsed > 0.0).then_some(parsed);
             }
         } else if line.starts_with("Treatment time:") {
             if let Some(parsed) = labeled_number(line, "Treatment time") {
-                treatment_s = i32::try_from(parsed as i64).ok();
+                treatment_s = i32::try_from(parsed as i64).ok().filter(|v| *v >= 0);
             }
         } else if line.starts_with("Room number:") {
             if let Some(parsed) = labeled_number(line, "Room number") {
-                room_number = i32::try_from(parsed as i64).ok();
+                room_number = i32::try_from(parsed as i64).ok().filter(|v| *v >= 0);
             }
         } else if let Some(rest) = labeled(line, "Configuration name") {
             let name = rest.trim();
@@ -236,11 +237,11 @@ pub fn parse_termination_summary_text(text: &str) -> SessionMeta {
             };
         } else if line.starts_with("Spot extent width:") {
             if let Some(parsed) = labeled_number(line, "Spot extent width") {
-                extent_w = Some(parsed);
+                extent_w = (parsed >= 0.0).then_some(parsed);
             }
         } else if line.starts_with("Spot extent height:") {
             if let Some(parsed) = labeled_number(line, "Spot extent height") {
-                extent_h = Some(parsed);
+                extent_h = (parsed >= 0.0).then_some(parsed);
             }
         } else if line.starts_with("Layer delivery:") {
             if let Some(parsed) = parse_layer_delivery(line) {
@@ -284,7 +285,11 @@ fn parse_layer_delivery(line: &str) -> Option<i32> {
     if let Some((_, planned)) = rest.split_once('/') {
         rest = planned.trim();
     }
-    i32::try_from(leading_number(rest)? as i64).ok()
+    // A non-positive or overflowing count is corrupt text, not geometry —
+    // leaving it None keeps the geom_incomplete seal.
+    i32::try_from(leading_number(rest)? as i64)
+        .ok()
+        .filter(|count| *count > 0)
 }
 
 fn leading_number(text: &str) -> Option<f64> {
@@ -328,7 +333,7 @@ fn leading_number(text: &str) -> Option<f64> {
             index = mantissa;
         }
     }
-    text[..index].parse().ok()
+    text[..index].parse().ok().filter(|v: &f64| v.is_finite())
 }
 
 fn parse_summary_date(rest: &str) -> Option<SummaryDate> {
@@ -339,13 +344,15 @@ fn parse_summary_date(rest: &str) -> Option<SummaryDate> {
     let month = month_index(parts[1])?;
     let day: u32 = parts[2].parse().ok()?;
     let year: i32 = parts[4].parse().ok()?;
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
     let mut clock = parts[3].split(':');
     let hour: u32 = clock.next()?.parse().ok()?;
     let minute: u32 = clock.next()?.parse().ok()?;
     let second: u32 = clock.next()?.parse().ok()?;
     if clock.next().is_some()
         || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
         || hour > 23
         || minute > 59
         || second > 60
@@ -360,6 +367,16 @@ fn parse_summary_date(rest: &str) -> Option<SummaryDate> {
         minute,
         second,
     })
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn weekday_index(name: &str) -> Option<u8> {
@@ -497,6 +514,19 @@ Configuration name: working_no_hvttt_new_cal
             parse_termination_summary_text("Layer delivery: 18\n").layer_count,
             Some(18)
         );
+        // A corrupt count is corrupt text, not geometry — leaving it None
+        // keeps the geom_incomplete seal.
+        for bogus in [
+            "Layer delivery: -5\n",
+            "Layer delivery: 0\n",
+            "Layer delivery: 1e999\n",
+        ] {
+            assert_eq!(
+                parse_termination_summary_text(bogus).layer_count,
+                None,
+                "{bogus}"
+            );
+        }
         let no_geom = parse_termination_summary_text("Primary total dose: 1.0\n");
         assert_eq!(no_geom.map_extent_mm, None);
         assert_eq!(no_geom.layer_count, None);

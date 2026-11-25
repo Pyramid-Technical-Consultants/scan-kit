@@ -266,7 +266,7 @@ jobs:
           cargo cyclonedx -f json --spec-version 1.5 --no-build-deps \
             --manifest-path apps/desktop/src-tauri/Cargo.toml --override-filename sbom
           mv apps/desktop/src-tauri/sbom.json "artifacts/scan-kit-${VERSION}-rust.cdx.json"
-          (cd apps/desktop && npm sbom --package-lock-only --omit dev --sbom-format cyclonedx) \
+          (cd apps/desktop && npm sbom --package-lock-only --omit dev --sbom-format cyclonedx --sbom-type application) \
             > "artifacts/scan-kit-${VERSION}-webview.cdx.json"
 
       - name: Create GitHub Release

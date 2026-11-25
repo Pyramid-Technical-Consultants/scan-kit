@@ -299,26 +299,67 @@ pub(super) fn scatter_series(
     scatter_cloud(xs, ys, Vec::new(), color, 2.5)
 }
 
+/// One empty consuming series — palette slots are positional per session,
+/// so a session that draws nothing must still hold its slot or the next
+/// session paints in its color.
+pub(super) fn empty_mark() -> Series {
+    Series::Polyline {
+        xs: Vec::new(),
+        ys: Vec::new(),
+        color: [0.0, 0.0, 0.0, 1.0],
+        thickness: 1.0,
+    }
+}
+
+/// The marks a missing column emits — contour holds its slots in
+/// `contour_series`; every other glyph needs a placeholder here.
+pub(super) fn empty_slot_marks(glyph: &str) -> Vec<Series> {
+    if glyph == "contour" {
+        Vec::new()
+    } else {
+        vec![empty_mark()]
+    }
+}
+
+/// Whether the series takes the next palette slot (alpha>0 marks and
+/// session-ramp heatmaps do; alpha-0 linked marks and guides do not) —
+/// apply_palette's rule.
+pub(super) fn consumes_slot(series: &Series) -> bool {
+    match series {
+        Series::Polyline { color, .. }
+        | Series::Points { color, .. }
+        | Series::Bars { color, .. }
+        | Series::Rects { color, .. }
+        | Series::Triangles { color, .. } => color[3] > 0.0,
+        Series::Heatmap { ramp, .. } => scan_kit_core::is_session(*ramp),
+        Series::Guide { .. } | Series::Cloud { .. } => false,
+    }
+}
+
+/// Per-session contour marks, one entry per table — a session whose marks
+/// consume no slot gets a placeholder so the palette stays aligned.
 pub(super) fn contour_series(
     tables: &[BTreeMap<String, Vec<f32>>],
     key: &str,
     x_column: &str,
     cutoff_pct: f32,
-) -> Vec<Series> {
-    let mut drawn = Vec::new();
-    for table in tables {
-        let Some(xs) = table.get(x_column) else {
-            continue;
-        };
-        let Some(ys) = table.get(key) else { continue };
-        drawn.extend(cloud_series(
-            xs,
-            ys,
-            &[],
-            CloudDraw::Contour { cutoff: cutoff_pct },
-        ));
-    }
-    drawn
+) -> Vec<Vec<Series>> {
+    tables
+        .iter()
+        .map(|table| {
+            let marks = match (table.get(x_column), table.get(key)) {
+                (Some(xs), Some(ys)) => {
+                    cloud_series(xs, ys, &[], CloudDraw::Contour { cutoff: cutoff_pct })
+                }
+                _ => Vec::new(),
+            };
+            if marks.iter().any(consumes_slot) {
+                marks
+            } else {
+                vec![empty_mark()]
+            }
+        })
+        .collect()
 }
 
 pub(super) fn binned_trend(
@@ -544,10 +585,18 @@ pub(super) fn hist_panel(
     range: Option<(f32, f32)>,
     position_guides: bool,
 ) -> Panel {
+    // Missing and all-non-finite columns stay as empty slices — dropping
+    // them would shift every later session off its palette slot.
     let columns: Vec<&[f32]> = tables
         .iter()
-        .filter_map(|table| table.get(series.key).map(Vec::as_slice))
-        .filter(|column| column.iter().any(|value| value.is_finite()))
+        .map(|table| {
+            let column = table.get(series.key).map(Vec::as_slice).unwrap_or(&[]);
+            if column.iter().any(|value| value.is_finite()) {
+                column
+            } else {
+                &[]
+            }
+        })
         .collect();
     let guides: Vec<f32> = if !position_guides {
         Vec::new()
@@ -585,6 +634,7 @@ pub(super) fn corr_panel(
     let mut all_y = Vec::new();
     for table in tables {
         let (Some(left), Some(right)) = (table.get(a.key), table.get(b.key)) else {
+            series.push(empty_mark());
             continue;
         };
         let mut xs = Vec::new();
@@ -596,6 +646,7 @@ pub(super) fn corr_panel(
             }
         }
         if xs.is_empty() {
+            series.push(empty_mark());
             continue;
         }
         all_x.extend(xs.iter().copied());
@@ -624,11 +675,9 @@ pub(super) fn corr_panel(
             });
         }
     }
-    // Each key can exist in a different table — no co-occurring pair means
-    // the panel would hold nothing but the diagonal guide.
-    if all_x.is_empty() {
-        return None;
-    }
+    // Each key can exist in a different table. Even then the slot is real -
+    // a skipped panel shifts every later panel one grid column, so a pair
+    // with no shared table still returns its diagonal guide.
     let (xmin, xmax) = span(&all_x);
     let (ymin, ymax) = span(&all_y);
     let lo = xmin.min(ymin);
@@ -700,11 +749,10 @@ pub(super) fn interlock_guides(
             "expected_sigma_{}",
             series_key.strip_suffix("_err").unwrap_or(series_key)
         );
-        if let Some(expected) = tables
-            .iter()
-            .find_map(|table| table.get(&band_key).cloned())
-        {
-            guides.extend(sigma_bands(&expected, categories, metric == "sigma"));
+        if tables.len() == 1 {
+            if let Some(expected) = tables[0].get(&band_key) {
+                guides.extend(sigma_bands(expected, categories, metric == "sigma"));
+            }
         }
     }
     guides
@@ -741,9 +789,9 @@ pub(super) fn dose_gates(categories: &[f32], glyph: &str, xmin: f32, xmax: f32) 
                 index as f32
             };
             let gate = ((GATE_ABS_MU + frac * f64::from(*mu)) / f64::from(*mu) * 100.0) as f32;
-            // mu = 0 (or NaN) makes the gate infinite/NaN — a guide at ±inf
-            // would poison the panel's y-range, so skip it.
-            if !gate.is_finite() {
+            // mu <= 0 (or NaN) makes the gate negative/infinite — a crossed
+            // or ±inf guide pair would poison the panel's y-range, so skip it.
+            if *mu <= 0.0 || !gate.is_finite() {
                 continue;
             }
             xs.push(x);
@@ -840,7 +888,11 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
     if values.is_empty() {
         return Vec::new();
     }
-    if values.len() == 1 || values.iter().all(|value| same(*value, values[0])) {
+    let lo = values.iter().copied().fold(f32::MAX, f32::min);
+    let hi = values.iter().copied().fold(f32::MIN, f32::max);
+    // "Flat" is relative to the data's scale — `same()`'s absolute 1e-4
+    // floor flattens every column under coulomb scale into a bare tick.
+    if values.len() == 1 || (hi - lo).abs() <= 1e-12 * hi.abs().max(lo.abs()).max(1e-30) {
         return vec![(values[0], half * 0.7)];
     }
     let n = values.len() as f64;
@@ -854,11 +906,9 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
         .sum::<f64>()
         / (n - 1.0);
     let bw = n.powf(-0.2) * var.sqrt();
-    if bw < 1e-9 {
+    if bw.is_nan() || bw <= 0.0 {
         return vec![(values[0], half * 0.7)];
     }
-    let lo = values.iter().copied().fold(f32::MAX, f32::min);
-    let hi = values.iter().copied().fold(f32::MIN, f32::max);
     const STEPS: usize = 48;
     // ponytail: a long bin is a 256-bin histogram, gaussian cut at 4 bandwidths.
     // Under 512 samples the kernel still visits every point, which is what the
@@ -980,14 +1030,23 @@ mod tests {
 
     #[test]
     fn pchip_keeps_opposite_extreme_means_finite() {
+        // Midpoint means of +-3e38 fit f32; a plain mean overflows to inf.
         let (_xs, ys) = pchip(&[0.0, 1.0, 2.0], &[-3.0e38, 0.0, 3.0e38]);
-        assert!(ys.iter().all(|y| y.is_finite()), "{ys:?}");
+        assert_eq!(
+            ys,
+            vec![
+                -3.0e38, -2.625e38, -2.25e38, -1.875e38, -1.5e38, -1.125e38, -7.5e37, -3.75e37,
+                0.0, 3.75e37, 7.5e37, 1.125e38, 1.5e38, 1.875e38, 2.25e38, 2.625e38, 3.0e38
+            ]
+        );
     }
 
     #[test]
     fn kde_and_mean_series_survive_extreme_finite_samples() {
         let curve = kde(&[f32::MAX, -f32::MAX], 1.0);
-        assert!(curve.iter().all(|(y, _)| y.is_finite()));
+        assert!(!curve.is_empty());
+        // (position, half-width) — extreme samples can corrupt either.
+        assert!(curve.iter().all(|(y, w)| y.is_finite() && w.is_finite()));
         // Two f32::MAX samples overflow an f32 sum — the f64 mean stays
         // finite instead of handing pchip a NaN.
         let mut table = BTreeMap::new();
@@ -1000,15 +1059,27 @@ mod tests {
             1,
             [1.0, 1.0, 1.0, 1.0],
         );
-        let json = serde_json::to_value(&series).unwrap();
-        let text = json.to_string();
-        assert!(!text.contains("inf") && !text.contains("NaN"), "{text}");
+        // serde_json writes non-finite floats as null — a text scan can't
+        // see them. The values themselves have to be checked.
+        assert!(!series.is_empty());
+        let mut checked = 0;
+        for item in &series {
+            let (xs, ys) = match item {
+                Series::Polyline { xs, ys, .. } | Series::Points { xs, ys, .. } => (xs, ys),
+                _ => continue,
+            };
+            checked += 1;
+            assert!(xs.iter().chain(ys.iter()).all(|v| v.is_finite()));
+        }
+        assert!(checked >= 1);
     }
 
     #[test]
-    fn a_correlation_pair_with_no_shared_table_draws_no_panel() {
-        // Either key can exist in a different session's table — the pair
-        // would otherwise emit a diagonal guide over an empty plot.
+    fn a_correlation_pair_with_no_shared_table_keeps_its_grid_slot() {
+        // Either key can exist in a different session's table. The slot is
+        // still fixed in the scene grid — a missing panel would shift every
+        // later panel a column left, so the pair draws its diagonal guide
+        // alone rather than dropping out.
         let a = YSeries {
             key: "ic1_x_err",
             label: "IC1",
@@ -1019,6 +1090,43 @@ mod tests {
         };
         let mut table = std::collections::BTreeMap::new();
         table.insert("ic1_x_err".to_string(), vec![1.0, 2.0]);
-        assert!(corr_panel(&a, &b, &[table], "Position").is_none());
+        let panel = corr_panel(&a, &b, &[table], "Position").unwrap();
+        // The missing session still holds its palette slot — an empty
+        // mark alongside the diagonal guide.
+        assert!(panel.series.iter().all(|item| {
+            matches!(item, Series::Guide { .. })
+                || matches!(item, Series::Polyline { xs, .. } if xs.is_empty())
+        }));
+    }
+    #[test]
+    fn sigma_bands_only_draw_for_a_single_session() {
+        // expected_sigma_* is per-session devices.xml — over pooled
+        // categories one session's band on another's points is wrong.
+        let table: BTreeMap<String, Vec<f32>> = BTreeMap::from([(
+            "expected_sigma_ic1_x".to_string(),
+            vec![70.0, 2.0, 90.0, 3.0],
+        )]);
+        let guides = interlock_guides(
+            &[table.clone(), table.clone()],
+            &[70.0, 90.0],
+            "sigma",
+            "ic1_x",
+            "energy",
+            "band",
+            0.0,
+            1.0,
+        );
+        assert!(guides.is_empty());
+        let guides = interlock_guides(
+            &[table],
+            &[70.0, 90.0],
+            "sigma",
+            "ic1_x",
+            "energy",
+            "band",
+            0.0,
+            1.0,
+        );
+        assert!(!guides.is_empty());
     }
 }

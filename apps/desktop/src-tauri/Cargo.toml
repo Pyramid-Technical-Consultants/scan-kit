@@ -27,5 +27,5 @@ scan-kit-core = { workspace = true }
 scan-kit-dicom = { workspace = true }
 scan-kit-io = { workspace = true }
 serde_json = { workspace = true }
-tauri = { version = "2", features = [] }
+tauri = { version = "2" }
 tauri-plugin-dialog = "2"

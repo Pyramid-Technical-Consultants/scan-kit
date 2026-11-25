@@ -4,8 +4,9 @@
 //! `run_view` renders the same plot offscreen and returns the base64 frame that
 //! MCP and the view tests use.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use scan_kit_core::Cancel;
 use scan_kit_core::{is_session, Series, ToolKind, ToolSpec};
 use serde_json::{json, Value};
 
@@ -40,13 +41,13 @@ pub fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "view": { "type": "string" },
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" },
-                "width": { "type": "integer" },
-                "height": { "type": "integer" },
-                "background": { "type": "array", "items": { "type": "number" } },
-                "foreground": { "type": "array", "items": { "type": "number" } },
-                "palette": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }
+                "width": { "type": "integer", "minimum": 1, "maximum": 8192 },
+                "height": { "type": "integer", "minimum": 1, "maximum": 8192 },
+                "background": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                "foreground": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                "palette": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 } }
             },
             "required": ["view", "path", "session_ids"],
             "additionalProperties": false
@@ -55,9 +56,9 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" },
-                "dest": { "type": "string" },
+                "dest": { "type": "string", "description": "An absolute .dcm write path" },
                 "description": { "type": "string" }
             },
             "required": ["path", "session_ids", "dest"],
@@ -67,9 +68,9 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" },
-                "dest": { "type": "string" }
+                "dest": { "type": "string", "description": "An absolute .pdf write path" }
             },
             "required": ["path", "session_ids", "dest"],
             "additionalProperties": false
@@ -79,11 +80,23 @@ pub fn tool_input_schema(name: &str) -> Value {
 }
 
 pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
+    invoke_flag(name, input, &Cancel::new())
+}
+
+/// `invoke` with a cooperative cancel — an MCP client's cancelled request
+/// stops the drain instead of finishing detached and still writing the file.
+pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, String> {
     match name {
         "scan_kit_run_view" => {
             let view = text(input, "view")?;
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
+            // The volumetric branch renders anything it is handed — the
+            // sibling views cap selection at five via analysis_scene, so
+            // this stateless tool gets the same bound.
+            if session_ids.len() > 5 {
+                return Err("at most five sessions can be selected".into());
+            }
             let options = object_arg(input, "options")?;
             let width = dim(input, "width", 960)?;
             let height = dim(input, "height", 640)?;
@@ -98,6 +111,13 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 [0.92, 0.92, 0.93, 1.0],
             )?;
             let palette = palette_of(input.get("palette"))?;
+            // An absent palette would paint every mark black on the dark
+            // default — the desktop always supplies one, the tool need not.
+            let palette = if palette.is_empty() {
+                vec![foreground]
+            } else {
+                palette
+            };
             run_view(
                 view,
                 Path::new(path),
@@ -108,26 +128,43 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 background,
                 foreground,
                 &palette,
+                cancel,
             )
         }
         "scan_kit_write_dose" | "scan_kit_write_report" => {
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
+            if session_ids.len() > 5 {
+                return Err("at most five sessions can be selected".into());
+            }
+            let dest = text(input, "dest")?;
             let mut options = object_arg(input, "options")?;
-            options["dest"] = json!(text(input, "dest")?);
             if name == "scan_kit_write_dose" {
                 let description = match input.get("description") {
+                    None | Some(Value::Null) => "scan-kit MC",
                     Some(value) => value.as_str().ok_or("description must be a string")?,
-                    None => "scan-kit MC",
                 };
                 options["description"] = json!(description);
             }
+            // A write tool's dest is a file-write primitive — confine it to
+            // the tool's own extension inside a real directory, like the
+            // plan .csv and session .zip checks.
+            let ext = if name == "scan_kit_write_dose" {
+                ".dcm"
+            } else {
+                ".pdf"
+            };
+            if !dest.to_ascii_lowercase().ends_with(ext) || !Path::new(dest).is_absolute() {
+                return Err(format!("dest must be an absolute {ext} path"));
+            }
+            options["dest"] = json!(dest);
             let view = if name == "scan_kit_write_dose" {
                 "write_dose"
             } else {
                 "write_report"
             };
-            let bytes = crate::task::drain_task(view, Path::new(path), &session_ids, &options)?;
+            let bytes =
+                crate::task::drain_task(view, Path::new(path), &session_ids, &options, cancel)?;
             serde_json::from_slice(&bytes).map_err(|err| format!("export result: {err}"))
         }
         _ => Err(format!("unknown tool {name}")),
@@ -145,6 +182,7 @@ pub fn run_view(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
+    cancel: &Cancel,
 ) -> Result<Value, String> {
     let bytes = open_plot(
         view,
@@ -154,6 +192,7 @@ pub fn run_view(
         background,
         foreground,
         palette,
+        cancel,
     )?;
     let header = scan_kit_plot::plot_header(&bytes)?;
     if header.reuses_lines() {
@@ -185,6 +224,7 @@ pub fn open_plot(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
+    cancel: &Cancel,
 ) -> Result<Vec<u8>, String> {
     // Task views never produce plot bytes — and ExportStage/CopyStage write files
     // as a side effect, so letting `scan_kit_run_view` (a READ_ONLY MCP tool)
@@ -202,6 +242,7 @@ pub fn open_plot(
         background,
         foreground,
         palette,
+        cancel,
     )
 }
 
@@ -209,7 +250,12 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
     if palette.is_empty() {
         for panel in &mut scene.panels {
             for series in &mut panel.series {
-                if let Series::Polyline { color, .. } | Series::Points { color, .. } = series {
+                if let Series::Polyline { color, .. }
+                | Series::Points { color, .. }
+                | Series::Bars { color, .. }
+                | Series::Rects { color, .. }
+                | Series::Triangles { color, .. } = series
+                {
                     if color[3] == 0.0 {
                         color[3] = 1.0;
                     }
@@ -255,8 +301,25 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
         }
     }
     if !palette.is_empty() && !scene.volume.values.is_empty() {
-        scene.volume.session_colors = palette.to_vec();
+        // session_colors indexes volume.sessions — a palette short of the
+        // session list leaves later cubes on the decoder's fallback tint
+        // while their panel marks wrap. Wrap here too.
+        let count = scene.volume.sessions.len().max(palette.len());
+        scene.volume.session_colors = (0..count)
+            .map(|index| palette[index % palette.len()])
+            .collect();
     }
+}
+
+/// The `*_dvh.csv` path that pairs with a report written at `dest` — shared
+/// so the cancel path removes the same artifact the writer commits.
+pub(crate) fn dvh_sidecar(dest: &Path) -> PathBuf {
+    dest.with_file_name(format!(
+        "{}_dvh.csv",
+        dest.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("report")
+    ))
 }
 
 /// `scan_kit_write_report`: the QA report `scan_kit.qa.report.write_report`
@@ -273,7 +336,10 @@ pub(crate) fn finish_patient_report(
     let Some(result) = &run.ran else {
         return Err("the Monte Carlo transport did not run".into());
     };
-    let provenance = scan_kit_io::patient_view::provenance(inputs, result, session_ids, gpu);
+    let mut provenance = scan_kit_io::patient_view::provenance(inputs, result, session_ids, gpu);
+    // A missing/short let_d falls back to physical dose — the artifact must
+    // say so, not claim the RBE model the run never applied.
+    provenance["rbe_effective"] = json!(run.effective);
     let metrics = scan_kit_io::patient_view::metrics(inputs, run, options);
     let title = format!("Patient QA — {}", inputs.study.plan_label);
     let rbe = scan_kit_io::patient_view::rbe_label(inputs.rbe_key);
@@ -281,20 +347,16 @@ pub(crate) fn finish_patient_report(
         &title,
         &metrics,
         rbe,
-        dvh_figure(&metrics)?,
+        run.effective,
+        dvh_figure(&metrics, run.effective)?,
         provenance,
     );
     let dest = Path::new(dest);
     // Build the CSV before writing the PDF - a DVH error must not leave a
     // fresh PDF beside the report the task calls failed.
-    let csv = scan_kit_io::report::dvh_csv(&curves)?;
+    let csv = scan_kit_io::report::dvh_csv(&curves, run.effective)?;
     let pdf = scan_kit_io::report::write_pdf(&report, dest)?;
-    let csv_path = dest.with_file_name(format!(
-        "{}_dvh.csv",
-        dest.file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("report")
-    ));
+    let csv_path = dvh_sidecar(dest);
     let mut out = json!({
         "pdf": pdf.display().to_string(),
         "provenance": report.provenance,
@@ -303,14 +365,29 @@ pub(crate) fn finish_patient_report(
         // A failed CSV must not leave the PDF looking like a successful
         // export — the task reports Err either way.
         if let Err(err) = scan_kit_core::atomic_write(&csv_path, csv.as_bytes()) {
-            let _ = std::fs::remove_file(&pdf);
-            return Err(format!("{}: {err}", csv_path.display()));
+            return Err(match std::fs::remove_file(&pdf) {
+                Ok(()) => format!("{}: {err}", csv_path.display()),
+                // The rollback failed too — a fresh PDF now sits beside an
+                // older CSV, so the error must name the mismatched pair.
+                Err(remove) => format!(
+                    "{}: {err}; {} could not be removed ({remove})",
+                    csv_path.display(),
+                    pdf.display()
+                ),
+            });
         }
         out["dvh_csv"] = json!(csv_path.display().to_string());
     } else {
         // A curve-less export must not leave a stale sidecar pairing with
         // the new PDF - the pair reads as one artifact.
-        let _ = std::fs::remove_file(&csv_path);
+        if let Err(err) = std::fs::remove_file(&csv_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "could not remove a stale {} ({err}) beside the new report",
+                    csv_path.display()
+                ));
+            }
+        }
     }
     Ok(out)
 }
@@ -319,6 +396,7 @@ pub(crate) fn finish_patient_report(
 /// names each curve's color because the plot has no legend.
 fn dvh_figure(
     metrics: &scan_kit_io::patient_view::PatientMetrics,
+    effective: bool,
 ) -> Result<Option<scan_kit_io::report::Figure>, String> {
     const COLORS: &[([f32; 4], &str)] = &[
         ([0.12, 0.47, 0.71, 1.0], "blue"),
@@ -337,7 +415,13 @@ fn dvh_figure(
     let mut xmax = 0.0f32;
     for (index, structure) in metrics.structures.iter().enumerate() {
         let (color, name) = COLORS[index % COLORS.len()];
-        names.push(format!("{} ({name})", structure.name));
+        // Past the palette the colors repeat — the caption is the only
+        // legend, so name the repeat or two curves read as one.
+        names.push(if index < COLORS.len() {
+            format!("{} ({name})", structure.name)
+        } else {
+            format!("{} ({name}, repeat)", structure.name)
+        });
         let cumulative = structure.dvh.cumulative();
         xmax = structure.dvh.edges.iter().copied().fold(xmax, f32::max);
         series.push(Series::Polyline {
@@ -350,7 +434,12 @@ fn dvh_figure(
     scene.panels.push(scan_kit_core::Panel {
         title: "DVH".into(),
         y_label: "Volume (fraction)".into(),
-        x_label: "Dose (Gy(RBE))".into(),
+        x_label: if effective {
+            "Dose (Gy(RBE))".into()
+        } else {
+            // A physical-dose run reports Gy like its CSV and stats tables.
+            "Dose (Gy)".into()
+        },
         xmin: 0.0,
         xmax,
         ymin: 0.0,
@@ -380,10 +469,13 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
-    input
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{key} is required"))?
+    let array = match input.get(key) {
+        None => return Err(format!("{key} is required")),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| format!("{key} must be an array"))?,
+    };
+    array
         .iter()
         .map(|value| {
             value
@@ -404,8 +496,8 @@ fn dim(input: &Value, key: &str, fallback: u32) -> Result<u32, String> {
             )
             .map_err(|_| format!("{key} is out of range"))?;
             // The same bound Plot::apply clamps to — a huge dim would ask the
-            // renderer for an oversized frame buffer.
-            if dim > 8192 {
+            // renderer for an oversized frame buffer; 0 yields an empty view.
+            if dim == 0 || dim > 8192 {
                 return Err(format!("{key} is out of range"));
             }
             Ok(dim)
@@ -431,8 +523,13 @@ fn color4(value: Option<&Value>, key: &str, fallback: [f32; 4]) -> Result<[f32; 
     let items = value
         .as_array()
         .ok_or_else(|| format!("{key} must be an array"))?;
+    // A short array must not blend user channels with the fallback —
+    // [0.5] would silently produce [0.5, 0.11, 0.12, 1.0].
+    if items.len() != 4 {
+        return Err(format!("{key} must have 4 channels"));
+    }
     let mut out = fallback;
-    for (index, item) in items.iter().take(4).enumerate() {
+    for (index, item) in items.iter().enumerate() {
         // Every sibling arg parser errors on a mistyped element — a bad
         // channel must not silently keep the fallback color.
         out[index] = item
@@ -500,10 +597,11 @@ mod tests {
         // conflated with it.
         let metrics = scan_kit_io::patient_view::PatientMetrics {
             matches: Vec::new(),
+            dropped: Vec::new(),
             structures: Vec::new(),
             gamma: None,
         };
-        assert!(super::dvh_figure(&metrics).unwrap().is_none());
+        assert!(super::dvh_figure(&metrics, true).unwrap().is_none());
     }
 
     #[test]
@@ -559,6 +657,7 @@ mod tests {
             [0.1, 0.1, 0.1, 1.0],
             [0.9, 0.9, 0.9, 1.0],
             &[[0.8, 0.8, 0.8, 1.0], [0.4, 0.4, 0.4, 1.0]],
+            &Cancel::new(),
         )
         .unwrap();
         assert!(frame["title"].as_str().unwrap().contains("vs"));
@@ -591,6 +690,7 @@ mod tests {
             [0.1, 0.1, 0.1, 1.0],
             [0.9, 0.9, 0.9, 1.0],
             &[[0.8, 0.2, 0.2, 1.0]],
+            &Cancel::new(),
         )
         .unwrap();
         let header = scan_kit_plot::plot_header(&opened).unwrap();

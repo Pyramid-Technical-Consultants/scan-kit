@@ -70,7 +70,13 @@ pub fn calibration_factor(target: &[f32], delivered: &[f32]) -> Option<f32> {
             sum_d += f64::from(*d);
         }
     }
-    (sum_d > 0.0).then_some((sum_t / sum_d) as f32)
+    if sum_d <= 0.0 {
+        return None;
+    }
+    // A denormal-tiny denominator casts to inf — refuse it rather than
+    // spraying inf/NaN through the scaled column.
+    let factor = (sum_t / sum_d) as f32;
+    factor.is_finite().then_some(factor)
 }
 
 pub fn scale_column(values: &[f32], factor: f32) -> Vec<f32> {
@@ -209,7 +215,10 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     let n_bins = n_bins.max(1);
     if finite.iter().all(|value| *value == finite[0]) {
         let lo = finite[0];
-        return vec![lo - 0.5, lo + 0.5];
+        let pad = (lo.abs() * f32::EPSILON).max(0.5);
+        // |lo| within a pad of f32::MAX overflows to +-inf — clamp like
+        // padded_span does.
+        return vec![(lo - pad).max(-f32::MAX), (lo + pad).min(f32::MAX)];
     }
     let qs: Vec<f32> = (0..=n_bins)
         .map(|step| step as f32 / n_bins as f32)
@@ -220,7 +229,8 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     edges.dedup_by(|a, b| (*a - *b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1e-30));
     if edges.len() < 2 {
         let lo = edges.first().copied().unwrap_or(0.0);
-        return vec![lo - 0.5, lo + 0.5];
+        let pad = (lo.abs() * f32::EPSILON).max(0.5);
+        return vec![(lo - pad).max(-f32::MAX), (lo + pad).min(f32::MAX)];
     }
     edges
 }
@@ -324,8 +334,12 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
     // "Flat" is relative to the data's scale — an absolute floor calls a
     // 1e-13-wide column flat and bins every distinct value into one bucket.
     if (hi - lo).abs() <= 1e-12 * hi.abs().max(lo.abs()).max(1e-30) {
-        lo -= 0.5;
-        hi += 0.5;
+        // The pad must survive the f32 ulp at the data's magnitude — an
+        // absolute 0.5 is unrepresentable above 2^23 and leaves span 0,
+        // piling every count into bin 0. Same fix uniform_edges carries.
+        let pad = (hi.abs().max(lo.abs()) * f32::EPSILON).max(0.5);
+        lo = (lo - pad).max(-f32::MAX);
+        hi = (hi + pad).min(f32::MAX);
     }
     // Span math in f64: a column can legitimately span more than f32::MAX,
     // which would turn every edge NaN and pile all counts into bin 0.
@@ -573,7 +587,12 @@ pub fn mip_xy(grid: &[f32], shape: [usize; 3]) -> Vec<f32> {
     if grid.len() < nx.saturating_mul(ny).saturating_mul(nz) {
         return image;
     }
-    for z in 0..nz {
+    // Seed from the z=0 slice — a zero seed would floor an all-negative
+    // grid's true maximum.
+    if nz > 0 {
+        image.copy_from_slice(&grid[..pixels]);
+    }
+    for z in 1..nz {
         for y in 0..ny {
             for x in 0..nx {
                 let value = grid[x + nx * (y + ny * z)];
@@ -676,44 +695,56 @@ pub fn dvh(dose: &[f32], mask: &[bool], bins: usize) -> (Vec<f32>, Vec<f32>) {
 pub fn sums_by_spot_id(spot: &[f32], current: &[f32]) -> Vec<f32> {
     // i64: `as i32` saturates, folding every id past ~2.1e9 into one bucket.
     let mut index = std::collections::BTreeMap::<i64, usize>::new();
-    let mut sums = Vec::new();
+    let mut sums: Vec<f64> = Vec::new();
     for (spot_id, value) in spot.iter().zip(current) {
         if !spot_id.is_finite() || !value.is_finite() {
             continue;
         }
-        let id = spot_id.round() as i64;
+        let rounded = spot_id.round();
+        // A value past i64 range saturates the cast — distinct ids would
+        // merge into one bucket (same guard as spot_delivery_ms).
+        if rounded.abs() >= 9e18 {
+            continue;
+        }
+        let id = rounded as i64;
         if let Some(slot) = index.get(&id) {
-            sums[*slot] += value;
+            sums[*slot] += f64::from(*value);
         } else {
             index.insert(id, sums.len());
-            sums.push(*value);
+            sums.push(f64::from(*value));
         }
     }
-    sums
+    sums.into_iter().map(|sum| sum as f32).collect()
 }
 
 /// Sum `current` over each contiguous run of the same spot id.
 pub fn sums_by_spot_run(spot: &[f32], current: &[f32]) -> Vec<f32> {
     let n = spot.len().min(current.len());
     let mut out = Vec::new();
-    let mut acc = 0.0f32;
+    let mut acc = 0.0f64;
     let mut have = false;
     let mut last = 0i64;
     for i in 0..n {
         if !spot[i].is_finite() || !current[i].is_finite() {
             continue;
         }
-        let id = spot[i].round() as i64;
+        let rounded = spot[i].round();
+        // Past i64 range the cast saturates — a run boundary at such an id
+        // would silently merge into the previous run.
+        if rounded.abs() >= 9e18 {
+            continue;
+        }
+        let id = rounded as i64;
         if have && id != last {
-            out.push(acc);
+            out.push(acc as f32);
             acc = 0.0;
         }
-        acc += current[i];
+        acc += f64::from(current[i]);
         last = id;
         have = true;
     }
     if have {
-        out.push(acc);
+        out.push(acc as f32);
     }
     out
 }
@@ -742,13 +773,21 @@ pub fn robust_limits_finite(values: &mut [f32]) -> Option<(f32, f32)> {
         crate::stats::select_ranks(values, rank(0.005).min(last), rank(0.995).min(last))
     };
     let scale = hi.abs().max(lo.abs());
-    let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
+    // An absolute 1e-6 floor swallows charge-integral columns that live at
+    // nC/pC scale (1e-9..1e-12) — the trace would pin to 0. Scale the floor.
+    let pad = ((hi - lo) * 0.02)
+        .max(scale * 0.02)
+        .max((scale * 1.0e-3).max(1.0e-12));
     Some(((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX)))
 }
 
 /// Time span plus a small margin. The floor is one 1 ms sample, and the start stays at 0.
 pub fn time_window(lo: f32, hi: f32) -> (f32, f32) {
-    let pad = ((hi - lo) * 0.02).max(0.001);
+    // The absolute 1 ms floor is below the f32 ulp for |t| past ~2^14 — a
+    // flat large timestamp would return a zero-width window.
+    let pad = ((hi - lo) * 0.02)
+        .max(0.001)
+        .max(hi.abs().max(lo.abs()) * f32::EPSILON);
     ((lo - pad).max(0.0), (hi + pad).min(f32::MAX))
 }
 
@@ -761,14 +800,14 @@ pub fn median_finite(values: &[f32]) -> Option<f32> {
 }
 
 pub fn trapz(time: &[f32], values: &[f32]) -> f32 {
-    let mut acc = 0.0f32;
+    let mut acc = 0.0f64;
     for i in 1..time.len().min(values.len()) {
         let dt = time[i] - time[i - 1];
         if dt.is_finite() && values[i].is_finite() && values[i - 1].is_finite() {
-            acc += 0.5 * (values[i] + values[i - 1]) * dt;
+            acc += 0.5 * (f64::from(values[i]) + f64::from(values[i - 1])) * f64::from(dt);
         }
     }
-    acc
+    acc as f32
 }
 
 /// Time window around the largest HV excursion, padded by 40 ms.
@@ -1034,8 +1073,11 @@ mod tests {
     #[test]
     fn a_non_finite_edge_timestamp_falls_back_to_the_row_ends() {
         // A NaN inside the excursion must not erase a measurable window.
-        let (lo, hi) = hv_step_window(&[f32::NAN, 1.0, 2.0], &[0.0, 10.0, 0.0]).unwrap();
-        assert!(lo.is_finite() && hi.is_finite());
+        let window = hv_step_window(&[f32::NAN, 1.0, 2.0], &[0.0, 10.0, 0.0]).unwrap();
+        assert_eq!(window, (-39.0, 41.0));
+        // The NaN sits on the excursion edge itself — both fallbacks fire.
+        let window = hv_step_window(&[0.0, f32::NAN, 20.0], &[0.0, 10.0, 0.0]).unwrap();
+        assert_eq!(window, (-40.0, 60.0));
     }
 
     #[test]
@@ -1474,17 +1516,54 @@ mod tests {
     #[test]
     fn extreme_finite_samples_stay_finite() {
         let mut values = vec![-f32::MAX, f32::MAX];
-        let (lo, hi) = robust_limits_finite(&mut values).unwrap();
-        assert!(lo.is_finite() && hi.is_finite());
-        let (wlo, whi) = time_window(-f32::MAX, f32::MAX);
-        assert!(wlo.is_finite() && whi.is_finite());
+        let window = robust_limits_finite(&mut values).unwrap();
+        assert_eq!(window, (-f32::MAX, f32::MAX));
+        let window = time_window(-f32::MAX, f32::MAX);
+        assert_eq!(window, (0.0, f32::MAX));
+    }
+
+    #[test]
+    fn a_flat_column_above_the_ulp_pads_representably() {
+        // |v| > 2^23: +-0.5 rounds away and leaves span 0 — every count
+        // used to pile into bin 0 and the panel domain collapsed.
+        let (edges, counts) = histogram(&[1e9f32; 8], 4);
+        assert!(edges[0] < edges[edges.len() - 1]);
+        assert_eq!(counts.iter().sum::<f32>(), 8.0);
+        let (wlo, whi) = time_window(20_000.0, 20_000.0);
+        assert!(wlo < whi);
+    }
+
+    #[test]
+    fn spot_ids_past_i64_range_do_not_merge() {
+        // `as i64` saturates at i64::MAX — without the guard 1e19 and 2e19
+        // would fold into one bucket and sum across spots.
+        let ids = sums_by_spot_id(&[1e19, 2e19, 3.0], &[1.0, 2.0, 4.0]);
+        assert_eq!(ids, vec![4.0]);
+        let runs = sums_by_spot_run(&[1e19, 2e19, 3.0, 3.0], &[1.0, 2.0, 4.0, 4.0]);
+        assert_eq!(runs, vec![8.0]);
+    }
+
+    #[test]
+    fn calibration_factor_refuses_a_denormal_denominator() {
+        // 1e-45 is positive-but-denormal f32 — the ratio casts to inf and
+        // used to come back as a usable factor.
+        assert_eq!(calibration_factor(&[1.0], &[1e-45]), None);
+        assert_eq!(calibration_factor(&[2.0], &[1.0]), Some(2.0));
     }
 
     #[test]
     fn a_huge_declared_shape_does_not_wrap_the_flat_index() {
         // x * nx used to overflow before the bounds check — a wrapped index
         // could land on a valid voxel and sample the wrong one.
-        let out = resample_nearest(&[1.0; 4], [usize::MAX, usize::MAX, usize::MAX], [4, 4, 4]);
+        let out = resample_nearest(
+            &[1.0, 2.0, 3.0, 4.0],
+            [usize::MAX, usize::MAX, usize::MAX],
+            [4, 4, 4],
+        );
         assert_eq!(out.len(), 64);
+        // A wrapped index could land on a valid voxel — only the first cell
+        // may hold a real sample.
+        assert_eq!(out[0], 1.0);
+        assert!(out[1..].iter().all(|value| *value == 0.0), "{out:?}");
     }
 }

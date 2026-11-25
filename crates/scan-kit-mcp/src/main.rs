@@ -110,6 +110,17 @@ impl ScanKit {
     /// scheme, a UNC share, or a file://host URI (file:/// is local).
     fn remote_spec(spec: &str) -> bool {
         let spec = spec.trim();
+        // `\\?\` verbatim and `\\.\` device paths are local — except
+        // `\\?\UNC\`, which is a verbatim spelling of a share.
+        if spec.get(..4).is_some_and(|head| {
+            head.eq_ignore_ascii_case(r"\\.\") || head.eq_ignore_ascii_case(r"\\?\")
+        }) {
+            // Both prefixes spell the object-manager root — a UNC tail
+            // under either one reaches the same redirector.
+            return spec
+                .get(4..8)
+                .is_some_and(|rest| rest.eq_ignore_ascii_case("UNC\\"));
+        }
         if scan_kit_io::is_remote_location(spec) || spec.starts_with('\\') || Self::unc(spec) {
             return true;
         }
@@ -128,20 +139,26 @@ impl ScanKit {
     /// Walks every string in the input; a JSON-in-JSON value such as
     /// options.scanners (a string carrying an array) is walked too.
     fn remote_in(value: &Value, name: &str) -> bool {
-        Self::remote_in_at(value, true, name)
+        Self::remote_in_at(value, true, name, 0)
     }
 
-    fn remote_in_at(value: &Value, top: bool, name: &str) -> bool {
+    fn remote_in_at(value: &Value, top: bool, name: &str, depth: u8) -> bool {
+        // Each string is re-parsed as JSON — serde caps one document's
+        // nesting but not a doc-inside-string chain. An arg needing more
+        // than a few re-parse levels is adversarial; gate it.
+        if depth >= 4 {
+            return true;
+        }
         match value {
             Value::String(spec) => {
                 Self::remote_spec(spec)
                     || serde_json::from_str::<Value>(spec)
                         .ok()
-                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false, name))
+                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false, name, depth + 1))
             }
             Value::Array(items) => items
                 .iter()
-                .any(|item| Self::remote_in_at(item, false, name)),
+                .any(|item| Self::remote_in_at(item, false, name, depth)),
             // `note` is the one free-text field in the tool surface — a note
             // that *is* a URL must not trip the path gate. The exemption is
             // top-level only and scoped to the one tool that takes a note:
@@ -151,7 +168,7 @@ impl ScanKit {
             Value::Object(map) => map.iter().any(|(key, value)| {
                 Self::remote_spec(key)
                     || !(top && name == "scan_kit_set_note" && key == "note" && value.is_string())
-                        && Self::remote_in_at(value, false, name)
+                        && Self::remote_in_at(value, false, name, depth)
             }),
             _ => false,
         }
@@ -163,18 +180,35 @@ impl ScanKit {
 }
 
 fn schema_object(value: Value) -> Arc<Map<String, Value>> {
-    let Value::Object(schema) = value else {
-        unreachable!("tool schema is an object");
-    };
-    Arc::new(schema)
+    match value {
+        Value::Object(schema) => Arc::new(schema),
+        // A non-object catalog schema must not panic the handler task —
+        // rmcp never awaits the spawned task, so a panic hangs the client.
+        _ => Arc::new(Map::new()),
+    }
 }
 
-fn catalog_specs() -> Vec<scan_kit_core::ToolSpec> {
-    let mut specs = scan_kit_core::tools().to_vec();
-    specs.extend_from_slice(scan_kit_io::tools());
-    specs.extend_from_slice(scan_kit_compute::tools());
-    specs.extend_from_slice(scan_kit_dicom::tools());
-    specs
+fn catalog_specs() -> &'static [scan_kit_core::ToolSpec] {
+    static SPECS: std::sync::OnceLock<Vec<scan_kit_core::ToolSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        let mut specs = scan_kit_core::tools().to_vec();
+        specs.extend_from_slice(scan_kit_io::tools());
+        specs.extend_from_slice(scan_kit_compute::tools());
+        specs.extend_from_slice(scan_kit_dicom::tools());
+        // A name collision across catalogs would shadow the later tool.
+        // Panics at startup — inside a spawned handler task a panic hangs
+        // the client, since rmcp never joins the task.
+        assert_eq!(
+            specs
+                .iter()
+                .map(|tool| tool.name)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            specs.len(),
+            "duplicate tool names across catalogs"
+        );
+        specs
+    })
 }
 
 fn schema_for(name: &str) -> Value {
@@ -192,16 +226,24 @@ fn schema_for(name: &str) -> Value {
     }
 }
 
-fn dispatch(name: &str, input: &Value) -> Result<Value, String> {
+fn dispatch(
+    name: &str,
+    input: &Value,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Value, String> {
     if scan_kit_core::tools().iter().any(|tool| tool.name == name) {
         scan_kit_core::invoke(name, input).map_err(|err| err.to_string())
     } else if scan_kit_io::tools().iter().any(|tool| tool.name == name) {
-        scan_kit_io::invoke(name, input).map_err(|err| err.to_string())
+        scan_kit_io::invoke_flag(name, input, cancel.as_ref()).map_err(|err| err.to_string())
     } else if scan_kit_compute::tools()
         .iter()
         .any(|tool| tool.name == name)
     {
-        scan_kit_compute::invoke(name, input)
+        scan_kit_compute::invoke_flag(
+            name,
+            input,
+            &scan_kit_core::Cancel::from_arc(cancel.clone()),
+        )
     } else if scan_kit_dicom::tools().iter().any(|tool| tool.name == name) {
         scan_kit_dicom::invoke(name, input)
     } else {
@@ -211,7 +253,7 @@ fn dispatch(name: &str, input: &Value) -> Result<Value, String> {
 
 fn catalog_tools(server: &ScanKit) -> Vec<Tool> {
     catalog_specs()
-        .into_iter()
+        .iter()
         .filter(|spec| server.allows(spec.name))
         .map(|spec| {
             Tool::new_with_raw(
@@ -249,7 +291,7 @@ impl ServerHandler for ScanKit {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let input = match request.arguments {
             None => Value::Null,
@@ -258,7 +300,7 @@ impl ServerHandler for ScanKit {
         let name = request.name.clone();
         let result = match self.blocked(&name, &input) {
             Some(name) => Err(format!(
-                "{name} changes files, devices, or reference configuration; start the server with --allow-effects to use it"
+                "{name} writes files/devices/configuration or reaches the network; start the server with --allow-effects to use it"
             )),
             None => {
                 if !catalog_specs().iter().any(|tool| tool.name == name) {
@@ -267,6 +309,22 @@ impl ServerHandler for ScanKit {
                         None,
                     ));
                 }
+                let ct = context.ct;
+                // rmcp spawns one task per request; cap in-flight
+                // dispatches so a flood can't queue unbounded blocking work.
+                // The acquire itself races the ct — a request cancelled while
+                // queued frees immediately instead of parking its (up to
+                // 16 MiB) parsed args behind the 8 live dispatches.
+                static DISPATCH_LIMIT: tokio::sync::Semaphore =
+                    tokio::sync::Semaphore::const_new(8);
+                let _permit = tokio::select! {
+                    permit = DISPATCH_LIMIT.acquire() => permit.map_err(|_| {
+                        McpError::internal_error("dispatch limiter closed", None)
+                    })?,
+                    _ = ct.cancelled() => {
+                        return Err(McpError::internal_error("cancelled", None));
+                    }
+                };
                 // The advertised schema is the contract — a typo'd arg
                 // must not silently default (e.g. `db_pth` writes the
                 // default index, `dest` drops a save). db_path is exempt:
@@ -295,7 +353,7 @@ impl ServerHandler for ScanKit {
                                 && schema
                                     .get("properties")
                                     .and_then(Value::as_object)
-                                    .is_some_and(|props| !props.contains_key(*key))
+                                    .is_none_or(|props| !props.contains_key(*key))
                         })
                     }) {
                         return Err(McpError::invalid_params(
@@ -306,10 +364,47 @@ impl ServerHandler for ScanKit {
                 }
                 // dispatch blocks on file IO, remote connect timeouts, and GPU
                 // waits — pinning a tokio worker starves every other request.
-                match tokio::task::spawn_blocking(move || dispatch(&name, &input)).await {
-                    Ok(inner) => inner,
-                    Err(err) => Err(err.to_string()),
+                // The client's ct cancels on CancelledNotification: it frees
+                // this request immediately, and the flag makes cooperative
+                // tools (index scans) roll back instead of running to
+                // completion in a detached task.
+                // Cancelled mid-validation —
+                // do not spawn work the client already abandoned.
+                if ct.is_cancelled() {
+                    return Err(McpError::internal_error("cancelled", None));
                 }
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = cancel.clone();
+                let tool = name.clone();
+                let joined =
+                    tokio::task::spawn_blocking(move || dispatch(&name, &input, &cancel));
+                // A blocking task cannot be aborted mid-run, but selecting
+                // frees this request now. The flag is set HERE, in the arm
+                // — a watcher task needs a separate scheduling slot and
+                // aborting it before it polls would leave flag false, so
+                // the detached task would commit writes after 'cancelled'.
+                let result = tokio::select! {
+                    out = joined => match out {
+                        Ok(inner) => inner,
+                        Err(err) => {
+                            // JoinError's Display embeds the panic payload —
+                            // internal details stay server-side.
+                            eprintln!("scan-kit-mcp: {tool} task failed: {err}");
+                            Err(format!("{tool} failed"))
+                        }
+                    },
+                    _ = ct.cancelled() => {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // ponytail: the detached spawn_blocking still runs to
+                        // completion — only tools that poll the flag (open_library,
+                        // compute stages) actually stop. A cancelled write tool
+                        // reports "cancelled" while its effect lands, and a slow
+                        // core/dicom read (index_study, load_study) keeps burning
+                        // IO; threading the flag into those invokes is the fix.
+                        Err("cancelled".to_owned())
+                    }
+                };
+                result
             }
         };
         match result {
@@ -322,6 +417,23 @@ impl ServerHandler for ScanKit {
                 } else {
                     serde_json::json!({ "result": value })
                 };
+                // rmcp silently discards response lines over 16 MiB — a
+                // full-dim run_view frame would hang the client, not fail it.
+                // CallToolResult::structured duplicates the payload — once
+                // as structuredContent, once escaped inside content[].text
+                // — so the wire line runs up to ~3x the measured size
+                // against the 16 MiB transport cap.
+                const MAX_RESULT: usize = 5 << 20;
+                let oversized = serde_json::to_vec(&value)
+                    .map(|bytes| bytes.len() > MAX_RESULT)
+                    .unwrap_or(true);
+                if oversized {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "{} produced a response over the transport's message limit",
+                        request.name
+                    ))])
+                    .into());
+                }
                 Ok(CallToolResult::structured(value).into())
             }
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
@@ -331,10 +443,25 @@ impl ServerHandler for ScanKit {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let effects = std::env::args().any(|arg| arg == "--allow-effects");
+    let mut effects = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--allow-effects" => effects = true,
+            _ => {
+                eprintln!("unknown argument {arg}; usage: scan-kit-mcp [--allow-effects]");
+                std::process::exit(2);
+            }
+        }
+    }
+    // Init the memoized catalog now — a duplicate tool name must fail at
+    // startup, not inside a spawned handler task rmcp never joins.
+    catalog_specs();
     let server = ScanKit { effects }.serve(stdio()).await?;
     server.waiting().await?;
-    Ok(())
+    // A detached spawn_blocking task (e.g. a cancelled core/dicom read)
+    // would otherwise keep the runtime — and this process — alive past
+    // stdin EOF, a zombie holding the index and GPU.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
@@ -369,17 +496,20 @@ mod tests {
         assert!(!ScanKit::remote_in_at(
             &json!({"note": "sftp://device.invalid/data"}),
             true,
-            "scan_kit_set_note"
+            "scan_kit_set_note",
+            0
         ));
         assert!(ScanKit::remote_in_at(
             &json!({"args": {"note": "sftp://device.invalid/data"}}),
             true,
-            "scan_kit_set_note"
+            "scan_kit_set_note",
+            0
         ));
         assert!(ScanKit::remote_in_at(
             &json!({"note": {"path": "sftp://device.invalid/data"}}),
             true,
-            "scan_kit_set_note"
+            "scan_kit_set_note",
+            0
         ));
     }
 
@@ -390,7 +520,8 @@ mod tests {
         assert!(ScanKit::remote_in_at(
             &json!({"note": "sftp://device.invalid/data"}),
             true,
-            "scan_kit_run_view"
+            "scan_kit_run_view",
+            0
         ));
     }
 
@@ -399,7 +530,8 @@ mod tests {
         assert!(ScanKit::remote_in_at(
             &json!({"sftp://host.invalid/share": "x"}),
             true,
-            "scan_kit_run_view"
+            "scan_kit_run_view",
+            0
         ));
     }
 

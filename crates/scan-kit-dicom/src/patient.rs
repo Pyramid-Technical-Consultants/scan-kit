@@ -122,6 +122,9 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut ct_positions: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut structures = Vec::new();
+    // First RTSTRUCT wins even when its SOP UID or ROI list comes back
+    // empty — the uid-empty gate used to let a second file overwrite it.
+    let mut structures_taken = false;
     let mut structures_frame = String::new();
     let mut patient_id = String::new();
     let mut patient_name = String::new();
@@ -156,7 +159,10 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         // encodings this reader deliberately rejects, and skipping is cheaper.
         if let Some(class) = crate::meta_sop_class(&bytes) {
             let wanted = [crate::CT, crate::RT_STRUCT, crate::RT_PLAN, crate::RT_DOSE];
-            if !wanted.iter().any(|uid| class.contains(uid)) {
+            // Exact match — RTDOSE ...481.2 is a substring of the
+            // second-generation RT UIDs (...481.20-481.25), which this
+            // reader deliberately rejects inside.
+            if !wanted.contains(&class.as_str()) {
                 continue;
             }
         }
@@ -177,7 +183,15 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             });
             let position = text_tag(&elems, tag(0x0018, 0x5100));
             if !position.is_empty() {
-                ct_positions.entry(uid.clone()).or_insert(position);
+                if let Some(held) = ct_positions.get(&uid) {
+                    if held != &position {
+                        return Err(format!(
+                            "CT series {uid} mixes patient positions {held}/{position}"
+                        ));
+                    }
+                } else {
+                    ct_positions.insert(uid.clone(), position);
+                }
             }
             let (sops, bucket) = ct_by_series.entry(uid).or_default();
             sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
@@ -190,10 +204,19 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
             plan_raw = Some((elems, frame, sop_uid, file.clone()));
         } else if class == "1.2.840.10008.5.1.4.1.1.481.3" {
-            if structures_uid.is_empty() {
+            if !structures_taken {
+                structures_taken = true;
                 structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
-                structures_frame = frame.clone();
-                structures = read_structures(&elems);
+                // RTSTRUCT carries its frame inside the Referenced Frame of
+                // Reference Sequence — top-level (0020,0052) exists only in
+                // non-IOD files like our own synthetic fixture.
+                structures_frame = seq(&elems, tag(0x3006, 0x0010))
+                    .iter()
+                    .map(|item| text_tag(item, tag(0x0020, 0x0052)))
+                    .find(|f| !f.is_empty())
+                    .unwrap_or_else(|| frame.clone());
+                structures =
+                    read_structures(&elems).map_err(|err| format!("{}: {err}", file.display()))?;
             }
         } else if class == "1.2.840.10008.5.1.4.1.1.481.2" {
             if dose_seen {
@@ -215,6 +238,11 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             if dose_type.is_empty() {
                 dose_type = text_tag(&elems, tag(0x3004, 0x0004));
                 summation = text_tag(&elems, tag(0x3004, 0x000A));
+            }
+            // A RELATIVE dose would read its scaled counts as absolute Gy.
+            let units = text_tag(&elems, tag(0x3004, 0x0002));
+            if !units.eq_ignore_ascii_case("GY") {
+                return Err(format!("dose units {units:?} are not GY"));
             }
             for slice in image_slices(&elems, scale)? {
                 dose_slices.push((frame.clone(), slice));
@@ -290,6 +318,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     let mut slices: Vec<_> = ct_slices.into_iter().map(|(_, slice)| slice).collect();
     let mut ct = stack(&mut slices)?;
+    ct.position = ct_position.clone();
     ct.frame = frame.clone();
     ct.patient_id = patient_id;
     ct.patient_name = patient_name;
@@ -301,6 +330,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     } else {
         let mut slices: Vec<_> = dose_slices.into_iter().map(|(_, slice)| slice).collect();
         let mut volume = stack(&mut slices)?;
+        volume.position = ct_position.clone();
         volume.frame = frame.clone();
         volume.dose_type = dose_type;
         volume.summation = summation;
@@ -339,12 +369,25 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
         ));
     }
     let elems = parse_file(&bytes)?;
+    // Wrong file kind — a CT or RTDOSE must not read as an empty ion plan.
+    let sop = text_tag(&elems, tag(0x0008, 0x0016));
+    if sop != "1.2.840.10008.5.1.4.1.1.481.8" {
+        return Err("not an RT Ion Plan storage object".into());
+    }
     let label = text_tag(&elems, tag(0x300A, 0x0002));
     let mut spots = Vec::new();
     let mut plan_index = 0i32;
+    let mut treatment_beams = 0;
     for beam in seq(&elems, tag(0x300A, 0x03A2)) {
         if text_tag(beam, tag(0x300A, 0x00CE)) == "SETUP" {
             continue;
+        }
+        treatment_beams += 1;
+        if treatment_beams > 1 {
+            // The spot map has no beam column — a second gantry's spots would
+            // merge into the same energy layers with no record. One map per
+            // field, like read_plan's single fraction group.
+            return Err("more than one treatment beam is not supported".into());
         }
         let mut energy = 0.0f32;
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
@@ -364,22 +407,46 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
             let size = floats_tag(cp, tag(0x300A, 0x0398));
-            let (size_x, size_y) = if size.len() >= 2 {
-                (size[0], size[1])
-            } else {
-                (f32::NAN, f32::NAN)
-            };
             let limit = n.min(xy.len() / 2);
+            // A declared layer whose map holds fewer than two values is the
+            // same corrupt-map failure read_plan rejects — skipping it
+            // would silently drop the energy layer.
+            if limit == 0 {
+                return Err("scan spot position map is missing or corrupt".into());
+            }
             // The weights tag must hold one entry per spot position — a
             // short array would silently drop the tail of the beam.
             if has_weights && weights.len() < limit {
                 return Err("meterset weights do not match the spot count".into());
             }
+            // Scan Mode is Type 1C only for MODULATED beams — absent on a
+            // MODULATED beam is the loud error read_plan already makes; on a
+            // UNIFORM beam every spot gets an equal share. An absent/unknown
+            // mode with no weight map cannot pick between them — refuse.
+            if !has_weights && limit > 0 {
+                match text_tag(beam, tag(0x300A, 0x0308)).as_str() {
+                    "UNIFORM" => {}
+                    "MODULATED" => {
+                        return Err("meterset weights are missing".into());
+                    }
+                    _ => return Err("a treatment beam has no scan mode".into()),
+                }
+            }
             for i in 0..limit {
                 let mu = if has_weights {
                     weights.get(i).copied().unwrap_or(f32::NAN)
                 } else {
-                    0.0
+                    // UNIFORM — an equal weight share per spot.
+                    1.0
+                };
+                // ScanningSpotSize is 2·n (x,y) pairs in spot order; a lone
+                // pair applies to every spot.
+                let (size_x, size_y) = if size.len() >= 2 * limit {
+                    (size[2 * i], size[2 * i + 1])
+                } else if size.len() >= 2 {
+                    (size[0], size[1])
+                } else {
+                    (f32::NAN, f32::NAN)
                 };
                 let index = plan_index;
                 plan_index += 1;
@@ -391,10 +458,12 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 if !energy.is_finite() || energy <= 0.0 {
                     return Err("a treatment beam has no nominal energy".into());
                 }
-                if (has_weights && (!mu.is_finite() || mu <= 0.0))
-                    || !x.is_finite()
-                    || !y.is_finite()
-                {
+                // read_plan's ruling: a negative or non-finite weight is
+                // corrupt input, zero is the legal end-of-segment marker.
+                if has_weights && (!mu.is_finite() || mu < 0.0) {
+                    return Err("a treatment beam carries a corrupt meterset weight".into());
+                }
+                if mu <= 0.0 || !x.is_finite() || !y.is_finite() {
                     continue;
                 }
                 spots.push(IonPlanSpot {
@@ -486,6 +555,9 @@ fn label_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> i32 {
 
 pub fn hu_density(hu: f32) -> f32 {
     let table = density_table();
+    if table.0.len() < 2 || !hu.is_finite() {
+        return 1e-6;
+    }
     let i = below(&table.0, hu).clamp(0, table.0.len() - 2);
     let (x0, x1) = (table.0[i], table.0[i + 1]);
     let (y0, y1) = (table.1[i], table.1[i + 1]);
@@ -499,6 +571,14 @@ pub fn hu_density(hu: f32) -> f32 {
 
 pub fn hu_label(hu: f32) -> i32 {
     let table = material_table();
+    if table.1.is_empty() {
+        return 0;
+    }
+    // below() maps NaN to the last index — the densest material. A
+    // non-finite voxel gets the lightest entry instead.
+    if !hu.is_finite() {
+        return table.1[0];
+    }
     let i = below(&table.0, hu).clamp(0, table.1.len() - 1);
     table.1[i]
 }
@@ -509,7 +589,10 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     let frame = "1.2.3.4.5";
     for (index, z) in [0.0f32, 1.0].into_iter().enumerate() {
         let mut bytes = preamble();
+        let sop = uid();
+        file_meta(&mut bytes, "1.2.840.10008.5.1.4.1.1.2", &sop)?;
         ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2")?;
+        ui(&mut bytes, 0x0008, 0x0018, &sop)?;
         cs(&mut bytes, 0x0008, 0x0060, "CT")?;
         ui(&mut bytes, 0x0020, 0x000D, "1.2.3")?;
         ui(&mut bytes, 0x0020, 0x000E, "1.2.3.1")?;
@@ -522,10 +605,14 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         ds(&mut bytes, 0x0028, 0x1052, &[0.0])?;
         ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
         ow(&mut bytes, 0x7FE0, 0x0010, &[0u16; 16])?;
-        fs::write(dir.join(format!("ct{index}.dcm")), bytes).map_err(|err| err.to_string())?;
+        scan_kit_core::atomic_write(&dir.join(format!("ct{index}.dcm")), &bytes)
+            .map_err(|err| err.to_string())?;
     }
     let mut plan = preamble();
-    ui(&mut plan, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8")?;
+    let plan_sop = uid();
+    file_meta(&mut plan, RT_ION_PLAN_CLASS, &plan_sop)?;
+    ui(&mut plan, 0x0008, 0x0016, RT_ION_PLAN_CLASS)?;
+    ui(&mut plan, 0x0008, 0x0018, &plan_sop)?;
     cs(&mut plan, 0x0008, 0x0060, "RTPLAN")?;
     ui(&mut plan, 0x0020, 0x0052, frame)?;
     let setup = {
@@ -550,6 +637,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     sq(&mut plan, 0x300A, 0x0180, &[setup])?;
     let control = {
         let mut item = Vec::new();
+        is(&mut item, 0x300A, 0x0112, 0)?;
         ds(&mut item, 0x300A, 0x0114, &[100.0])?;
         ds(&mut item, 0x300A, 0x011E, &[0.0])?;
         ds(&mut item, 0x300A, 0x0122, &[0.0])?;
@@ -571,7 +659,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         item
     };
     sq(&mut plan, 0x300A, 0x03A2, &[beam])?;
-    fs::write(dir.join("plan.dcm"), plan).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(&dir.join("plan.dcm"), &plan).map_err(|err| err.to_string())?;
     let roi = {
         let mut item = Vec::new();
         is(&mut item, 0x3006, 0x0022, 1)?;
@@ -596,15 +684,23 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         item
     };
     let mut structures = preamble();
+    let struct_sop = uid();
+    file_meta(
+        &mut structures,
+        "1.2.840.10008.5.1.4.1.1.481.3",
+        &struct_sop,
+    )?;
     ui(
         &mut structures,
         0x0008,
         0x0016,
         "1.2.840.10008.5.1.4.1.1.481.3",
     )?;
+    ui(&mut structures, 0x0008, 0x0018, &struct_sop)?;
     ui(&mut structures, 0x0020, 0x0052, frame)?;
     let observation = {
         let mut item = Vec::new();
+        is(&mut item, 0x3006, 0x0082, 1)?;
         is(&mut item, 0x3006, 0x0084, 1)?;
         cs(&mut item, 0x3006, 0x00A4, "PTV")?;
         item
@@ -614,9 +710,13 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     // RT ROI Observations is Type 1 — without it the set has contours but
     // no interpreted semantics.
     sq(&mut structures, 0x3006, 0x0080, &[observation])?;
-    fs::write(dir.join("struct.dcm"), structures).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(&dir.join("struct.dcm"), &structures)
+        .map_err(|err| err.to_string())?;
     let mut dose = preamble();
-    ui(&mut dose, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2")?;
+    let dose_sop = uid();
+    file_meta(&mut dose, RT_DOSE_CLASS, &dose_sop)?;
+    ui(&mut dose, 0x0008, 0x0016, RT_DOSE_CLASS)?;
+    ui(&mut dose, 0x0008, 0x0018, &dose_sop)?;
     cs(&mut dose, 0x0008, 0x0060, "RTDOSE")?;
     ui(&mut dose, 0x0020, 0x0052, frame)?;
     ds(&mut dose, 0x0020, 0x0032, &[0.0, 0.0, 0.0])?;
@@ -624,10 +724,13 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     us(&mut dose, 0x0028, 0x0010, 4)?;
     us(&mut dose, 0x0028, 0x0011, 4)?;
     ds(&mut dose, 0x0028, 0x0030, &[1.0, 1.0])?;
+    cs(&mut dose, 0x3004, 0x0002, "GY")?;
+    cs(&mut dose, 0x3004, 0x0004, "PHYSICAL")?;
+    cs(&mut dose, 0x3004, 0x000A, "FRACTION")?;
     ds(&mut dose, 0x3004, 0x000C, &[0.0, 1.0])?;
     ds(&mut dose, 0x3004, 0x000E, &[0.01])?;
     ow(&mut dose, 0x7FE0, 0x0010, &[100u16; 32])?;
-    fs::write(dir.join("dose.dcm"), dose).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(&dir.join("dose.dcm"), &dose).map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -642,6 +745,12 @@ struct Slice {
 }
 
 fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
+    let photometric = text_tag(elems, tag(0x0028, 0x0004));
+    if !photometric.is_empty() && !photometric.eq_ignore_ascii_case("MONOCHROME2") {
+        return Err(format!(
+            "photometric interpretation {photometric} is not MONOCHROME2"
+        ));
+    }
     // int_tag can text-parse a 2-byte US payload whose bytes spell an ASCII
     // number (e.g. value 12589 = "-1") — reject non-positive results rather
     // than casting them to usize::MAX.
@@ -680,16 +789,37 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     let (column_sign, row_sign) = axial_signs(elems)?;
     let normal_sign = column_sign * row_sign;
     let bits = int_tag(elems, tag(0x0028, 0x0100)).unwrap_or(16);
+    // A corrupt width silently decodes with a guessed sample size — a 0-bit
+    // file would read every pixel as its LSB rather than error.
+    if !matches!(bits, 8 | 16 | 32) {
+        return Err(format!("unsupported bits allocated {bits}"));
+    }
     // Pixel Representation 1 stores two's-complement samples. Reading those as
     // unsigned turns a negative HU into a huge positive one.
     let signed = int_tag(elems, tag(0x0028, 0x0103)).unwrap_or(0) == 1;
     // High Bit marks the sign bit of the stored value — a 12-bit signed
     // sample in a 16-bit slot reads as a large positive without extension.
+    // bits - 1 underflows i32 on a corrupt Bits Allocated — clamp first.
+    // An absent High Bit defaults to Bits Stored - 1 — a sloppy writer
+    // omitting it on a 12-in-16 image would otherwise read the sign bit at
+    // 15 and never sign-extend.
+    let stored_bits = int_tag(elems, tag(0x0028, 0x0101)).unwrap_or(bits).max(1);
     let high_bit = i64::from(
         int_tag(elems, tag(0x0028, 0x0102))
-            .unwrap_or(bits - 1)
+            .unwrap_or_else(|| stored_bits - 1)
             .clamp(0, 62),
     );
+    let sample_bytes = if bits == 8 {
+        1
+    } else if bits > 16 {
+        4
+    } else {
+        2
+    };
+    if !pixels.bytes.len().is_multiple_of(sample_bytes) {
+        // A frame ending mid-sample would silently drop the dangling bytes.
+        return Err("pixel data ends inside a sample".into());
+    }
     let stored: Vec<f32> = if bits == 8 {
         pixels
             .bytes
@@ -698,7 +828,8 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
                 let raw = if signed {
                     sign_extend(i64::from(*byte), high_bit.min(7)) as f32
                 } else {
-                    *byte as f32
+                    let mask = (1u16 << (high_bit.min(7) + 1)) - 1;
+                    (*byte as u16 & mask) as f32
                 };
                 (raw * slope + intercept) * scale
             })
@@ -711,9 +842,10 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .iter()
             .map(|chunk| {
                 let raw = if signed {
-                    sign_extend(i64::from(u32::from_le_bytes(*chunk)), high_bit) as f64
+                    sign_extend(i64::from(u32::from_le_bytes(*chunk)), high_bit.min(31)) as f64
                 } else {
-                    u32::from_le_bytes(*chunk) as f64
+                    let mask = (1u64 << (high_bit.min(31) + 1)) - 1;
+                    (u32::from_le_bytes(*chunk) as u64 & mask) as f64
                 };
                 (raw * slope as f64 + intercept as f64) as f32 * scale
             })
@@ -726,18 +858,24 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .iter()
             .map(|chunk| {
                 let raw = if signed {
-                    sign_extend(i64::from(u16::from_le_bytes(*chunk)), high_bit) as f32
+                    sign_extend(i64::from(u16::from_le_bytes(*chunk)), high_bit.min(15)) as f32
                 } else {
-                    u16::from_le_bytes(*chunk) as f32
+                    let mask = (1u32 << (high_bit.min(15) + 1)) - 1;
+                    (u16::from_le_bytes(*chunk) as u32 & mask) as f32
                 };
                 (raw * slope + intercept) * scale
             })
             .collect()
     };
+    if stored.iter().any(|value| !value.is_finite()) {
+        return Err("pixel data computes a non-finite value".into());
+    }
     if rows == 0 || cols == 0 {
         return Err("missing pixel dimensions".into());
     }
-    let plane = rows * cols;
+    let Some(plane) = rows.checked_mul(cols).filter(|plane| *plane > 0) else {
+        return Err("pixel plane overflows".into());
+    };
     if stored.len() < plane {
         return Err("pixel data is short".into());
     }
@@ -781,7 +919,8 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // equal to the slice origin z with identity orientation). Reading
     // absolute values as relative shifts every frame by the origin z.
     let absolute_z = !offsets.is_empty() && offsets[0] != 0.0;
-    if absolute_z && (offsets[0] != origin[2] || column_sign < 0.0 || row_sign < 0.0) {
+    if absolute_z && ((offsets[0] - origin[2]).abs() > 0.01 || column_sign < 0.0 || row_sign < 0.0)
+    {
         return Err("frame offsets are neither relative nor absolute z".into());
     }
     let mut slices = Vec::new();
@@ -863,7 +1002,7 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
     else {
         return Err("CT volume is too large".into());
     };
-    if voxels > (1 << 30) {
+    if voxels > (1 << 28) {
         return Err("CT volume exceeds the voxel bound".into());
     }
     let mut hu = vec![0.0; voxels];
@@ -913,16 +1052,26 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
     }
     let mut fractions = 1;
     let mut metersets = Vec::new();
-    // ponytail: beams in later fraction groups share this fraction count.
+    let mut populated_groups = 0;
     for group in seq(elems, tag(0x300A, 0x0070)) {
-        if metersets.is_empty() {
+        let beams_in_group = seq(group, tag(0x300C, 0x0004));
+        if !beams_in_group.is_empty() {
+            // A second populated group's metersets would misattribute via
+            // the first-match find below, and its fraction count may differ
+            // — refuse rather than pick one silently.
+            populated_groups += 1;
+            if populated_groups > 1 {
+                return Err(
+                    "more than one fraction group with beam references is not supported".into(),
+                );
+            }
             fractions = match int_tag(group, tag(0x300A, 0x0078)) {
                 Some(value) if value > 0 => value,
                 Some(_) => return Err("a fraction group has a non-positive fraction count".into()),
                 None => 1,
             };
         }
-        for beam in seq(group, tag(0x300C, 0x0004)) {
+        for beam in beams_in_group {
             metersets.push((
                 int_tag(beam, tag(0x300C, 0x0006)).unwrap_or(0),
                 float_tag(beam, tag(0x300A, 0x0086)).unwrap_or(0.0),
@@ -951,7 +1100,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         {
             return Err(format!("beam {number} has no meterset"));
         }
-        let setup = int_tag(beam, tag(0x300C, 0x006A)).unwrap_or(1);
+        // An absent reference is only unambiguous when a single setup
+        // exists — guessing #1 mirrors the beam when there are several.
+        let setup = match int_tag(beam, tag(0x300C, 0x006A)) {
+            Some(setup) => setup,
+            None if setups.len() > 1 => {
+                return Err(format!("beam {number} has an ambiguous patient setup"));
+            }
+            None => 1,
+        };
         // The setup sequence is optional — but an unresolvable or empty
         // position cannot default to "HFS": the support matrix would mirror
         // the beam geometry of an FFS patient. With no setup sequence at
@@ -969,6 +1126,13 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| format!("beam {number} has no patient position"))?
         };
+        // A beam position that disagrees with the CT's mirrors the support
+        // matrix against the volume — fail like the frame-of-reference rule.
+        if !ct_position.is_empty() && !position.eq_ignore_ascii_case(ct_position) {
+            return Err(format!(
+                "beam {number} is {position} but the CT is {ct_position}"
+            ));
+        }
         let mut shifter_ids = Vec::new();
         for item in seq(beam, tag(0x300A, 0x0314)) {
             let id = int_tag(item, tag(0x300A, 0x0316)).unwrap_or(0);
@@ -994,7 +1158,27 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         let mut first_iso = [0.0f32; 3];
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
-        for cp in seq(beam, tag(0x300A, 0x03A8)) {
+        let control_points = seq(beam, tag(0x300A, 0x03A8));
+        // Cumulative Meterset Weight (300A,0134) is a per-item Type 2
+        // element (VM 1) on each control point — element k's value is the
+        // cumulative share through CP k. A spot-bearing CP's dose is the
+        // FORWARD segment cum[k+1] - cum[k] per C.8.8.25.7, not the whole
+        // beam, and not the backward delta (which hands the segment to the
+        // end-marker CP).
+        let cums: Vec<f32> = control_points
+            .iter()
+            .map(|cp| float_tag(cp, tag(0x300A, 0x0134)).unwrap_or(f32::NAN))
+            .collect();
+        // The tagless UNIFORM fallback divides the beam over the spots that
+        // actually deliver — setup and marker CPs take no share.
+        let uniform_spots: usize = control_points
+            .iter()
+            .map(|cp| {
+                (int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize)
+                    .min(floats_tag(cp, tag(0x300A, 0x0394)).len() / 2)
+            })
+            .sum();
+        for (k, cp) in control_points.iter().enumerate() {
             // DS fields can carry "nan" — a non-finite value must not
             // replace the last good reading.
             energy = float_tag(cp, tag(0x300A, 0x0114))
@@ -1077,7 +1261,6 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
-            let spot_size_mm = scanning_spot_mm(cp);
             if n == 0 {
                 continue;
             }
@@ -1102,9 +1285,19 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 ));
             }
             // A modulated beam's weight map is Type 1C — absent, every spot
-            // computes mu = 0 and the beam silently empties.
-            if !has_weights && limit > 0 && text_tag(beam, tag(0x300A, 0x0308)) == "MODULATED" {
-                return Err(format!("beam {number}: meterset weights are missing"));
+            // computes mu = 0 and the beam silently empties. UNIFORM means an
+            // equal meterset share per spot; a missing mode cannot pick
+            // between them, so it errors too.
+            if !has_weights && limit > 0 {
+                match text_tag(beam, tag(0x300A, 0x0308)).as_str() {
+                    "UNIFORM" => {}
+                    "MODULATED" => {
+                        return Err(format!("beam {number}: meterset weights are missing"));
+                    }
+                    _ => {
+                        return Err(format!("beam {number}: scan mode is missing"));
+                    }
+                }
             }
             if in_shifters.len() > 1 {
                 return Err(format!(
@@ -1124,12 +1317,44 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 None => (String::new(), 0.0, f32::NAN),
             };
             for i in 0..limit {
-                let mu = weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight;
+                let mu = if has_weights {
+                    weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight
+                } else {
+                    // UNIFORM — the forward cumulative-weight segment
+                    // (this CP to the next) divided evenly over its spots;
+                    // the whole beam meterset went to every spot-bearing
+                    // CP otherwise. Missing tags: split evenly over the
+                    // spots that deliver.
+                    match (cums.get(k), cums.get(k + 1)) {
+                        (Some(&from), Some(&to)) if (to - from).is_finite() => {
+                            let segment = to - from;
+                            if segment > 0.0 {
+                                meterset * segment / final_weight / limit as f32
+                            } else {
+                                // A zero segment marks a non-delivering CP —
+                                // it takes no share, like a zero-weight
+                                // marker.
+                                0.0
+                            }
+                        }
+                        // The last CP has no forward segment — it delivers
+                        // nothing. A NaN entry means the tags were absent
+                        // entirely; take the even split instead.
+                        (Some(&from), None) if from.is_finite() => 0.0,
+                        _ => meterset / uniform_spots.max(1) as f32,
+                    }
+                };
                 let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);
                 let y = xy.get(i * 2 + 1).copied().unwrap_or(f32::NAN);
-                // A non-finite position or meterset reaches the transport
-                // and the plan CSV — reject it like a non-finite energy.
-                if mu.is_finite() && mu > 0.0 && x.is_finite() && y.is_finite() {
+                // A negative or non-finite weight is corrupt input — a
+                // silently dropped spot under-models the delivered dose.
+                // Zero weights are the legal end-of-segment marker.
+                if !mu.is_finite() || mu < 0.0 {
+                    return Err(format!("beam {number} carries a corrupt meterset weight"));
+                }
+                // A non-finite position reaches the transport and the plan
+                // CSV — skip it like a zero-weight marker.
+                if mu > 0.0 && x.is_finite() && y.is_finite() {
                     spots.push(Spot {
                         energy,
                         x,
@@ -1138,7 +1363,7 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                         shifter: shifter.clone(),
                         wet_mm,
                         shifter_distance_mm,
-                        spot_size_mm,
+                        spot_size_mm: scanning_spot_mm_at(cp, i, limit),
                     });
                 }
             }
@@ -1178,7 +1403,7 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
     })
 }
 
-fn read_structures(elems: &[Elem]) -> Vec<Structure> {
+fn read_structures(elems: &[Elem]) -> Result<Vec<Structure>, String> {
     let mut names = Vec::new();
     for roi in seq(elems, tag(0x3006, 0x0020)) {
         names.push((
@@ -1200,10 +1425,33 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
             // even-odd test — only closed rings rasterize. A missing tag
             // defaults to closed (Type 3, writers commonly omit it).
             let kind = text_tag(item, tag(0x3006, 0x0042));
-            if !kind.is_empty() && kind.trim() != "CLOSED_PLANAR" {
+            // CLOSEDPLANAR_XOR is retired but still exported — it is a
+            // closed ring, and the even-odd fill already implements XOR.
+            if !kind.is_empty()
+                && kind.trim() != "CLOSED_PLANAR"
+                && kind.trim() != "CLOSEDPLANAR_XOR"
+            {
                 continue;
             }
             let data = floats_tag(item, tag(0x3006, 0x0050));
+            // floats_tag is all-or-nothing — one corrupt component in the
+            // DS yields empty and the whole contour slice would vanish
+            // silently, shrinking the ROI in every downstream metric.
+            if data.is_empty() && elem(item, tag(0x3006, 0x0050)).is_some() {
+                return Err("corrupt ContourData — one bad value drops the slice".into());
+            }
+            // "nan"/"inf" parse as f32 — a non-finite vertex slips the
+            // min/max straddle check and silently miscounts crossings.
+            if data.iter().any(|value| !value.is_finite()) {
+                return Err("ContourData holds a non-finite coordinate".into());
+            }
+            if !data.len().is_multiple_of(3) {
+                return Err("ContourData does not hold whole xyz triples".into());
+            }
+            let declared = int_tag(item, tag(0x3006, 0x0046));
+            if declared.is_some_and(|count| count >= 0 && count as usize != data.len() / 3) {
+                return Err("ContourData point count disagrees with NumberOfContourPoints".into());
+            }
             let plane: Vec<[f32; 3]> = data
                 .chunks(3)
                 .filter(|point| point.len() == 3)
@@ -1217,7 +1465,7 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
             structures.push(Structure { name, contour });
         }
     }
-    structures
+    Ok(structures)
 }
 
 /// True when the voxel center is inside the structure's axial contour.
@@ -1443,6 +1691,8 @@ fn parse_dataset(bytes: &[u8]) -> Result<Vec<Elem>, String> {
 
 fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Elem>, String> {
     let mut elems = Vec::new();
+    // HashSet lookup — a per-element linear scan is O(n^2) on crafted input.
+    let mut seen = std::collections::HashSet::new();
     let mut cursor = 0;
     while cursor + 8 <= bytes.len() {
         let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
@@ -1501,7 +1751,11 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
             return Err("undefined-length DICOM sequences are not read".into());
         }
         let start = cursor + header;
-        let end = start + length as usize;
+        // checked_add like element_span — on wasm32 a u32 length could
+        // wrap the add and pass the bounds check.
+        let end = start
+            .checked_add(length as usize)
+            .ok_or("the dataset ends inside an element")?;
         if end > bytes.len() {
             return Err("the dataset ends inside an element".into());
         }
@@ -1514,12 +1768,17 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
             (parse_items(value, false, depth + 1)?, true)
         } else if (implicit || vr == *b"UN")
             && tag(group, element) != tag(0x7FE0, 0x0010)
-            && looks_like_items(value)
+            && looks_like_items(value)?
         {
             (parse_items(value, implicit, depth + 1)?, true)
         } else {
             (Vec::new(), false)
         };
+        if !seen.insert(tag(group, element)) {
+            return Err(format!(
+                "duplicate tag ({group:04X},{element:04X}) in one dataset"
+            ));
+        }
         elems.push(Elem {
             tag: tag(group, element),
             vr: if implicit { [0, 0] } else { vr },
@@ -1541,12 +1800,17 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
 /// start with those same four bytes (e.g. two stored values 0xFFFE/0xE000)
 /// — requiring the first item's length to fit inside the value shrinks the
 /// false-positive window to near zero.
-fn looks_like_items(value: &[u8]) -> bool {
+fn looks_like_items(value: &[u8]) -> Result<bool, String> {
     if value.len() < 8 || value[..4] != [0xFE, 0xFF, 0x00, 0xE0] {
-        return false;
+        return Ok(false);
     }
     let item_len = u32::from_le_bytes([value[4], value[5], value[6], value[7]]) as usize;
-    item_len == u32::MAX as usize || item_len <= value.len() - 8
+    if item_len != u32::MAX as usize && item_len > value.len() - 8 {
+        // The marker is present but the declared item cannot fit — a corrupt
+        // sequence. Demoting it to bytes would silently empty the SQ.
+        return Err("a sequence item extends past its sequence".into());
+    }
+    Ok(true)
 }
 
 fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>>, String> {
@@ -1580,7 +1844,9 @@ fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>
             return Err("undefined-length DICOM sequences are not read".into());
         }
         let start = cursor + 8;
-        let end = start + length as usize;
+        let end = start
+            .checked_add(length as usize)
+            .ok_or("a sequence item is short")?;
         if end > bytes.len() {
             return Err("a sequence item is short".into());
         }
@@ -1606,6 +1872,14 @@ fn seq(elems: &[Elem], tag: u32) -> &[Vec<Elem>] {
 }
 
 fn text_of(bytes: &[u8]) -> String {
+    // Interior control bytes (charset escapes, CSI, newlines) must not
+    // reach reports or JSON verbatim.
+    let bytes: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|byte| *byte >= 0x20 && *byte != 0x7F)
+        .collect();
+    let bytes = &bytes[..];
     String::from_utf8_lossy(bytes)
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_owned()
@@ -1693,6 +1967,21 @@ fn scanning_spot_mm(cp: &[Elem]) -> f32 {
     }
 }
 
+/// ScanningSpotSize is a 2·n array of (x,y) FWHM pairs in spot order —
+/// spot `i`'s pair is `size[2i]`/`size[2i+1]`, a lone pair covers all.
+fn scanning_spot_mm_at(cp: &[Elem], i: usize, limit: usize) -> f32 {
+    let size = floats_tag(cp, tag(0x300A, 0x0398));
+    if size.len() >= 2 * limit {
+        let (x, y) = (size[2 * i], size[2 * i + 1]);
+        if x > 0.0 && y > 0.0 && x < 500.0 && y < 500.0 && x.is_finite() && y.is_finite() {
+            return (x + y) / 2.0;
+        }
+        0.0
+    } else {
+        scanning_spot_mm(cp)
+    }
+}
+
 fn float_tag(elems: &[Elem], tag: u32) -> Option<f32> {
     floats_tag(elems, tag).first().copied()
 }
@@ -1731,6 +2020,9 @@ fn int_tag(elems: &[Elem], tag: u32) -> Option<i32> {
             elem.bytes[1],
         ])));
     }
+    if elem.bytes.len() == 4 && elem.bytes.contains(&0) && elem.vr == [0, 0] {
+        return Some(i32::from_le_bytes(elem.bytes[..4].try_into().ok()?));
+    }
     let text = text_of(&elem.bytes);
     if let Ok(value) = text.parse::<i32>() {
         return Some(value);
@@ -1768,7 +2060,10 @@ fn push_elem(
     bytes.extend_from_slice(&group.to_le_bytes());
     bytes.extend_from_slice(&slot.to_le_bytes());
     bytes.extend_from_slice(vr);
-    let long = matches!(vr, b"OW" | b"OB" | b"SQ" | b"OD");
+    let long = matches!(
+        vr,
+        b"OW" | b"OB" | b"SQ" | b"OD" | b"OF" | b"OL" | b"OV" | b"UC" | b"UR" | b"UT" | b"UN"
+    );
     if long {
         bytes.extend_from_slice(&[0, 0]);
         // Exactly 2^32 bytes wraps the VL to 0 — a silent empty element.
@@ -1785,6 +2080,15 @@ fn push_elem(
 }
 
 pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    // A UID from a crafted source file would write verbatim into the
+    // export — the VR caps at 64 chars of [0-9.].
+    if text.len() > 64
+        || text
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && byte != b'.')
+    {
+        return Err(format!("{group:04X},{element:04X} is not a uid"));
+    }
     let mut value = text.as_bytes().to_vec();
     if value.len() % 2 == 1 {
         value.push(0);
@@ -1794,6 +2098,17 @@ pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> R
 
 pub(crate) fn cs(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
     push_elem(bytes, group, element, b"CS", &even(text))
+}
+
+/// A zero-length element with the right VR — Type 2 tags are required to be
+/// present but may be empty.
+pub(crate) fn empty(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    vr: &[u8],
+) -> Result<(), String> {
+    push_elem(bytes, group, element, vr, &[])
 }
 
 pub(crate) fn lo(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
@@ -1818,9 +2133,10 @@ pub(crate) fn ds(
         .iter()
         .map(|value| {
             let plain = format!("{value:.6}");
-            // {:.6} collapses small magnitudes to "0.000000" - a declared
-            // zero geometry is worse than an exponential spelling.
-            if *value != 0.0 && plain.parse::<f64>() == Ok(0.0) {
+            // {:.6} collapses small magnitudes to "0.000000" and overflows
+            // the 16-char DS cap past |v| >= ~1e9 — the exponential
+            // spelling covers both.
+            if (*value != 0.0 && plain.parse::<f64>() == Ok(0.0)) || plain.len() > 16 {
                 format!("{value:.6e}")
             } else {
                 plain
@@ -1850,19 +2166,6 @@ pub(crate) fn fl(
         raw.extend_from_slice(&value.to_le_bytes());
     }
     push_elem(bytes, group, element, b"FL", &raw)
-}
-
-pub(crate) fn fd(
-    bytes: &mut Vec<u8>,
-    group: u16,
-    element: u16,
-    values: &[f64],
-) -> Result<(), String> {
-    let mut raw = Vec::with_capacity(values.len() * 8);
-    for value in values {
-        raw.extend_from_slice(&value.to_le_bytes());
-    }
-    push_elem(bytes, group, element, b"FD", &raw)
 }
 
 pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) -> Result<(), String> {
@@ -1910,10 +2213,33 @@ pub(crate) fn sq(
     for item in items {
         body.extend_from_slice(&0xFFFEu16.to_le_bytes());
         body.extend_from_slice(&0xE000u16.to_le_bytes());
-        body.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        body.extend_from_slice(
+            &u32::try_from(item.len())
+                .map_err(|_| "a sequence item exceeds the 4 GiB length limit".to_owned())?
+                .to_le_bytes(),
+        );
         body.extend_from_slice(item);
     }
     push_elem(bytes, group, element, b"SQ", &body)
+}
+
+/// Group-0002 File Meta Information — always explicit VR LE, required for a
+/// conformant Part-10 file. `bytes` must hold exactly the 132-byte preamble.
+pub(crate) fn file_meta(
+    bytes: &mut Vec<u8>,
+    sop_class: &str,
+    sop_instance: &str,
+) -> Result<(), String> {
+    let mut meta = Vec::new();
+    ob(&mut meta, 0x0002, 0x0001, &[0, 1])?;
+    ui(&mut meta, 0x0002, 0x0002, sop_class)?;
+    ui(&mut meta, 0x0002, 0x0003, sop_instance)?;
+    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE)?;
+    ui(&mut meta, 0x0002, 0x0012, IMPL_UID)?;
+    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT")?;
+    ul(bytes, 0x0002, 0x0000, meta.len() as u32)?;
+    bytes.extend_from_slice(&meta);
+    Ok(())
 }
 
 fn ul(bytes: &mut Vec<u8>, group: u16, element: u16, value: u32) -> Result<(), String> {
@@ -2056,47 +2382,71 @@ pub fn write_rtdose(
         // silently all-zero — degenerate input, not data to encode.
         return Err("the dose peak is outside the encodable range".into());
     }
-    let pixels: Vec<u32> = dose
+    let pixels: Result<Vec<u32>, String> = dose
         .iter()
         .map(|&v| {
             let value = if v.is_nan() { 0.0 } else { v as f64 };
-            (value.max(0.0) / scale).round_ties_even() as u32
+            // Dose is a sum of non-negative contributions — a negative
+            // voxel is corrupt input, not something to floor to zero.
+            if value < 0.0 {
+                return Err("the dose contains a negative value".to_owned());
+            }
+            Ok((value / scale).round_ties_even() as u32)
         })
         .collect();
+    let pixels = pixels?;
     let sop_uid = uid();
     let (date, time) = stamp();
 
     let mut bytes = preamble();
-    let mut meta = Vec::new();
-    ob(&mut meta, 0x0002, 0x0001, &[0, 1])?;
-    ui(&mut meta, 0x0002, 0x0002, RT_DOSE_CLASS)?;
-    ui(&mut meta, 0x0002, 0x0003, &sop_uid)?;
-    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE)?;
-    ui(&mut meta, 0x0002, 0x0012, IMPL_UID)?;
-    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT")?;
-    ul(&mut bytes, 0x0002, 0x0000, meta.len() as u32)?;
-    bytes.extend_from_slice(&meta);
+    file_meta(&mut bytes, RT_DOSE_CLASS, &sop_uid)?;
 
+    // Patient names and ids arrive as UTF-8 from the source CT — declare the
+    // repertoire or a non-ASCII name writes undecodable bytes.
+    cs(&mut bytes, 0x0008, 0x0005, "ISO_IR 192")?;
+    cs(&mut bytes, 0x0008, 0x0008, r"DERIVED\SECONDARY")?;
     push_elem(&mut bytes, 0x0008, 0x0012, b"DA", &even(&date))?;
     push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time))?;
     ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS)?;
     ui(&mut bytes, 0x0008, 0x0018, &sop_uid)?;
+    push_elem(&mut bytes, 0x0008, 0x0020, b"DA", &[])?;
     push_elem(&mut bytes, 0x0008, 0x0023, b"DA", &even(&date))?;
+    push_elem(&mut bytes, 0x0008, 0x0030, b"TM", &[])?;
     push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time))?;
+    push_elem(&mut bytes, 0x0008, 0x0050, b"SH", &[])?;
     cs(&mut bytes, 0x0008, 0x0060, "RTDOSE")?;
     lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants")?;
-    // LO holds 64 characters; a byte slice would panic inside a multi-byte char.
-    let series_description: String = format!("{description} (research only)")
-        .chars()
-        .take(64)
-        .collect();
+    push_elem(&mut bytes, 0x0008, 0x0090, b"PN", &[])?;
+    // LO holds 64 characters — PS3.5 6.2 counts characters, not bytes, in a
+    // multi-byte charset, so a multibyte UTF-8 value may exceed 64 bytes and
+    // still be valid. The series description is our own text and truncates;
+    // the patient identifiers below may not.
+    let cap64 = |text: &str| -> String { text.chars().take(64).collect() };
+    let series_description = cap64(&format!("{description} (research only)"));
     lo(&mut bytes, 0x0008, 0x103E, &series_description)?;
-    // PN/LO cap at 64 characters - a malformed source CT must not write an
-    // overlong value into the export.
-    let patient_name: String = ct.patient_name.chars().take(64).collect();
-    let patient_id: String = ct.patient_id.chars().take(64).collect();
-    pn(&mut bytes, 0x0010, 0x0010, &patient_name)?;
-    lo(&mut bytes, 0x0010, 0x0020, &patient_id)?;
+    // The identifiers pair this dose with the source patient — silently
+    // shortening one corrupts the pairing while the study UID still matches,
+    // so an overlong value rejects the export instead.
+    if ct.patient_id.chars().count() > 64 {
+        return Err(format!(
+            "patient id is {} characters — DICOM LO holds 64",
+            ct.patient_id.chars().count()
+        ));
+    }
+    // PN allows three component groups separated by '=', each limited to 64
+    // characters.
+    for group in ct.patient_name.split('=') {
+        if group.chars().count() > 64 {
+            return Err(format!(
+                "patient name component group is {} characters — DICOM PN holds 64 per group",
+                group.chars().count()
+            ));
+        }
+    }
+    pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name)?;
+    lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id)?;
+    push_elem(&mut bytes, 0x0010, 0x0030, b"DA", &[])?;
+    push_elem(&mut bytes, 0x0010, 0x0040, b"CS", &[])?;
     ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]])?;
     lo(
         &mut bytes,
@@ -2106,16 +2456,33 @@ pub fn write_rtdose(
     )?;
     ui(&mut bytes, 0x0020, 0x000D, &ct.study_uid)?;
     ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    push_elem(&mut bytes, 0x0020, 0x0010, b"SH", &[])?;
+    push_elem(&mut bytes, 0x0020, 0x0011, b"IS", &[])?;
+    push_elem(&mut bytes, 0x0020, 0x0013, b"IS", &[])?;
     ds(&mut bytes, 0x0020, 0x0032, &ct.origin)?;
     ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
     ui(&mut bytes, 0x0020, 0x0052, &ct.frame)?;
+    push_elem(&mut bytes, 0x0020, 0x1040, b"LO", &[])?;
     // LT holds 10240 characters and forbids backslashes; the provenance
     // JSON carries UIDs and paths that can exceed both.
-    let comment: String = comment.chars().filter(|c| *c != '\\').take(10240).collect();
+    // LT forbids backslashes — swap rather than strip or JSON escapes and
+    // Windows paths lose their separators.
+    let comment: String = comment
+        .chars()
+        // LT permits only CR/LF/FF of the control bytes.
+        .filter(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\x0C'))
+        .take(10239)
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
     lt(&mut bytes, 0x0020, 0x4000, &comment)?;
     us(&mut bytes, 0x0028, 0x0002, 1)?;
     cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
-    is(&mut bytes, 0x0028, 0x0008, nz as i32)?;
+    is(
+        &mut bytes,
+        0x0028,
+        0x0008,
+        i32::try_from(nz).map_err(|_| "too many frames")?,
+    )?;
     at(&mut bytes, 0x0028, 0x0009, 0x3004, 0x000C)?;
     us(&mut bytes, 0x0028, 0x0010, ny as u16)?;
     us(&mut bytes, 0x0028, 0x0011, nx as u16)?;
@@ -2164,8 +2531,8 @@ pub fn write_rtdose(
         let mut item = Vec::new();
         ui(&mut item, 0x0008, 0x1150, RT_ION_PLAN_CLASS)?;
         ui(&mut item, 0x0008, 0x1155, plan_uid)?;
-        // Referenced RT Plan Sequence — (300C,0060) is the brachy
-        // application setup sequence, a different attribute entirely.
+        // Referenced RT Plan Sequence — not (300C,0060), which is
+        // Referenced Brachy Application Setup Sequence.
         sq(&mut bytes, 0x300C, 0x0002, &[item])?;
     }
     ow32(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
@@ -2641,6 +3008,77 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_dose_is_an_error_not_a_silent_floor() {
+        // Dose is a sum of non-negative contributions — flooring a negative
+        // would hide upstream corruption.
+        let dir = std::env::temp_dir().join(format!("scan-kit-negdose-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "1.2.3".into(),
+            origin: [0.0, 0.0, 0.0],
+            spacing: [1.0, 1.0, 1.0],
+            shape: [2, 2, 2],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            patient_id: "P1".into(),
+            patient_name: "A^B".into(),
+            study_uid: "1.2.3".into(),
+            series_uid: "1.2.3.1".into(),
+            sop_uids: vec!["1.2.3.1.1".into()],
+        };
+        let mut dose = vec![1.0f32; 8];
+        dose[3] = -0.5;
+        let err = write_rtdose(
+            &dir.join("dose.dcm"),
+            &dose,
+            &ct,
+            "9.8",
+            "FRACTION",
+            "PHYSICAL",
+            "t",
+            "{}",
+        )
+        .unwrap_err();
+        assert!(err.contains("negative"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_water_study_stamps_file_meta_and_a_control_point_index() {
+        let root = std::env::temp_dir().join(format!("scan-kit-wmeta-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write_water_study(&root).unwrap();
+        for name in ["ct0.dcm", "ct1.dcm", "plan.dcm", "struct.dcm", "dose.dcm"] {
+            let bytes = fs::read(root.join(name)).unwrap();
+            assert!(
+                crate::meta_sop_class(&bytes).is_some(),
+                "{name} missing meta"
+            );
+        }
+        let bytes = fs::read(root.join("plan.dcm")).unwrap();
+        assert_eq!(
+            crate::meta_sop_class(&bytes).as_deref(),
+            Some(RT_ION_PLAN_CLASS)
+        );
+        let elems = parse_file(&bytes).unwrap();
+        let beams = seq(&elems, tag(0x300A, 0x03A2));
+        let control = seq(&beams[0], tag(0x300A, 0x03A8));
+        assert!(!control.is_empty());
+        for item in control {
+            // Control Point Index is Type 1 on every item.
+            assert!(elem(item, tag(0x300A, 0x0112)).is_some());
+            let tags: Vec<u32> = item.iter().map(|entry| entry.tag).collect();
+            let mut sorted = tags.clone();
+            sorted.sort();
+            assert_eq!(tags, sorted, "control point tags out of order");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rtdose_round_trips_through_the_reader() {
         let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2716,7 +3154,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let ct = CtVolume {
-            frame: "f".into(),
+            frame: "1.2.3".into(),
             origin: [0.0; 3],
             spacing: [1.0; 3],
             shape: [1, 1, 1],
@@ -2730,8 +3168,9 @@ mod tests {
             series_uid: String::new(),
             sop_uids: Vec::new(),
         };
-        // "x" + 60 é's is 77 characters and puts a two-byte char across the
-        // old 64-byte cut.
+        // "x" + 60 é's is 61 characters before the provenance suffix; PS3.5
+        // 6.2 counts characters, not bytes, so 64 whole chars survive even
+        // though the é's are two bytes each.
         let description = format!("x{}", "é".repeat(60));
         let path = write_rtdose(
             &dir.join("dose.dcm"),
@@ -2746,7 +3185,9 @@ mod tests {
         .unwrap();
         let elems = parse_dataset(&fs::read(&path).unwrap()[132..]).unwrap();
         let written = text_tag(&elems, tag(0x0008, 0x103E));
+        assert!(written.chars().count() <= 64);
         assert_eq!(written.chars().count(), 64);
+        assert!(written.len() > 64);
         assert!(written.starts_with('x'));
         assert_eq!(int_tag(&elems, tag(0x0028, 0x0101)), Some(32));
         assert_eq!(int_tag(&elems, tag(0x0028, 0x0102)), Some(31));
@@ -2754,9 +3195,61 @@ mod tests {
     }
 
     #[test]
+    fn rtdose_preserves_a_multibyte_patient_id_and_rejects_an_overlong_one() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "1.2.3".into(),
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+            shape: [1, 1, 1],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            // 24 three-byte chars: 72 bytes, 24 characters — within the LO
+            // limit and must survive intact.
+            patient_id: "中".repeat(24),
+            patient_name: "^".into(),
+            study_uid: "1.2.3".into(),
+            series_uid: String::new(),
+            sop_uids: Vec::new(),
+        };
+        let path = write_rtdose(
+            &dir.join("dose.dcm"),
+            &[0.5],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "",
+            "",
+        )
+        .unwrap();
+        let elems = parse_dataset(&fs::read(&path).unwrap()[132..]).unwrap();
+        assert_eq!(text_tag(&elems, tag(0x0010, 0x0020)), "中".repeat(24));
+        assert_eq!(text_tag(&elems, tag(0x0010, 0x0010)), "^");
+        let mut overlong = ct.clone();
+        overlong.patient_id = "a".repeat(65);
+        assert!(write_rtdose(
+            &dir.join("over.dcm"),
+            &[0.5],
+            &overlong,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "",
+            ""
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rtdose_rejects_a_wrong_sized_dose() {
         let ct = CtVolume {
-            frame: "f".into(),
+            frame: "1.2.3".into(),
             origin: [0.0; 3],
             spacing: [1.0; 3],
             shape: [2, 2, 2],
@@ -2944,7 +3437,7 @@ mod tests {
         is(&mut beam, 0x300C, 0x006A, 1).unwrap();
         sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
         let mut plan = Vec::new();
-        sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x0070, std::slice::from_ref(&group)).unwrap();
         sq(&mut plan, 0x300A, 0x03A2, &[beam.clone()]).unwrap();
         sq(&mut plan, 0x300A, 0x0010, &[item, other.clone()]).unwrap();
         let elems = parse_dataset(&plan).unwrap();
@@ -2987,7 +3480,7 @@ mod tests {
         is(&mut beam, 0x300C, 0x006A, 1).unwrap();
         sq(&mut beam, 0x300A, 0x03A8, &[cp_with(0.0), cp_with(45.0)]).unwrap();
         let mut plan = Vec::new();
-        sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x0070, std::slice::from_ref(&group)).unwrap();
         sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
         assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").is_err());
         // Identical geometry across control points stays legal.
@@ -3281,11 +3774,10 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::NAN]).is_err());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::INFINITY]).is_err());
-        // 1e10 formats to 18 chars — over the 16-byte DS limit.
-        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10]).is_err());
-        // The limit is per component — one overlong element is not
-        // diluted by short siblings.
-        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10, 1.5]).is_err());
+        // 1e10 formats to 18 chars plain — but "1.000000e10" is a legal
+        // 11-char DS, so it encodes.
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10]).is_ok());
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10, 1.5]).is_ok());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5, 2.5]).is_ok());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5]).is_ok());
     }
@@ -3360,10 +3852,10 @@ mod tests {
         let mut value = vec![0xFE, 0xFF, 0x00, 0xE0];
         value.extend_from_slice(&100u32.to_le_bytes());
         value.extend_from_slice(&[0; 8]);
-        assert!(!looks_like_items(&value));
+        assert!(looks_like_items(&value).is_err());
         let mut value = vec![0xFE, 0xFF, 0x00, 0xE0];
         value.extend_from_slice(&0u32.to_le_bytes());
-        assert!(looks_like_items(&value));
+        assert_eq!(looks_like_items(&value), Ok(true));
     }
 
     #[test]
@@ -3527,5 +4019,134 @@ mod tests {
         bytes.extend_from_slice(&slope);
         ow(&mut bytes, 0x7FE0, 0x0010, &[0]).unwrap();
         assert!(image_slices(&parse_dataset(&bytes).unwrap(), 1.0).is_err());
+    }
+
+    fn uniform_beam_group() -> Vec<u8> {
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        group
+    }
+
+    #[test]
+    fn a_uniform_beam_shares_its_meterset_across_spots() {
+        // No Scan Spot Meterset Weights on a UNIFORM scan is not "every spot
+        // is zero" — the beam meterset divides evenly over the spot map.
+        let group = uniform_beam_group();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0, 2.0, -2.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        cs(&mut beam, 0x300A, 0x0308, "UNIFORM").unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let parsed = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").unwrap();
+        assert_eq!(parsed.beams[0].spots.len(), 2);
+        for spot in &parsed.beams[0].spots {
+            assert!((spot.mu - 5.0).abs() < 1e-4, "{}", spot.mu);
+        }
+    }
+
+    #[test]
+    fn a_beam_without_weights_or_scan_mode_is_an_error() {
+        // Scan Mode is Type 1C — absent with no weight map the loader cannot
+        // pick UNIFORM vs MODULATED and must refuse, not emit a zero beam.
+        let group = uniform_beam_group();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
+        for (mode, reason) in [("", "scan mode"), ("MODULATED", "weights")] {
+            let mut beam = Vec::new();
+            is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+            if !mode.is_empty() {
+                cs(&mut beam, 0x300A, 0x0308, mode).unwrap();
+            }
+            ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+            is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+            sq(&mut beam, 0x300A, 0x03A8, &[cp.clone()]).unwrap();
+            let mut plan = Vec::new();
+            sq(&mut plan, 0x300A, 0x0070, std::slice::from_ref(&group)).unwrap();
+            sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+            let message = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS")
+                .err()
+                .unwrap_or_default();
+            assert!(message.contains(reason), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_second_populated_fraction_group_is_rejected() {
+        // Metersets pool across groups and first-match wins — a second group
+        // with beam refs would misattribute dose silently.
+        let group = uniform_beam_group();
+        let mut second = Vec::new();
+        is(&mut second, 0x300A, 0x0078, 3).unwrap();
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 9).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[4.0]).unwrap();
+        sq(&mut second, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group, second]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let message = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS")
+            .err()
+            .unwrap_or_default();
+        assert!(message.contains("fraction group"), "{message}");
+    }
+
+    #[test]
+    fn spot_sizes_index_per_spot() {
+        // ScanningSpotSize is 2·n pairs in spot order — spot two must not
+        // inherit spot one's size.
+        let group = uniform_beam_group();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0, 2.0, -2.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0, 1.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0398, &[4.0, 4.0, 8.0, 8.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let parsed = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").unwrap();
+        assert!((parsed.beams[0].spots[0].spot_size_mm - 4.0).abs() < 1e-4);
+        assert!((parsed.beams[0].spots[1].spot_size_mm - 8.0).abs() < 1e-4);
     }
 }

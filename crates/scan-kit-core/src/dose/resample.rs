@@ -216,9 +216,14 @@ mod tests {
             &[1.0f32; 4],
             [0.0; 3],
             [1e-20; 3],
-            [usize::MAX, usize::MAX, 1],
-            [0.0; 3],
-            [1.0; 3],
+            // Passes the per-axis bounds check while nx*(y + ny*z)
+            // overflows usize — usize::MAX axes fail the bound before the
+            // index math ever runs, so they never exercise checked_mul.
+            // The dst sits entirely at z >= 2: every sample overflows the
+            // product (and a wrapping index would land back on index x).
+            [1 << 33, 1 << 33, 4],
+            [0.0, 0.0, 2e-20],
+            [1e-20; 3],
             [2, 2, 2],
         );
         assert_eq!(out.len(), 8);

@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
@@ -108,6 +109,7 @@ fn meta_id(meta: &str) -> String {
         .unwrap_or("")
         .chars()
         .filter(|ch| !ch.is_control())
+        .take(64)
         .collect::<String>()
         .trim()
         .to_owned()
@@ -115,6 +117,19 @@ fn meta_id(meta: &str) -> String {
 
 /// Read the current session id from the RCI's timeslice table metadata.
 /// `None` when the device has never run a session.
+/// `live_session_id` on a bounded deadline — for the status poll, where an
+/// unresponsive file server must not freeze the health check behind it.
+pub fn live_session_id_timed(host: &str, timeout: Duration) -> Option<String> {
+    runner::http_json_timed(
+        host,
+        "rci/control_point_table/timeslice_table/file_header_meta",
+        timeout,
+    )
+    .and_then(|value| value.as_str().map(str::to_owned))
+    .map(|meta| meta_id(&meta))
+    .filter(|id| !id.is_empty())
+}
+
 pub fn live_session_id(host: &str) -> Option<String> {
     table_io(host, "rci", "timeslice_table", "file_header_meta")
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -174,6 +189,40 @@ fn devices(
             warnings.push(format!("{client} has no device address — skipped"));
             continue;
         }
+        // The device map is remote-supplied: its host drives real fetches
+        // and its path lands in the request line. An IP literal only, and
+        // no .. or query steering — a hostile map must not proxy internal
+        // reads into the session zip.
+        let host_ip = host
+            .trim()
+            .rsplit_once(':')
+            .map(|(head, _)| head)
+            .unwrap_or_else(|| host.trim());
+        // A literal still permits steering reads at hosts that can never
+        // be a device file server: link-local (the 169.254.169.254-style
+        // metadata endpoint), unspecified, or multicast. Loopback is left
+        // alone — co-located device software serves from it legitimately.
+        let steering = host_ip
+            .parse::<std::net::IpAddr>()
+            .map(|ip| {
+                ip.is_unspecified()
+                    || ip.is_multicast()
+                    || match ip {
+                        std::net::IpAddr::V4(ip) => ip.is_link_local(),
+                        std::net::IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
+                    }
+            })
+            .unwrap_or(true);
+        if steering
+            || io_root.split('/').any(|seg| seg == "..")
+            || io_root.contains(['?', '#'])
+            || io_root.contains('%')
+        {
+            warnings.push(format!(
+                "{client} has an untrusted device address — skipped"
+            ));
+            continue;
+        }
         // The name lands in capture file paths (x_spot_data.csv, x.log, the
         // nozzle folder) — a device client key is untrusted text, so keep it
         // to filename characters only.
@@ -190,11 +239,22 @@ fn devices(
             ));
             continue;
         }
+        // config_target is fetched from the RCI itself — a poisoned
+        // target just loses that one file, not the whole device.
+        let config_target = field("configuration_upload/target");
+        let config_target = if config_target.split('/').any(|seg| seg == "..")
+            || config_target.contains(['?', '#'])
+            || config_target.contains('%')
+        {
+            String::new()
+        } else {
+            config_target
+        };
         out.push(CaptureDevice {
             name,
             io_root,
             host,
-            config_target: field("configuration_upload/target"),
+            config_target,
         });
     }
     Ok(out)
@@ -241,6 +301,7 @@ fn client_name(client: &str) -> String {
         .to_ascii_uppercase()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .take(64)
         .collect();
     // A bare DOS device stem (`CON.log`, `NUL_spot_data.csv`) fails every
     // write on Windows — the charset filter alone lets it through.
@@ -259,21 +320,26 @@ fn table_io(host: &str, io_root: &str, table: &str, io: &str) -> Option<Value> {
     )
 }
 
-/// Fetch one table as CSV and parse it. Missing or empty tables are `None`.
-fn fetch_sheet(host: &str, io_root: &str, table: &str) -> Option<Sheet> {
+/// Fetch one table as CSV and parse it. Missing/empty tables are `Ok(None)`;
+/// a transport or URL failure is `Err` so callers can say "could not fetch"
+/// instead of reporting data as absent.
+fn fetch_sheet(host: &str, io_root: &str, table: &str) -> Result<Option<Sheet>, String> {
     let url = io_url(
         host,
         &format!("{io_root}/control_point_table/{table}"),
         "data.csv",
-    )
-    .ok()?;
-    let bytes = runner::http(&url, "GET", None).ok()?;
-    parse_sheet(&bytes)
+    )?;
+    let bytes = runner::http(&url, "GET", None)?;
+    Ok(parse_sheet(&bytes))
 }
 
 fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
-    let header = reader
+    // Banner lines strip manually — a `#`-first data row or header is real
+    // content, not a comment (see columns::strip_csv_banner).
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(crate::columns::strip_csv_banner(bytes));
+    let header: Vec<String> = reader
         .headers()
         .ok()?
         .iter()
@@ -292,18 +358,26 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
     let mut rows = Vec::new();
     // A close-delimited reply has no length to check - a body that does not
     // end in a newline was cut mid-record even though the parse is clean.
-    let mut truncated = !bytes.is_empty() && bytes.last() != Some(&10);
+    let mut truncated = !bytes.is_empty() && !matches!(bytes.last(), Some(&10) | Some(&13));
     for record in reader.records() {
         let Ok(record) = record else {
             truncated = true;
             break;
         };
-        rows.push(
-            record
+        let cells = record
+            .iter()
+            .map(|cell| cell.trim().to_owned())
+            .collect::<Vec<_>>();
+        // A repeated header line is a banner, not a data row — keeping it
+        // keys phantom "layer_id"/"spot_no" rows in every downstream join.
+        let repeated = cells.len() == header.len()
+            && cells
                 .iter()
-                .map(|cell| cell.trim().to_owned())
-                .collect::<Vec<_>>(),
-        );
+                .zip(header.iter())
+                .all(|(cell, name)| cell.eq_ignore_ascii_case(name));
+        if !repeated {
+            rows.push(cells);
+        }
     }
     if rows.is_empty() {
         None
@@ -343,12 +417,21 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
             .get(row)
             .and_then(|cells| cells.get(column))
             .map(String::as_str);
-        let id = if row < sheet.rows.len() && cell.is_none_or(|id| clean(id).is_empty()) {
+        let id = if row < sheet.rows.len()
+            && cell.is_none_or(|id| {
+                // A repeated literal header line mid-file is not a layer —
+                // inherit the open run like a ragged cell.
+                let id = clean(id);
+                id.is_empty() || id.eq_ignore_ascii_case("layer_id")
+            }) {
             prev_eff.clone()
         } else {
             cell.map(|id| join_key(clean(id)))
         };
-        if row > 0 && (row == sheet.rows.len() || id != prev_eff) {
+        if row > 0
+            && (row == sheet.rows.len() || id != prev_eff)
+            && (prev_eff.is_some() || row == sheet.rows.len())
+        {
             // A leading ragged run has no previous id — it belongs to the
             // layer that opens it, not a phantom "" layer.
             let prev_id = prev_eff.clone().or_else(|| id.clone()).unwrap_or_default();
@@ -381,7 +464,12 @@ fn csv_text(sheet: &Sheet) -> String {
     let mut out = join_cells(sheet.header.iter().map(String::as_str));
     out.push('\n');
     for row in &sheet.rows {
-        out.push_str(&join_cells(row.iter().map(|cell| clean(cell))));
+        // Pad/truncate to the header width — parse_sheet keeps ragged rows
+        // and writing them back verbatim misaligns every strict reader.
+        let cells = (0..sheet.header.len())
+            .map(|index| clean(row.get(index).map(String::as_str).unwrap_or("")))
+            .collect::<Vec<_>>();
+        out.push_str(&join_cells(cells.iter().copied()));
         out.push('\n');
     }
     out
@@ -472,7 +560,7 @@ pub fn capture(
     let mut slices: Vec<(&CaptureDevice, Sheet)> = Vec::new();
     for device in &devices {
         match fetch_sheet(&device.host, &device.io_root, "table") {
-            Some(sheet) => {
+            Ok(Some(sheet)) => {
                 if sheet.truncated {
                     warnings.push(format!(
                         "{}: control-point table truncated mid-file",
@@ -481,11 +569,15 @@ pub fn capture(
                 }
                 spots.push((device, sheet));
             }
-            None => warnings.push(format!("{}: no control-point table", device.name)),
+            Ok(None) => warnings.push(format!("{}: no control-point table", device.name)),
+            Err(err) => warnings.push(format!(
+                "{}: could not fetch the control-point table: {err}",
+                device.name
+            )),
         }
         tick(count, keep)?;
         match fetch_sheet(&device.host, &device.io_root, "timeslice_table") {
-            Some(sheet) => {
+            Ok(Some(sheet)) => {
                 if sheet.truncated {
                     warnings.push(format!(
                         "{}: timeslice table truncated mid-file",
@@ -494,7 +586,11 @@ pub fn capture(
                 }
                 slices.push((device, sheet));
             }
-            None => warnings.push(format!("{}: no timeslice table", device.name)),
+            Ok(None) => warnings.push(format!("{}: no timeslice table", device.name)),
+            Err(err) => warnings.push(format!(
+                "{}: could not fetch the timeslice table: {err}",
+                device.name
+            )),
         }
         tick(count, keep)?;
     }
@@ -523,6 +619,13 @@ pub fn capture(
     > = BTreeMap::new();
     let mut layer_of: HashMap<String, usize> = HashMap::new();
     for (device, sheet) in &spots {
+        if sheet.column("layer_id").is_none() {
+            warnings.push(format!(
+                "{}'s spot table has no layer_id column — skipped",
+                device.name
+            ));
+            continue;
+        }
         for block in blocks(sheet, &mut layer_of) {
             hits.entry((block.layer, block.run))
                 .or_default()
@@ -531,6 +634,13 @@ pub fn capture(
         }
     }
     for (device, sheet) in &slices {
+        if sheet.column("layer_id").is_none() {
+            warnings.push(format!(
+                "{}'s timeslice table has no layer_id column — skipped",
+                device.name
+            ));
+            continue;
+        }
         for block in blocks(sheet, &mut layer_of) {
             hits.entry((block.layer, block.run))
                 .or_default()
@@ -560,7 +670,7 @@ pub fn capture(
         tick(count, keep)?;
     }
 
-    if let Some(text) = join_spot_data(&spots) {
+    if let Some(text) = join_spot_data(&spots, &mut warnings) {
         write_text(&dir.join("spot_data.csv"), &text)?;
         count += 1;
         tick(count, keep)?;
@@ -582,7 +692,7 @@ pub fn capture(
                 .last()
                 .and_then(|row| row.get(c))
                 .map(|cell| join_key(clean(cell)))
-                .filter(|cell| !cell.is_empty())
+                .filter(|cell| !cell.is_empty() && cell != "layer_id")
         })
         .unwrap_or_else(|| "0".into());
     let state = match status
@@ -609,7 +719,7 @@ pub fn capture(
     count += 1;
     count += write_termination(dir, &session_id, status, &spots, &slices)?;
     count += write_session_meta(dir, &session_id, status, &devices)?;
-    count += fetch_aux(rci_host, &devices, dir, keep)?;
+    count += fetch_aux(rci_host, &devices, dir, &mut warnings, keep)?;
     // The aux phase runs ~13 GETs per device after the last recheck - the
     // logs it lands are the worst mixed-session artifact.
     let mut scratch = Vec::new();
@@ -702,8 +812,8 @@ fn join_timeslices(
 ) -> Option<String> {
     struct Part {
         header: Vec<String>,
-        rows: HashMap<String, Vec<String>>,
-        order: Vec<String>,
+        rows: HashMap<(String, String, String), Vec<String>>,
+        order: Vec<(String, String, String)>,
     }
     let mut parts_out: Vec<(String, Part)> = Vec::new();
     for (device, sheet) in parts {
@@ -723,6 +833,8 @@ fn join_timeslices(
         let keep: Vec<usize> = (0..sheet.header.len())
             .filter(|index| !META.contains(&base_name(&sheet.header[*index])))
             .collect();
+        let spot_i = sheet.column("spot_no");
+        let layer_i = sheet.column("layer_id");
         let mut part = Part {
             header: meta_cols
                 .iter()
@@ -732,16 +844,71 @@ fn join_timeslices(
             rows: HashMap::new(),
             order: Vec::new(),
         };
+        // Two source headers can emit the same name (a stripped "(unit)"
+        // suffix or the r_ rewrite) — name readers bind the first, so
+        // suffix the collision like spot_columns does.
+        let mut taken = std::collections::HashSet::new();
+        for name in &mut part.header {
+            if taken.insert(name.clone()) {
+                continue;
+            }
+            let base = name.clone();
+            let mut suffix = 2;
+            while !taken.insert(format!("{base}_{suffix}")) {
+                suffix += 1;
+            }
+            *name = format!("{base}_{suffix}");
+        }
+        // Ragged meta cells inherit the running value like blocks() and
+        // join_spot_data() — an empty layer or spot cell must not file the
+        // row under "" and split it from its siblings.
+        let mut eff_layer = sheet
+            .rows
+            .iter()
+            .find_map(|row| {
+                layer_i.and_then(|i| row.get(i)).and_then(|cell| {
+                    let raw = clean(cell);
+                    (!raw.is_empty() && !raw.eq_ignore_ascii_case("layer_id"))
+                        .then(|| raw.to_owned())
+                })
+            })
+            .unwrap_or_default();
+        let mut eff_spot = sheet
+            .rows
+            .iter()
+            .find_map(|row| {
+                spot_i.and_then(|i| row.get(i)).and_then(|cell| {
+                    let raw = clean(cell);
+                    (!raw.is_empty() && !raw.eq_ignore_ascii_case("spot_no"))
+                        .then(|| raw.to_owned())
+                })
+            })
+            .unwrap_or_default();
         for row in &sheet.rows {
             let Some(raw) = row.get(ts_i) else { continue };
             let key = clean(raw);
-            if key.is_empty() {
+            if key.is_empty() || key.eq_ignore_ascii_case("timeslicenumber") {
                 continue;
             }
-            let key = join_key(key);
-            // Keyed on the timeslice number alone: unlike spot keys, a
-            // timeslice number is a per-delivery counter, so re-delivery
-            // means the device is replacing that slice, not repeating one.
+            // Key on (layer, spot, timeslice): a counter scoped narrower
+            // than the whole delivery — per spot or per layer — would
+            // overwrite earlier rows under a timesliceNumber-only key.
+            // Missing meta columns degrade to the old single key.
+            let raw_layer = layer_i
+                .and_then(|i| row.get(i))
+                .map(|cell| clean(cell))
+                .unwrap_or_default();
+            if !raw_layer.is_empty() && !raw_layer.eq_ignore_ascii_case("layer_id") {
+                eff_layer = raw_layer.to_owned();
+            }
+            let raw_spot = spot_i
+                .and_then(|i| row.get(i))
+                .map(|cell| clean(cell))
+                .unwrap_or_default();
+            if !raw_spot.is_empty() && !raw_spot.eq_ignore_ascii_case("spot_no") {
+                eff_spot = raw_spot.to_owned();
+            }
+            let key = (join_key(&eff_layer), join_key(&eff_spot), join_key(key));
             if !part.rows.contains_key(&key) {
                 part.order.push(key.clone());
             }
@@ -769,12 +936,65 @@ fn join_timeslices(
         return None;
     }
     parts_out.sort_by(|a, b| a.0.cmp(&b.0));
-    let parts: Vec<Part> = parts_out.into_iter().map(|(_, part)| part).collect();
+    let mut parts: Vec<Part> = parts_out.into_iter().map(|(_, part)| part).collect();
+
+    // A device that records no layer/spot metadata still measures the same
+    // delivery — its rows belong to whatever layer/spot the other devices
+    // recorded at that timeslice. Keying them ("", "", ts) separates them
+    // from their siblings, so re-key them by the unambiguous
+    // timeslice → (layer, spot) mapping the recording devices establish.
+    let mut infer: HashMap<String, (String, String)> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for part in &parts {
+        for key in &part.order {
+            if key.0.is_empty() && key.1.is_empty() {
+                continue;
+            }
+            let meta = (key.0.clone(), key.1.clone());
+            match infer.get(&key.2) {
+                Some(existing) if *existing != meta => {
+                    ambiguous.insert(key.2.clone());
+                }
+                None => {
+                    infer.insert(key.2.clone(), meta);
+                }
+                _ => {}
+            }
+        }
+    }
+    for ts in &ambiguous {
+        infer.remove(ts);
+    }
+    if !infer.is_empty() {
+        for part in &mut parts {
+            if !part
+                .order
+                .iter()
+                .all(|key| key.0.is_empty() && key.1.is_empty())
+            {
+                continue;
+            }
+            let order = std::mem::take(&mut part.order);
+            for key in order {
+                let Some(row) = part.rows.remove(&key) else {
+                    continue;
+                };
+                let key = match infer.get(&key.2) {
+                    Some((layer, spot)) => (layer.clone(), spot.clone(), key.2.clone()),
+                    None => key,
+                };
+                if !part.rows.contains_key(&key) {
+                    part.order.push(key.clone());
+                }
+                part.rows.insert(key, row);
+            }
+        }
+    }
 
     // Timeslice keys joined on numeric value; a row missing in one device
     // leaves that block empty.
-    let mut keys: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut keys: Vec<(String, String, String)> = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     for part in &parts {
         for key in &part.order {
             if seen.insert(key.clone()) {
@@ -782,19 +1002,19 @@ fn join_timeslices(
             }
         }
     }
+    // Numeric first, then lexicographic, per key component — the old
+    // mixed-compare path was not a strict weak order (3 < 10 < "2x" < 3)
+    // and total_cmp keeps NaN/inf text keys ordered deterministically.
+    let cell_cmp = |a: &str, b: &str| match (a.parse::<f64>().ok(), b.parse::<f64>().ok()) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    };
     keys.sort_by(|a, b| {
-        // Numeric keys first, then lexicographic - the old mixed-compare
-        // path was not a strict weak order (3 < 10 < "2x" < 3) and sort_by
-        // may panic on it.
-        match (a.parse::<f64>().ok(), b.parse::<f64>().ok()) {
-            // total_cmp, not partial_cmp: join_key keeps "nan"/"inf" text
-            // raw and f64::parse accepts it - partial_cmp made NaN Equal to
-            // every key, which is not a strict weak order either.
-            (Some(x), Some(y)) => x.total_cmp(&y),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.cmp(b),
-        }
+        cell_cmp(&a.0, &b.0)
+            .then_with(|| cell_cmp(&a.1, &b.1))
+            .then_with(|| cell_cmp(&a.2, &b.2))
     });
 
     let mut header = Vec::new();
@@ -861,7 +1081,7 @@ fn quoted(cell: &str) -> String {
 /// `(layer_id, spot_no)` in RCI spot order — G3 block layout with repeated meta
 /// columns, renamed measured columns, `_state` separators and `datetime`,
 /// `state` trailers.
-fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
+fn join_spot_data(spots: &[(&CaptureDevice, Sheet)], warnings: &mut Vec<String>) -> Option<String> {
     struct Part {
         dest: Vec<String>,
         rows: BTreeMap<(String, String, usize), Vec<String>>,
@@ -872,9 +1092,14 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
     let mut states: HashMap<(String, String, usize), String> = HashMap::new();
     for (device, sheet) in spots {
         let Some(spot_i) = sheet.column("spot_no") else {
+            warnings.push(format!("{}: spot table has no spot_no column", device.name));
             continue;
         };
         let Some(layer_i) = sheet.column("layer_id") else {
+            warnings.push(format!(
+                "{}: spot table has no layer_id column",
+                device.name
+            ));
             continue;
         };
         let state_i = sheet.column("state");
@@ -895,7 +1120,7 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
             .iter()
             .find_map(|row| {
                 let raw = clean(row.get(layer_i).map(String::as_str).unwrap_or_default());
-                if raw.is_empty() {
+                if raw.is_empty() || raw.eq_ignore_ascii_case("layer_id") {
                     None
                 } else {
                     Some(raw.to_owned())
@@ -906,16 +1131,15 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
             // A ragged layer cell inherits the running layer like blocks()
             // does - foldering and joining must agree on the same layer.
             let raw_layer = clean(row.get(layer_i).map(String::as_str).unwrap_or_default());
-            if !raw_layer.is_empty() {
+            if !raw_layer.is_empty() && !raw_layer.eq_ignore_ascii_case("layer_id") {
                 eff_layer = raw_layer.to_owned();
             }
             let layer = join_key(&eff_layer);
-            let spot = join_key(clean(
-                row.get(spot_i).map(String::as_str).unwrap_or_default(),
-            ));
-            if spot.is_empty() {
+            let raw_spot = clean(row.get(spot_i).map(String::as_str).unwrap_or_default());
+            if raw_spot.is_empty() || raw_spot.eq_ignore_ascii_case("spot_no") {
                 continue;
             }
+            let spot = join_key(raw_spot);
             let base = (layer.clone(), spot.clone());
             let n = occurrences.entry(base).or_insert(0);
             let key = (layer, spot, *n);
@@ -1052,10 +1276,14 @@ fn spot_columns(device: &CaptureDevice, sheet: &Sheet) -> (Vec<String>, Vec<Stri
             if meta.contains(&base_name(name)) {
                 continue;
             }
-            pairs.push((
-                format!("{}_raw", dest_name(name)),
-                base_name(name).to_owned(),
-            ));
+            let base = dest_name(name);
+            let mut dest = format!("{base}_raw");
+            let mut suffix = 2;
+            while pairs.iter().any(|(taken, _)| *taken == dest) {
+                dest = format!("{base}_raw_{suffix}");
+                suffix += 1;
+            }
+            pairs.push((dest, base_name(name).to_owned()));
         }
     }
     (
@@ -1230,6 +1458,7 @@ fn column_values(sheet: &Sheet, name: &str) -> Vec<f64> {
                 .rows
                 .iter()
                 .filter_map(|row| row.get(index)?.trim().parse().ok())
+                .filter(|value: &f64| value.is_finite())
                 .collect()
         })
         .unwrap_or_default()
@@ -1248,6 +1477,7 @@ fn column_icase(sheet: &Sheet, name: &str) -> Vec<f64> {
                 .rows
                 .iter()
                 .filter_map(|row| row.get(i)?.trim().parse().ok())
+                .filter(|value: &f64| value.is_finite())
                 .collect()
         })
         .unwrap_or_default()
@@ -1272,7 +1502,11 @@ fn write_termination(
     let last_dose = |ic: &str| -> Option<String> {
         let sheet = ic_sheet(ic)?;
         let index = sheet.column("total_dose")?;
-        let dose: f64 = sheet.rows.last()?.get(index)?.trim().parse().ok()?;
+        let dose: f64 = sheet
+            .rows
+            .iter()
+            .rev()
+            .find_map(|row| row.get(index)?.trim().parse().ok())?;
         // Summary convention is measured units — "Total dose target" below
         // scales its C targets INTO nC to sit beside this raw nC total.
         Some(num_text(dose))
@@ -1301,8 +1535,8 @@ fn write_termination(
     let elapsed_s = status
         .get(TIME_ELAPSED)
         .and_then(io_number)
-        .or(span_s)
-        .filter(|seconds| *seconds > 0.0);
+        .filter(|seconds| *seconds > 0.0)
+        .or(span_s);
 
     // Beam-on: the ms of the timeslice clock where commanded beam current
     // (`c_beamI`) is nonzero.
@@ -1340,10 +1574,18 @@ fn write_termination(
         .or_else(|| {
             let sheet = ["ic3", "ic1", "ic2"].iter().find_map(|ic| ic_sheet(ic))?;
             let ic = ic_prefix(sheet)?;
-            let measured: Vec<f32> = column_values(sheet, "point_dose")
+            // Same preference spot_columns uses — a sheet carrying only
+            // total_dose would scale targets by an empty set (1.0).
+            let measured: Vec<f32> = ["point_dose", "total_dose"]
                 .iter()
-                .map(|v| *v as f32)
-                .collect();
+                .find_map(|name| {
+                    let values: Vec<f32> = column_values(sheet, name)
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect();
+                    (!values.is_empty()).then_some(values)
+                })
+                .unwrap_or_default();
             let targets: Vec<f32> = column_values(sheet, &format!("{ic}_dose_target"))
                 .iter()
                 .map(|v| *v as f32)
@@ -1364,8 +1606,14 @@ fn write_termination(
                     .iter()
                     .filter_map(|row| row.get(index))
                     // join_key normalizes "1"/"1.0"/"01" — counting raw
-                    // spellings reports phantom extra layers.
-                    .map(|cell| join_key(cell))
+                    // spellings reports phantom extra layers. Empty/"null"
+                    // cells mean "inherit" everywhere else; counting them
+                    // adds a phantom layer too.
+                    .filter_map(|cell| {
+                        let cell = clean(cell);
+                        (!cell.is_empty() && !cell.eq_ignore_ascii_case("layer_id"))
+                            .then(|| join_key(cell))
+                    })
                     .collect::<HashSet<_>>()
                     .len()
             })
@@ -1381,7 +1629,9 @@ fn write_termination(
     let planned_spots = status
         .get(CONTROL_POINT_COUNT)
         .and_then(io_number)
-        .filter(|count| count.is_finite() && *count >= 0.0 && count.fract() == 0.0)
+        // 1e20 as usize saturates — a nonsense count must not print a
+        // 19-digit "planned" total in the summary.
+        .filter(|count| count.is_finite() && *count >= 0.0 && count.fract() == 0.0 && *count <= 1e6)
         .map(|count| count as usize)
         .or_else(|| input_map.as_ref().map(|sheet| sheet.rows.len()))
         .filter(|count| *count > 0);
@@ -1421,10 +1671,12 @@ fn write_termination(
         },
         chrono::Local::now().format("%a %b %e %T %Y"),
     );
+    // These are raw nC readings, not MU — a "total dose" label would be
+    // parsed as MU by the summary reader and displayed as ~1e8 MU.
     for (label, ic) in [
-        ("Primary total dose", "ic3"),
-        ("Secondary total dose", "ic1"),
-        ("Tertiary total dose", "ic2"),
+        ("Primary total charge (nC)", "ic3"),
+        ("Secondary total charge (nC)", "ic1"),
+        ("Tertiary total charge (nC)", "ic2"),
     ] {
         if let Some(dose) = last_dose(ic) {
             // Device text lands raw in this file — a newline would forge a
@@ -1484,11 +1736,25 @@ fn write_termination(
     Ok(2)
 }
 
+/// One aux-file GET — a failed fetch must surface in the report's
+/// warnings, not silently drop the file from the capture.
+fn get_file(url: &str, what: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
+    match runner::http(url, "GET", None) {
+        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+        Ok(_) => None,
+        Err(err) => {
+            warnings.push(format!("{what}: {err}"));
+            None
+        }
+    }
+}
+
 /// Auxiliary per-device files — each is one HTTP GET; misses are skipped.
 fn fetch_aux(
     rci_host: &str,
     devices: &[CaptureDevice],
     dir: &Path,
+    warnings: &mut Vec<String>,
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<usize, String> {
     let mut count = 0;
@@ -1501,81 +1767,92 @@ fn fetch_aux(
             tick(count, keep)?;
             let remote = format!("/root/config/{file}");
             if let Ok(url) = device_file_url(&device.host, &remote) {
-                if let Ok(bytes) = runner::http(&url, "GET", None) {
-                    if !bytes.is_empty() {
-                        write_bytes(&nozzle.join(file), &bytes)?;
-                        count += 1;
-                    }
+                if let Some(bytes) = get_file(&url, &format!("{}: {file}", device.name), warnings) {
+                    write_bytes(&nozzle.join(file), &bytes)?;
+                    count += 1;
                 }
             }
         }
         tick(count, keep)?;
         if let Ok(url) = device_file_url(&device.host, "/root/config/calibration.json") {
-            if let Ok(bytes) = runner::http(&url, "GET", None) {
-                if !bytes.is_empty() {
-                    write_bytes(
-                        &dir.join("calibration")
-                            .join("devices_calibration")
-                            .join(format!("{}_calibration.json", device.name)),
-                        &bytes,
-                    )?;
-                    count += 1;
-                }
+            if let Some(bytes) = get_file(
+                &url,
+                &format!("{}: calibration.json", device.name),
+                warnings,
+            ) {
+                write_bytes(
+                    &dir.join("calibration")
+                        .join("devices_calibration")
+                        .join(format!("{}_calibration.json", device.name)),
+                    &bytes,
+                )?;
+                count += 1;
             }
         }
         tick(count, keep)?;
         if let Ok(url) = io_url(&device.host, "log", "data.txt") {
-            if let Ok(bytes) = runner::http(&url, "GET", None) {
-                if !bytes.is_empty() {
-                    if device.name == "RCI" {
-                        write_bytes(&dir.join("SessionLogFile.log"), &bytes)?;
-                        count += 1;
-                    }
-                    write_bytes(
-                        &dir.join("log").join(format!("{}.log", device.name)),
-                        &bytes,
-                    )?;
+            if let Some(bytes) = get_file(&url, &format!("{}: data.txt", device.name), warnings) {
+                if device.name == "RCI" {
+                    write_bytes(&dir.join("SessionLogFile.log"), &bytes)?;
                     count += 1;
                 }
+                write_bytes(
+                    &dir.join("log").join(format!("{}.log", device.name)),
+                    &bytes,
+                )?;
+                count += 1;
             }
         }
         // Channel-map XMLs live on the RCI under /root/config/control/.
         if !device.config_target.is_empty() {
             tick(count, keep)?;
             if let Ok(url) = device_file_url(rci_host, &device.config_target) {
-                if let Ok(bytes) = runner::http(&url, "GET", None) {
-                    if !bytes.is_empty() {
-                        let base = PathBuf::from(&device.config_target)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .filter(|name| *name != "." && *name != "..")
-                            .unwrap_or(&device.name)
-                            .to_owned();
-                        // Remote-supplied text becomes a filename - screen
-                        // DOS device stems like client_name does or every
-                        // write fails on Windows.
-                        let base = if dos_reserved(&base) {
-                            format!("_{base}")
-                        } else {
-                            base
-                        };
-                        // The target filesystem is case-insensitive - key the
-                        // dedup on the lowercase form or MAP.XML replaces
-                        // map.xml while count still credits both writes.
-                        let name = if dcs_names.insert(base.to_lowercase()) {
-                            base
-                        } else {
-                            let mut name = format!("{}_{base}", device.name);
-                            let mut n = 2;
-                            while !dcs_names.insert(name.to_lowercase()) {
-                                name = format!("{}_{n}_{base}", device.name);
-                                n += 1;
-                            }
-                            name
-                        };
-                        write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
-                        count += 1;
-                    }
+                if let Some(bytes) = get_file(
+                    &url,
+                    &format!("{}: {}", device.name, device.config_target),
+                    warnings,
+                ) {
+                    let base = PathBuf::from(&device.config_target)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|name| *name != "." && *name != "..")
+                        .unwrap_or(&device.name)
+                        .to_owned();
+                    // Remote-supplied text becomes a filename — same
+                    // whitelist as client_name or characters Windows
+                    // rejects (and a trailing "."/" ") sink the whole
+                    // capture at write_bytes.
+                    let base: String = base
+                        .chars()
+                        .filter(|ch| {
+                            ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == '.'
+                        })
+                        .take(64)
+                        .collect();
+                    // Windows strips a trailing dot on create — the file
+                    // would land as _foo while the dedup tracked _foo.
+                    let base = base.trim_end_matches('.');
+                    let base = if base.is_empty() || dos_reserved(base) {
+                        format!("_{base}")
+                    } else {
+                        base.to_owned()
+                    };
+                    // The target filesystem is case-insensitive - key the
+                    // dedup on the lowercase form or MAP.XML replaces
+                    // map.xml while count still credits both writes.
+                    let name = if dcs_names.insert(base.to_lowercase()) {
+                        base
+                    } else {
+                        let mut name = format!("{}_{base}", device.name);
+                        let mut n = 2;
+                        while !dcs_names.insert(name.to_lowercase()) {
+                            name = format!("{}_{n}_{base}", device.name);
+                            n += 1;
+                        }
+                        name
+                    };
+                    write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
+                    count += 1;
                 }
             }
         }
@@ -1637,16 +1914,26 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
         let dose_line = text
             .lines()
-            .find(|line| line.starts_with("Secondary total dose"))
+            .find(|line| line.starts_with("Secondary total charge"))
             .unwrap_or("");
         let target_line = text
             .lines()
             .find(|line| line.starts_with("Total dose target"))
             .unwrap_or("");
         // Both in nC: the raw 2.0e8 total and 0.3 C of targets x 1e9.
-        assert!(dose_line.contains("200000000"), "dose line: {dose_line}");
+        let parsed = |line: &str, label: &str| -> f64 {
+            line.strip_prefix(label)
+                .and_then(|tail| tail.parse::<f64>().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let dose = parsed(dose_line, "Secondary total charge (nC): ");
         assert!(
-            target_line.contains("3000000"),
+            (dose - 2.0e8).abs() <= dose.abs() * 0.001,
+            "dose line: {dose_line}"
+        );
+        let target = parsed(target_line, "Total dose target: ");
+        assert!(
+            (target - 3.0e8).abs() <= target.abs() * 0.001,
             "target line: {target_line}"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1777,6 +2064,27 @@ mod tests {
     }
 
     #[test]
+    fn timeslices_join_when_only_one_device_records_layer_and_spot() {
+        // The IX256 has no layer/spot columns but measures the same delivery —
+        // its rows belong to the layer/spot the RCI recorded at that
+        // timeslice, not a bare key that splits them apart.
+        let rci = sheet(
+            "spot_no,layer_id,timesliceNumber,timestamp(ms),r_beamOk\n1,0,1,10,true\n1,0,2,20,false\n",
+        );
+        let ic = sheet(
+            "timesliceNumber,timestamp(ms),ic1_total_dose_spot(nC),r_ic1_x(ch)\n1,10,3.5,64.5\n2,20,4.0,62\n",
+        );
+        let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
+        let text = join_timeslices(&refs(&parts), &mut Vec::new()).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        // Two joined rows, not four separated ones: the IC block joins the
+        // RCI row sharing its timeslice number.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "1,10,3.5,64.5,0,1,0,1,10,1,0");
+        assert_eq!(rows[1], "2,20,4.0,62,0,1,0,2,20,0,0");
+    }
+
+    #[test]
     fn spot_data_join_maps_measured_columns_to_raw_names() {
         let rci = sheet(
             "spot_no,layer_id,timeslice_number,timeslice_timestamp(ms),beam_current_command\n1,0,1,10,9\n2,0,2,20,8\n",
@@ -1792,7 +2100,7 @@ mod tests {
             (device("IX256_1"), ic),
             (device("TX2"), tx2),
         ];
-        let text = join_spot_data(&refs(&parts)).unwrap();
+        let text = join_spot_data(&refs(&parts), &mut Vec::new()).unwrap();
         let mut lines = text.lines();
         let header = lines.next().unwrap();
         assert!(header.contains("c_current_rci"));
@@ -1900,7 +2208,10 @@ mod tests {
         let summary = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
         assert!(summary.contains("Layer delivery: 1/1"), "{summary}");
         assert!(summary.contains("Spot delivery: 2/1"), "{summary}");
-        assert!(summary.contains("Secondary total dose: 7"), "{summary}");
+        assert!(
+            summary.contains("Secondary total charge (nC): 7"),
+            "{summary}"
+        );
         assert!(
             summary.contains("Energy min: 70\nEnergy max: 70"),
             "{summary}"
@@ -1996,7 +2307,7 @@ mod tests {
             "spot_no,layer_id,timeslice_number,timeslice_timestamp(ms),point_time(ms),point_dose(nC),total_dose(nC),ic1_dose_target,ic1_position_measured_b,ic1_position_measured_a,ic1_sigma_measured_b(mm),ic1_sigma_measured_a(mm)\n1,0,1,10,5,0.4,3.5,4e-10,11,12,0.1,0.2\n1,0,2,30,6,0.5,7.0,4e-10,21,22,0.3,0.4\n",
         );
         let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
-        let text = join_spot_data(&refs(&parts)).unwrap();
+        let text = join_spot_data(&refs(&parts), &mut Vec::new()).unwrap();
         let rows: Vec<&str> = text.lines().skip(1).collect();
         assert_eq!(rows.len(), 2, "both deliveries survive the join");
         assert_ne!(rows[0], rows[1]);
@@ -2020,8 +2331,8 @@ mod tests {
 
     #[test]
     fn a_leading_ragged_row_joins_the_next_layer() {
-        // Row 0 has no layer_id cell — there is no previous run to inherit,
-        // so the empty leading block must not consume a "" layer ordinal.
+        // Row 0 has no layer_id cell — it folds into the run its real
+        // layer opens, not a separate one-row run of its own.
         let table = sheet("spot_no,layer_id\n1\n2,9\n3,9\n");
         let mut layers = HashMap::new();
         let got = blocks(&table, &mut layers);
@@ -2030,7 +2341,7 @@ mod tests {
             got.iter()
                 .map(|block| (block.layer, block.run, block.start, block.end))
                 .collect::<Vec<_>>(),
-            vec![(0, 0, 0, 1), (0, 1, 1, 3)]
+            vec![(0, 0, 0, 3)]
         );
     }
 

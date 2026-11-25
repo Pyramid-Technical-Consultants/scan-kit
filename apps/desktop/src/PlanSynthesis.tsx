@@ -203,6 +203,8 @@ export function PlanSynthesis() {
   // State has not flushed for a same-frame second click — check the ref.
   const busyRef = useRef(false);
   const [waiting, setWaiting] = useState(true);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [catalogRetry, setCatalogRetry] = useState(0);
   usePageLoad(waiting || busy);
   const [saveDir, setSaveDir] = useState("");
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -229,13 +231,14 @@ export function PlanSynthesis() {
       .catch((caught: unknown) => {
         if (!cancel) {
           setWaiting(false);
+          setCatalogError(caught instanceof Error ? caught.message : String(caught));
           notifyError(caught);
         }
       });
     return () => {
       cancel = true;
     };
-  }, []);
+  }, [catalogRetry]);
 
   useEffect(() => {
     const node = host.current;
@@ -303,6 +306,11 @@ export function PlanSynthesis() {
   }
 
   async function browse(param: Param) {
+    // Same frame double-click would stack two dialogs; last-resolved wins.
+    if (browseRef.current) {
+      return;
+    }
+    browseRef.current = true;
     const selected = await open({
       multiple: false,
       title: param.label,
@@ -310,14 +318,20 @@ export function PlanSynthesis() {
         param.key === "pld_path"
           ? [{ name: "IBA PLD", extensions: ["pld"] }]
           : [{ name: "RT Ion DICOM", extensions: ["dcm"] }],
-    }).catch((reason: unknown) => {
-      notifyError(reason);
-      return null;
-    });
+    })
+      .catch((reason: unknown) => {
+        notifyError(reason);
+        return null;
+      })
+      .finally(() => {
+        browseRef.current = false;
+      });
     if (typeof selected === "string") {
       setValue(param.key, selected);
     }
   }
+
+  const browseRef = useRef(false);
 
   async function savePlan() {
     if (busyRef.current || plan == null || template == null) {
@@ -356,7 +370,22 @@ export function PlanSynthesis() {
   }
 
   if (catalog == null || template == null) {
-    return null;
+    return catalogError == null ? null : (
+      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
+        <p className="text-muted-foreground text-sm">{catalogError}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setWaiting(true);
+            setCatalogError(null);
+            setCatalogRetry((n) => n + 1);
+          }}
+        >
+          Retry
+        </Button>
+      </div>
+    );
   }
 
   const applyQuick = (next: Record<string, number>) => {

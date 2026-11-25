@@ -162,7 +162,13 @@ export function ConfigTuning({
   const [xml, setXml] = useState("");
   const [form, setForm] = useState<FormDoc | null>(null);
   const [integrity, setIntegrity] = useState<Integrity | null>(null);
-  const [hideUnused, setHideUnused] = useState(false);
+  const [hideUnused, setHideUnusedState] = useState(false);
+  const hideUnusedRef = useRef(false);
+  const setHideUnused = (next: boolean | ((prev: boolean) => boolean)) => {
+    const value = typeof next === "function" ? next(hideUnusedRef.current) : next;
+    hideUnusedRef.current = value;
+    setHideUnusedState(value);
+  };
   const [dirty, setDirty] = useState(false);
   const [preview, setPreview] = useState<HeldPreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
@@ -177,6 +183,10 @@ export function ConfigTuning({
   const dirtyRef = useRef(false);
   const editSeq = useRef(0);
   const hideSeq = useRef(0);
+  // Two rapid clicks must write in click order — spawn_blocking completion
+  // order is not guaranteed and last-write-wins would leave the persisted
+  // flag disagreeing with the checkbox.
+  const hideChain = useRef<Promise<unknown>>(Promise.resolve());
   const busyRef = useRef(false);
   const leftPane = useRef<HTMLDivElement>(null);
   const previewDrag = useRef(PREVIEW_RATIO);
@@ -195,6 +205,13 @@ export function ConfigTuning({
     () => selectedIds.filter((id) => !excluded.includes(id)),
     [excluded, selectedIds],
   );
+  // An exclusion of a no-longer-selected session must not linger — the view
+  // is kept mounted, so a re-selected id would arrive still excluded.
+  const [prevSelectedIds, setPrevSelectedIds] = useState(selectedIds);
+  if (prevSelectedIds !== selectedIds) {
+    setPrevSelectedIds(selectedIds);
+    setExcluded((current) => current.filter((id) => selectedIds.includes(id)));
+  }
   // Only the anchor decides which config opens — the array identity
   // changes on every exclusion click and would re-fire the open.
   const anchorId = sessionIds[0] ?? "";
@@ -413,15 +430,28 @@ export function ConfigTuning({
     }
   }
 
+  const dialogRef = useRef(false);
+
   async function browse() {
-    const selected = await open({ directory: true, multiple: false, title: "Configuration folder" }).catch((reason: unknown) => {
-      notifyError(reason);
-      return null;
-    });
+    // busy arms only after the dialog closes — a second click would open a
+    // racing dialog whose later resolution wins.
+    if (dialogRef.current) {
+      return;
+    }
+    dialogRef.current = true;
+    let selected: unknown;
+    try {
+      selected = await open({ directory: true, multiple: false, title: "Configuration folder" }).catch((reason: unknown) => {
+        notifyError(reason);
+        return null;
+      });
+    } finally {
+      dialogRef.current = false;
+    }
     if (typeof selected !== "string") {
       return;
     }
-    if (dirty && !window.confirm("Discard unsaved edits in this file?")) {
+    if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
       return;
     }
     const seq = ++openSeq.current;
@@ -496,19 +526,36 @@ export function ConfigTuning({
 
   async function toggleHide(next: boolean) {
     const seq = ++hideSeq.current;
+    // save() reads this ref for what the user last set — record the click
+    // now, not when the invoke lands.
+    hideUnusedRef.current = next;
+    const run = hideChain.current.then(() =>
+      invoke("scan_kit_config_hide", { hideUnused: next }),
+    );
+    hideChain.current = run.catch(() => undefined);
     try {
-      await invoke("scan_kit_config_hide", { hideUnused: next });
+      await run;
       // A slower earlier call must not overwrite the newest click.
       if (seq === hideSeq.current) {
         setHideUnused(next);
         editSeq.current += 1;
       }
     } catch (caught) {
+      // The Toggle snaps back to `hideUnused` — the ref must too, or
+      // save() persists a flag the UI shows as off.
+      if (seq === hideSeq.current) {
+        hideUnusedRef.current = hideUnused;
+      }
       notifyError(caught);
     }
   }
 
   function applyPreview() {
+    // busyRef covers an in-flight loadFile — the applied edits would be
+    // overwritten when it resolves, exactly like a dropped changeField.
+    if (busyRef.current) {
+      return;
+    }
     if (workflow == null || matched == null || !matched.changed) {
       return;
     }
@@ -577,7 +624,9 @@ export function ConfigTuning({
         source: configDir,
         dest: selected,
         files: [{ rel: file, xml: nextXml }],
-        hideUnused,
+        // The toggle's own invoke can still be in flight — send what the
+        // user last set, not the render snapshot.
+        hideUnused: hideUnusedRef.current,
       });
       // Same guard after the awaits — an edit landing during apply/save must
       // not have its dirty flag cleared by the older snapshot.
@@ -759,7 +808,7 @@ export function ConfigTuning({
                   size="sm"
                   className="shrink-0"
                   onClick={applyPreview}
-                  disabled={busy || previewing || matched == null || !matched.changed}
+                  disabled={busy || opening || previewing || matched == null || !matched.changed}
                   title="Apply the preview to devices.xml. The file stays unsaved until you save."
                 >
                   <Check />
@@ -888,7 +937,11 @@ function PreviewGrid({ columns, rows }: { columns: string[]; rows: PreviewCell[]
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
-    return () => observer.disconnect();
+    node.addEventListener("wheel", forwardWheel, { passive: false });
+    return () => {
+      observer.disconnect();
+      node.removeEventListener("wheel", forwardWheel);
+    };
   }, []);
   function getCell([column, row]: Item): GridCell {
     const cell = rows[row]?.[column];
@@ -912,7 +965,6 @@ function PreviewGrid({ columns, rows }: { columns: string[]; rows: PreviewCell[]
       ref={host}
       className="h-full w-full min-w-0 overflow-hidden"
       style={{ overflowAnchor: "none" }}
-      onWheel={forwardWheel}
     >
       {size.width > 0 && height > 0 ? (
         <DataEditor

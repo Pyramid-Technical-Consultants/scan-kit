@@ -39,8 +39,12 @@ jobs:
           if "RUSTSEC-2026-0543" not in text:
               line = '    { id = "RUSTSEC-2026-0543", reason = "direct and transitive; no upgrade" },\n'
               marker = "ignore = [\n"
-              start = text.index(marker) + len(marker)
-              path.write_text(text[:start] + line + text[start:])
+              if marker in text:
+                  start = text.index(marker) + len(marker)
+                  path.write_text(text[:start] + line + text[start:])
+              else:
+                  block = '[advisories]\nignore = [\n' + line + ']\n'
+                  path.write_text(text + block)
           PY
           cargo deny check advisories
 

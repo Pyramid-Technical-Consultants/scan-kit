@@ -14,6 +14,7 @@ pub fn parse_pld(text: &str, beam_size: f64) -> Result<Vec<ImportSpot>, String> 
     let mut plan_index = 0i32;
     let mut energy = None;
     let mut pending: Vec<(f64, f64, f64)> = Vec::new();
+    let mut seen: std::collections::HashMap<(u64, u64), usize> = std::collections::HashMap::new();
     let flush = |energy: &Option<f64>,
                  pending: &mut Vec<(f64, f64, f64)>,
                  spots: &mut Vec<ImportSpot>,
@@ -27,7 +28,7 @@ pub fn parse_pld(text: &str, beam_size: f64) -> Result<Vec<ImportSpot>, String> 
             } else {
                 weight * header.total_mu / header.cumulative
             };
-            if charge <= 0.0 {
+            if !(charge.is_finite() && charge > 0.0) {
                 continue;
             }
             spots.push(ImportSpot {
@@ -44,6 +45,7 @@ pub fn parse_pld(text: &str, beam_size: f64) -> Result<Vec<ImportSpot>, String> 
     for line in &lines[1..] {
         if line.starts_with("Layer,") {
             flush(&energy, &mut pending, &mut spots, &mut plan_index);
+            seen.clear();
             energy = Some(parse_layer_header(line)?.0);
             continue;
         }
@@ -60,13 +62,17 @@ pub fn parse_pld(text: &str, beam_size: f64) -> Result<Vec<ImportSpot>, String> 
         let x = parse_pld_float(parts[1], "element X position")?;
         let y = parse_pld_float(parts[2], "element Y position")?;
         let weight = parse_pld_float(parts[3], "element meterset weight")?;
-        if let Some(found) = pending.iter_mut().find(|item| item.0 == x && item.1 == y) {
-            found.2 += weight;
+        // Linear find is O(n^2) over a layer of unique positions.
+        let key = (x.to_bits(), y.to_bits());
+        if let Some(&slot) = seen.get(&key) {
+            pending[slot].2 += weight;
         } else {
+            seen.insert(key, pending.len());
             pending.push((x, y, weight));
         }
     }
     flush(&energy, &mut pending, &mut spots, &mut plan_index);
+    seen.clear();
     if energy.is_none() {
         return Err("PLD file contains no Layer headers".into());
     }
@@ -89,9 +95,17 @@ pub(super) fn parse_beam_header(line: &str) -> Result<BeamHeader, String> {
     if parts.len() < 10 {
         return Err("PLD Beam header is missing required fields".into());
     }
+    // The format defines total MU, cumulative weight, and layer count as the
+    // last three fields — fixed indices misread any variant with extra
+    // metadata columns.
+    let total_mu = parse_pld_float(parts[parts.len() - 3], "beam total MU")?;
+    let cumulative = parse_pld_float(parts[parts.len() - 2], "cumulative meterset weight")?;
+    if !total_mu.is_finite() || !cumulative.is_finite() || total_mu <= 0.0 || cumulative <= 0.0 {
+        return Err("PLD beam total MU and cumulative meterset weight must be positive".into());
+    }
     Ok(BeamHeader {
-        total_mu: parse_pld_float(parts[7], "beam total MU")?,
-        cumulative: parse_pld_float(parts[8], "cumulative meterset weight")?,
+        total_mu,
+        cumulative,
     })
 }
 
@@ -107,7 +121,7 @@ pub(super) fn parse_layer_header(line: &str) -> Result<(f64,), String> {
     // Same bound the DICOM writer enforces - a hand-edited PLD is a trust
     // boundary too.
     if !energy.is_finite() || energy <= 0.0 || energy > 330.0 {
-        return Err("PLD layer energy must be from 0 to 330 MeV".into());
+        return Err("PLD layer energy must be greater than 0 and at most 330 MeV".into());
     }
     Ok((energy,))
 }

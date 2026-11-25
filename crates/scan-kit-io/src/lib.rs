@@ -21,6 +21,7 @@ mod phantom;
 mod remote;
 pub mod report;
 mod runner;
+pub use runner::DOWNLOAD_BUSY_ERR;
 mod session_capture;
 mod source;
 mod store;
@@ -262,7 +263,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "db_path": { "type": "string" }
             },
             "required": ["path", "session_ids"],
@@ -308,7 +309,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "view": { "type": "string" },
                 "path": { "type": "string" },
-                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "session_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                 "options": { "type": "object" }
             },
             "required": ["view", "path", "session_ids"],
@@ -325,10 +326,12 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "template": { "type": "string" },
                 "params": { "type": "object" },
                 "path": { "type": "string" },
-                "csv": { "type": "string" },
+                "csv": { "type": "string", "description": "Raw plan CSV starting with #NO,ENERGY(MeV)" },
                 "db_path": { "type": "string" }
             },
-            "required": ["template", "params"],
+            // The csv+path write mode needs neither template nor params —
+            // the handler errors per-branch ("template is required").
+            "required": [],
             "additionalProperties": false
         }),
         "scan_kit_config_catalog" => json!({
@@ -360,7 +363,7 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "xml": { "type": "string" },
                 "form": { "type": "object" }
             },
-            "required": ["xml", "form"],
+            "required": ["xml"],
             "additionalProperties": false
         }),
         "scan_kit_config_save" => json!({
@@ -368,7 +371,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "source": { "type": "string" },
                 "dest": { "type": "string" },
-                "files": { "type": "array" },
+                "files": { "type": "array", "items": { "type": "object", "properties": { "rel": { "type": "string" }, "xml": { "type": "string" } }, "required": ["rel", "xml"] } },
                 "hide_unused": { "type": "boolean" },
                 "db_path": { "type": "string" }
             },
@@ -464,7 +467,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_runner_control" => json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string" }
+                "action": { "type": "string", "enum": ["start", "pause", "stop", "reset"] }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -472,7 +475,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_runner_download" => json!({
             "type": "object",
             "properties": {
-                "dest": { "type": "string" },
+                "dest": { "type": "string", "description": "A local .zip path" },
                 "db_path": { "type": "string" }
             },
             "required": ["dest"],
@@ -505,6 +508,9 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["action"],
             "additionalProperties": false
         }),
+        // session_storage_paths/trash_session are dispatched but not in
+        // TOOLS — desktop-only via forward!, so the restrictive fallback
+        // schema (which forbids their required args) never validates them.
         _ => json!({ "type": "object", "additionalProperties": false }),
     }
 }
@@ -527,6 +533,11 @@ impl std::fmt::Display for InvokeError {
 impl std::error::Error for InvokeError {}
 
 pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
+    if !input.is_null() && !input.is_object() {
+        // A non-object args payload would silently default every arg —
+        // callers get success for input they never intended.
+        return Err(InvokeError::Message("args must be an object".into()));
+    }
     match name {
         "scan_kit_open_library" => {
             let path = required_str(input, "path")?;
@@ -538,9 +549,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let session_id = required_str(input, "session_id")?;
             let note = required_str(input, "note")?;
             let db = database_path(input)?;
+            let root = library_root(path).map_err(InvokeError::Message)?;
+            // Prefetch the legacy JSON before STORE_LOCK — a stalled share
+            // must not hold the process mutex.
+            let legacy = store::legacy_files(Path::new(&root));
             with_store(&db, |conn| {
-                let root = library_root(path)?;
-                set_note(conn, &root, session_id, note)
+                set_note(conn, &root, session_id, note, Some(&legacy))
             })
             .map_err(InvokeError::Message)?;
             Ok(json!({ "session_id": session_id, "note": note.trim() }))
@@ -567,8 +581,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             // note/selection/hidden survive the failed delete. Nothing
             // found at all is not a successful delete either.
             if errors.is_empty() && !paths.is_empty() {
+                let legacy = store::legacy_files(Path::new(&root));
                 with_store(&db, |conn| {
-                    let lib_id = store::prepare_library(conn, &root)?;
+                    let lib_id = store::prepare_library(conn, &root, Some(&legacy))?;
                     store::delete_session(conn, lib_id, session_id)
                 })
                 .map_err(InvokeError::Message)?;
@@ -580,9 +595,10 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let path = required_str(input, "path")?;
             let session_ids = required_strings(input, "session_ids")?;
             let db = database_path(input)?;
+            let root = library_root(path).map_err(InvokeError::Message)?;
+            let legacy = store::legacy_files(Path::new(&root));
             with_store(&db, |conn| {
-                let root = library_root(path)?;
-                let stored = set_selected(conn, &root, &session_ids)?;
+                let stored = set_selected(conn, &root, &session_ids, Some(&legacy))?;
                 Ok(json!({ "session_ids": stored }))
             })
             .map_err(InvokeError::Message)
@@ -600,14 +616,19 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_forget_data_dir" => {
             let path = required_str(input, "path")?;
             let db = database_path(input)?;
-            with_store(&db, |conn| {
-                // canonical_root, not library_root: forgetting a dead path is the point.
-                let root = location::canonical_root(path)?;
+            // canonical_root, not library_root: forgetting a dead path is the point.
+            let root = location::canonical_root(path).map_err(InvokeError::Message)?;
+            let result = with_store(&db, |conn| {
                 forget_data_dir(conn, &root)?;
-                location::drop_sessions(&root);
                 publish_catalog(conn)
             })
-            .map_err(InvokeError::Message)
+            .map_err(InvokeError::Message);
+            // The cache wipe waits on the remote COPY lock — keep it out of
+            // STORE_LOCK or every store call stalls for the copy budget.
+            if result.is_ok() {
+                location::drop_sessions(&root);
+            }
+            result
         }
         "scan_kit_load_columns" => {
             let storage = required_str(input, "storage_path")?;
@@ -628,7 +649,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                     storage.display()
                 )));
             }
-            if !discover::session_directory(storage, session_id).is_dir() {
+            if !discover::session_directory(storage, session_id).exists() {
                 return Err(InvokeError::Message(format!(
                     "no session {session_id} under {path}"
                 )));
@@ -645,7 +666,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                     storage.display()
                 )));
             }
-            if !discover::session_directory(storage, session_id).is_dir() {
+            if !discover::session_directory(storage, session_id).exists() {
                 return Err(InvokeError::Message(format!(
                     "no session {session_id} under {path}"
                 )));
@@ -684,9 +705,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_config_open" => {
             let db = database_path(input)?;
-            let path = input.get("path").and_then(Value::as_str);
-            let data_dir = input.get("data_dir").and_then(Value::as_str);
-            let session_id = input.get("session_id").and_then(Value::as_str);
+            let path = optional_str(input, "path")?;
+            let data_dir = optional_str(input, "data_dir")?;
+            let session_id = optional_str(input, "session_id")?;
             config::open_folder(&db, path, data_dir, session_id).map_err(InvokeError::Message)
         }
         "scan_kit_config_form" => {
@@ -695,7 +716,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_config_apply" => {
             let xml = required_str(input, "xml")?;
-            let form = input.get("form").cloned().unwrap_or_else(|| json!({}));
+            let form = object_arg(input, "form")?;
             config::apply(xml, &form).map_err(InvokeError::Message)
         }
         "scan_kit_config_save" => {
@@ -706,14 +727,17 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                 .get("files")
                 .cloned()
                 .ok_or_else(|| InvokeError::Message("files is required".into()))?;
-            let hide = input.get("hide_unused").and_then(Value::as_bool);
+            let hide =
+                match input.get("hide_unused") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(value.as_bool().ok_or_else(|| {
+                        InvokeError::Message("hide_unused must be a bool".into())
+                    })?),
+                };
             config::save_folder(&db, Path::new(source), Path::new(dest), &files, hide)
                 .map_err(InvokeError::Message)
         }
-        "scan_kit_config_tune" => {
-            let db = database_path(input)?;
-            config::tune(input, &db).map_err(InvokeError::Message)
-        }
+        "scan_kit_config_tune" => config::tune(input).map_err(InvokeError::Message),
         "scan_kit_config_diff" => config::diff(input).map_err(InvokeError::Message),
         "scan_kit_config_integrity" => {
             let path = required_str(input, "path")?;
@@ -721,10 +745,14 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_config_hide" => {
             let db = database_path(input)?;
-            let hide = input
-                .get("hide_unused")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| InvokeError::Message("hide_unused is required".into()))?;
+            let hide = match input.get("hide_unused") {
+                None | Some(Value::Null) => {
+                    return Err(InvokeError::Message("hide_unused is required".into()));
+                }
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| InvokeError::Message("hide_unused must be a bool".into()))?,
+            };
             config::set_hide_unused(&db, hide).map_err(InvokeError::Message)
         }
         "scan_kit_phantom_catalog" => {
@@ -732,13 +760,20 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             Ok(phantom::catalog(&db))
         }
         "scan_kit_phantom_preview" => {
-            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+            let params = object_arg(input, "params")?;
             phantom::preview(&params).map_err(InvokeError::Message)
         }
         "scan_kit_write_phantom" => {
             let db = database_path(input)?;
             let parent = required_str(input, "parent")?;
-            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+            // Schema marks params required — a missing object must not
+            // mint a full default study.
+            let params = match input.get("params") {
+                Some(value) if value.is_object() => value.clone(),
+                _ => {
+                    return Err(InvokeError::Message("params must be an object".into()));
+                }
+            };
             phantom::write(Path::new(parent), &params, &db).map_err(InvokeError::Message)
         }
         "scan_kit_runner_catalog" => {
@@ -756,11 +791,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             Ok(runner::catalog(&db))
         }
         "scan_kit_runner_status" => {
-            let has_plan = input
-                .get("has_plan")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let dest = input.get("dest").and_then(Value::as_str).unwrap_or("");
+            let has_plan = match input.get("has_plan") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err(InvokeError::Message("has_plan must be a boolean".into())),
+            };
+            let dest = optional_str(input, "dest")?.unwrap_or("");
             runner::read_status(has_plan, dest).map_err(InvokeError::Message)
         }
         "scan_kit_runner_upload" => {
@@ -789,8 +825,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_scanners" => {
             let db = database_path(input)?;
             let action = required_str(input, "action")?;
-            scanners(&db, action, input.get("folder").and_then(Value::as_str))
-                .map_err(InvokeError::Message)
+            scanners(&db, action, optional_str(input, "folder")?).map_err(InvokeError::Message)
         }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),
@@ -799,9 +834,13 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
 }
 
 fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, String> {
-    match action {
+    let stored: Vec<(String, String)> = match action {
         "add" => {
             let folder = folder.ok_or("scanner folder required")?;
+            // "" would resolve against the process CWD and register it.
+            if folder.trim().is_empty() {
+                return Err("scanner folder required".into());
+            }
             // File IO outside STORE_LOCK — resolve before taking it.
             let calibration = calibration::CtCalibration::resolve(folder)?;
             store::with_store(db, |conn| {
@@ -809,47 +848,70 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
                     .map_err(|err| err.to_string())?;
                 let result = (|| {
                     let mut list = store::scanners(conn)?;
-                    if !list.iter().any(|(_, existing)| existing == folder) {
+                    let key = folder.trim_end_matches(['/', '\\']);
+                    if !list
+                        .iter()
+                        .any(|(_, existing)| existing.trim_end_matches(['/', '\\']) == key)
+                    {
                         list.push((calibration.name.clone(), folder.to_owned()));
+                        store::set_scanners(conn, &list)?;
                     }
-                    store::set_scanners(conn, &list)
+                    Ok::<_, String>(list)
                 })();
-                if result.is_err() {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return result;
+                match result {
+                    Err(err) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(err)
+                    }
+                    Ok(list) => {
+                        conn.execute_batch("COMMIT")
+                            .map_err(|err| err.to_string())?;
+                        Ok(list)
+                    }
                 }
-                conn.execute_batch("COMMIT").map_err(|err| err.to_string())
-            })?;
+            })?
         }
         "remove" => {
             let folder = folder.ok_or("scanner folder required")?;
+            if folder.trim().is_empty() {
+                return Err("scanner folder required".into());
+            }
             store::with_store(db, |conn| {
                 conn.execute_batch("BEGIN IMMEDIATE")
                     .map_err(|err| err.to_string())?;
                 let result = (|| {
+                    let key = folder.trim_end_matches(['/', '\\']);
                     let list: Vec<(String, String)> = store::scanners(conn)?
                         .into_iter()
-                        .filter(|(_, existing)| existing != folder)
+                        .filter(|(_, existing)| existing.trim_end_matches(['/', '\\']) != key)
                         .collect();
-                    store::set_scanners(conn, &list)
+                    store::set_scanners(conn, &list)?;
+                    Ok::<_, String>(list)
                 })();
-                if result.is_err() {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return result;
+                match result {
+                    Err(err) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(err)
+                    }
+                    Ok(list) => {
+                        conn.execute_batch("COMMIT")
+                            .map_err(|err| err.to_string())?;
+                        Ok(list)
+                    }
                 }
-                conn.execute_batch("COMMIT").map_err(|err| err.to_string())
-            })?;
+            })?
         }
-        "list" => {}
+        "list" => store::with_store(db, |conn| store::scanners(conn))?,
         other => return Err(format!("unknown scanners action {other}")),
-    }
-    let stored = store::with_store(db, |conn| store::scanners(conn))?;
+    };
     let mut entries = Vec::new();
     for (label, folder) in stored {
         // Digest reads files — outside the lock.
+        // An unresolvable folder must not masquerade as a real digest —
+        // the empty string is indistinguishable from one downstream.
         let digest = calibration::CtCalibration::resolve(&folder)
-            .map(|calibration| calibration.digest())
-            .unwrap_or_default();
+            .map(|calibration| Value::String(calibration.digest()))
+            .unwrap_or(Value::Null);
         entries.push(json!({ "label": label, "folder": folder, "digest": digest }));
     }
     Ok(json!({ "scanners": entries }))
@@ -863,10 +925,6 @@ pub fn copy_runner(dest: &str, keep: &mut dyn FnMut(u64, u64) -> bool) -> Result
 /// Where the desktop shell appends panics, beside the store.
 pub fn crash_log_path() -> PathBuf {
     default_db_path().with_file_name("crash.log")
-}
-
-pub fn read_last_data_dir() -> Result<Option<String>, String> {
-    with_store(&default_db_path(), |conn| store::last_data_dir(conn))
 }
 
 pub fn read_window_geometry() -> Result<Value, String> {
@@ -887,6 +945,25 @@ pub fn write_last_main_tab(tab: &str) -> Result<(), String> {
     with_store(&default_db_path(), |conn| set_last_main_tab(conn, tab))
 }
 
+/// `invoke` with a cooperative cancel flag — only `scan_kit_open_library`
+/// polls it today (it feeds index_library's `keep`); other tools pass
+/// straight through. Used by the MCP server to honour client cancels.
+pub fn invoke_flag(
+    name: &str,
+    input: &Value,
+    flag: &std::sync::atomic::AtomicBool,
+) -> Result<Value, InvokeError> {
+    if name == "scan_kit_open_library" {
+        let path = required_str(input, "path")?;
+        let db = database_path(input)?;
+        return index_library(&db, Path::new(path), &mut |_, _, _| {
+            !flag.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .map_err(InvokeError::Message);
+    }
+    invoke(name, input)
+}
+
 /// Workflow `scan_kit_open_library`. Discovers, syncs the index, and returns rows.
 pub fn open_library(db: &Path, data_dir: &Path) -> Result<Value, String> {
     index_library(db, data_dir, &mut |_, _, _| true)
@@ -905,6 +982,13 @@ pub fn index_library(
     // covers the short DB sections only.
     let spec = data_dir.to_string_lossy();
     let (root, opened) = location::open_root(&spec)?;
+    let conn = &mut store::open_connection(db)?;
+    // A forget_data_dir that lands during the walk must not be resurrected
+    // by this index's commit — remember whether the root was registered
+    // before the scan started; first-time adds are absent at both reads.
+    let was_member = store::locked(|| data_dirs(conn))?
+        .iter()
+        .any(|dir| dir == &root);
     let found = match &opened {
         location::Opened::Local(path) => {
             discover::discover(path, &mut |done, total| keep(done, total, None))?
@@ -928,7 +1012,6 @@ pub fn index_library(
             return Err("cancelled".into());
         }
     }
-    let conn = &mut store::open_connection(db)?;
     let places = found
         .entries
         .iter()
@@ -957,6 +1040,11 @@ pub fn index_library(
         // ensure_library only — import_legacy/backfill read legacy JSON off
         // disk and must not hold the write lock while a share stalls.
         let lib_id = ensure_library(&tx, &root)?;
+        // A forget_data_dir that landed during the walk must not be
+        // re-registered by this commit — roll the whole sync back.
+        if was_member && !data_dirs(&tx)?.iter().any(|dir| dir == &root) {
+            return Err("cancelled".into());
+        }
         let ids = places
             .iter()
             .map(|(session_id, _)| session_id.clone())
@@ -983,18 +1071,35 @@ pub fn index_library(
             }
         }
         tx.commit().map_err(|err| err.to_string())?;
-        // Both read legacy JSON off disk — autocommit after commit so a
-        // stalled share can't sit inside the write lock. Fill-blanks only,
-        // safe to replay if the next scan finds them half-done.
-        import_legacy(conn, lib_id, Path::new(&root))?;
-        backfill_blank_notes(conn, lib_id, Path::new(&root))?;
         Ok((lib_id, pending))
     })?;
     // Refresh the recorded bindings now, not only after the hydrate loop -
     // a cancel or error below used to leave new storage_paths committed
     // while the in-memory maps still resolved the old locations.
-    location::replace_sessions(&root, &places);
-    store::locked(|| publish_catalog(conn))?;
+    // Binding replace + catalog publish inside one locked section so a
+    // forget_data_dir on a peer connection cannot interleave between the
+    // drop and the publish.
+    store::locked(|| {
+        // Same race, second window: a forget between the commit and this
+        // publish must not repopulate bindings nothing will clear again.
+        if was_member && !data_dirs(conn)?.iter().any(|dir| dir == &root) {
+            return Err("cancelled".into());
+        }
+        location::replace_sessions(&root, &places, !walk_failed);
+        publish_catalog(conn)
+    })?;
+    // Both read legacy JSON off disk — autocommit after commit so a
+    // stalled share can't sit inside the write lock. Fill-blanks only and
+    // replayed on every scan, so a corrupt legacy file must not fail the
+    // committed scan or skip the publish above: demote to retry-next-scan.
+    // Prefetch the legacy JSON before the locked apply — same stalled-
+    // share rule as the invoke arms.
+    let legacy = store::legacy_files(Path::new(&root));
+    store::locked(|| {
+        let _ = import_legacy(conn, lib_id, Path::new(&root), Some(&legacy));
+        let _ = backfill_blank_notes(conn, lib_id, legacy.notes());
+        Ok(())
+    })?;
     if !keep(0, total, None) {
         return Err("cancelled".into());
     }
@@ -1166,7 +1271,22 @@ fn hydrate(entry: &Discovered, stamped: Option<(i64, i64)>) -> (Option<SessionMe
     // Meta hydrated after the fingerprint stat can describe newer bytes than
     // the row certifies — a moved file stays retryable instead of sealing
     // stale meta under the old fingerprint.
-    let readable = (meta.is_some() || fresh.is_some()) && fresh == stamped;
+    // A NULL-stamped row sealing on another failed stat (None == None)
+    // certifies no bytes at all — only a real fingerprint may seal.
+    let readable = stamped.is_some()
+        && fresh == stamped
+        // Stat-ok is not read-ok (locked zip, remote auth flap): a session
+        // whose reads all failed must stay retryable instead of sealing
+        // NULL meta under a reachable fingerprint. A meta hit already
+        // proves reads work; the marker probe covers the absent-summary
+        // case.
+        && (meta.is_some()
+            || discover::read_session_file(
+                &entry.storage_path,
+                &entry.session_id,
+                "input_map.csv",
+            )
+            .is_some());
     (meta, readable)
 }
 
@@ -1181,32 +1301,66 @@ fn library_root(path: &str) -> Result<String, String> {
     if location::is_remote_location(path) {
         return location::canonical_root(path);
     }
-    let path = Path::new(path);
-    if !path.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
+    // canonical_root unwraps file:// URIs and ~ before the dir check —
+    // open_library accepts those specs, so the write arms must too.
+    let root = location::canonical_root(path)?;
+    if !Path::new(&root).is_dir() {
+        return Err(format!("{root} is not a directory"));
     }
-    location::canonical_root(&path.to_string_lossy())
+    Ok(root)
 }
 
 fn database_path(input: &Value) -> Result<PathBuf, InvokeError> {
-    match input.get("db_path").and_then(Value::as_str) {
-        Some(path) if !path.trim().is_empty() => Ok(PathBuf::from(path)),
-        _ => Ok(default_db_path()),
+    match input.get("db_path") {
+        None | Some(Value::Null) => Ok(default_db_path()),
+        Some(Value::String(path)) if !path.trim().is_empty() => Ok(PathBuf::from(path)),
+        // A blank string means "default store" — a pinned contract. Only a
+        // non-string db_path is a caller error.
+        Some(Value::String(_)) => Ok(default_db_path()),
+        Some(_) => Err(InvokeError::Message(
+            "db_path must be a non-empty string".to_owned(),
+        )),
     }
 }
 
 fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, InvokeError> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| InvokeError::Message(format!("{key} is required")))
+    match input.get(key) {
+        None => Err(InvokeError::Message(format!("{key} is required"))),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| InvokeError::Message(format!("{key} must be a string"))),
+    }
+}
+
+/// A present-but-non-string optional arg is a caller error, not "absent" —
+/// as_str() tolerance would silently fall back to defaults elsewhere.
+fn optional_str<'a>(input: &'a Value, key: &str) -> Result<Option<&'a str>, InvokeError> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| InvokeError::Message(format!("{key} must be a string"))),
+    }
+}
+
+/// params/options objects: absent or null defaults, anything else must be
+/// an object or the parse defaults a real write silently.
+fn object_arg(input: &Value, key: &str) -> Result<Value, InvokeError> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(json!({})),
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(_) => Err(InvokeError::Message(format!("{key} must be an object"))),
+    }
 }
 
 fn required_strings(input: &Value, key: &str) -> Result<Vec<String>, InvokeError> {
-    let items = input
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| InvokeError::Message(format!("{key} is required")))?;
+    let items = match input.get(key) {
+        None => return Err(InvokeError::Message(format!("{key} is required"))),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| InvokeError::Message(format!("{key} must be an array")))?,
+    };
     items
         .iter()
         .map(|item| {
@@ -1520,6 +1674,9 @@ Layer delivery: 27/27
         let root = workspace("columns");
         let session = root.join("sess");
         fs::create_dir_all(&session).unwrap();
+        // input_map.csv is the marker that proves this dir is session
+        // "sess"; keep its columns disjoint so timeslice routing wins.
+        fs::write(session.join("input_map.csv"), "spot_no\n1\n").unwrap();
         fs::write(
             session.join("timeslice_data_device_units.csv"),
             "Energy,r_ic1_current_dose,note\n\"70.5\",\"1.5e-9\",\"a,b\"\n\"80.0\",\"2.5e-9\",\"c\"\n",
@@ -1972,7 +2129,7 @@ Layer delivery: 27/27
         let db = root.join("test.sqlite");
         let root_str = root.to_string_lossy().into_owned();
         store::with_store(&db, |conn| {
-            store::set_note(conn, &root_str, "sess", "keep me")
+            store::set_note(conn, &root_str, "sess", "keep me", None)
         })
         .unwrap();
         let result = invoke(
@@ -2056,6 +2213,14 @@ Layer delivery: 27/27
         assert_eq!(path, default_db_path());
         let path = database_path(&json!({"db_path": "  "})).unwrap();
         assert_eq!(path, default_db_path());
+    }
+
+    #[test]
+    fn a_non_string_db_path_errors_instead_of_defaulting() {
+        // Silently storing to the default db hides the caller's mistake.
+        assert!(database_path(&json!({"db_path": 42})).is_err());
+        assert!(database_path(&json!({"db_path": {"x": 1}})).is_err());
+        assert!(database_path(&json!({"db_path": null})).is_ok());
     }
 
     #[test]

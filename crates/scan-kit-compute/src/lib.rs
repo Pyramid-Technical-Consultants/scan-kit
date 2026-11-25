@@ -12,7 +12,7 @@ pub use mc::run_mc;
 pub use task::{cancel_task, poll_task, start_task};
 
 pub use kernels::compile_scientific_shaders;
-pub use present::{invoke, open_plot, run_view, tool_input_schema, tools};
+pub use present::{invoke, invoke_flag, open_plot, run_view, tool_input_schema, tools};
 pub use scan_kit_plot::{
     compile_plot_shader, plot_shader_source, render_plot, request_device, GpuError as ComputeError,
 };

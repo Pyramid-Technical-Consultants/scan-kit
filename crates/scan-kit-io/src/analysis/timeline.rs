@@ -7,9 +7,7 @@ use scan_kit_core::{
 };
 use serde_json::Value;
 
-use super::{
-    col, control, drew_line, flag, load_csv, panel, placed, scene, session_text, span, stroke, MARK,
-};
+use super::{control, drew_line, flag, panel, placed, scene, session_text, span, stroke, MARK};
 
 /// Timeslice rows are 1 ms apart.
 const SAMPLE_S: f32 = 0.001;
@@ -51,12 +49,12 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
         .cloned()
         .collect();
-    let window = scrub_limits(&options);
     let end = time_end(
         tables
             .iter()
             .filter_map(|table| table.get("time_s").map(Vec::as_slice)),
     );
+    let window = scrub_limits(&options, end);
     // Beam Both and Rank All keep every row, so the trace is the column itself.
     let filter_rows = !keeps_every_row(&trace_segments);
     let masks: Vec<Vec<bool>> = if filter_rows {
@@ -90,6 +88,10 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         let mut ymax = f32::MIN;
         for (table_index, table) in tables.iter().enumerate() {
             let Some(samples) = table.get(series.key) else {
+                // Series are colored positionally per session — an empty
+                // stroke keeps this session's palette slot so a missing
+                // column can't paint the next session this one's color.
+                drawn.push(stroke(Vec::new(), Vec::new(), false));
                 continue;
             };
             let keep = filter_rows.then(|| masks[table_index].as_slice());
@@ -122,8 +124,11 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
             let columns: Vec<Vec<f32>> = tables
                 .iter()
                 .zip(&fft_masks)
-                .filter_map(|(table, keep)| {
-                    table.get(series.key).map(|samples| gated(samples, keep))
+                .map(|(table, keep)| {
+                    table
+                        .get(series.key)
+                        .map(|samples| gated(samples, keep))
+                        .unwrap_or_default()
                 })
                 .collect();
             panels.push(spectrum_panel(&columns));
@@ -371,7 +376,7 @@ fn trace_span(
             });
         xs.push(t);
         ys.push(*value);
-        if !value.is_finite() || !inside(t, window) {
+        if !value.is_finite() || !t.is_finite() || !inside(t, window) {
             continue;
         }
         x_lo = x_lo.min(t);
@@ -417,23 +422,57 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
         let mut panels = Vec::new();
         for device in ["IC1", "IC2", "IC3"] {
             let path = format!("ic_hv_toggle/{device}_HCC.csv");
-            let columns = load_csv(root, session, &path);
+            // The sheet keeps `wide` (f64) columns — `time_s`/`timestamp`/
+            // `time_ns` classify as Wide, so a `num`-only map could never
+            // resolve those clocks.
+            let sheet = crate::discover::read_session_file(root, session, &path)
+                .map(|bytes| crate::tables::read_sheet(&bytes))
+                .unwrap_or_default();
             // Prefer the exact "current" column — a file carrying e.g.
             // charge_current and ic_current would otherwise bind whichever
             // sorts first alphabetically.
-            let Some((_, current)) = columns
+            let Some((_, current)) = sheet
+                .num
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("current"))
                 .or_else(|| {
-                    columns
+                    sheet
+                        .num
                         .iter()
                         .find(|(name, _)| name.to_ascii_lowercase().contains("current"))
                 })
             else {
                 continue;
             };
-            let time = col(&columns, "time")
-                .map(|values| values.to_vec())
+            // The capacitance integrates real milliseconds — the device
+            // file's "time" column is ms, time_s is seconds, timestamp is
+            // epoch ms, time_ns is nanoseconds. `num_clock`/`wide_clock`
+            // honor `(unit)` header suffixes; an epoch-scale stamp is
+            // differenced in f64 before the f32 cast or the ~131 s ulp
+            // erases the trace. When no clock resolves the index axis
+            // draws the trace but the measured pF must not be fabricated.
+            let clock = crate::tables::num_clock(&sheet, "time", "ms")
+                .map(|(values, factor)| values.iter().map(|v| v * factor).collect::<Vec<f32>>())
+                .or_else(|| {
+                    [
+                        ("time_s", "s", 1000.0),
+                        ("timestamp", "ms", 1.0),
+                        ("time_ns", "ns", 1e-6),
+                    ]
+                    .iter()
+                    .find_map(|(name, unit, to_ms)| {
+                        crate::tables::wide_clock(&sheet, name, unit).map(|(values, factor)| {
+                            let t0 = values.first().copied().unwrap_or(0.0);
+                            let origin = if t0.abs() > 1.0e6 { t0 } else { 0.0 };
+                            values
+                                .iter()
+                                .map(|v| ((v - origin) * factor * to_ms) as f32)
+                                .collect::<Vec<f32>>()
+                        })
+                    })
+                });
+            let time = clock
+                .clone()
                 .unwrap_or_else(|| (0..current.len()).map(|i| i as f32).collect());
             let (t0, t1) = hv_step_window(&time, current).unwrap_or((
                 time.first().copied().unwrap_or(0.0),
@@ -442,10 +481,14 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
             let config = hv_config_text(root, session, device);
             // Without the nozzle config's step voltages there is no measured
             // capacitance — don't fabricate one from an assumed 80 V step.
-            let measured = config
-                .as_deref()
-                .and_then(hv_delta_v)
-                .and_then(|delta_v| hv_capacitance_pf(&time, current, t0, t1, delta_v));
+            let measured = if clock.is_none() {
+                None
+            } else {
+                config
+                    .as_deref()
+                    .and_then(hv_delta_v)
+                    .and_then(|delta_v| hv_capacitance_pf(&time, current, t0, t1, delta_v))
+            };
             let expected = config.as_deref().and_then(hv_expected_pf);
             let result = session_text(root, session, &format!("ic_hv_toggle/{device}_result.json"));
             let (overall, flags) = hv_firmware_flags(&result);
@@ -525,6 +568,9 @@ fn spectrum_panel(columns: &[Vec<f32>]) -> Panel {
             .filter(|value| value.is_finite())
             .collect();
         if kept.len() < 16 {
+            // Keep the palette slot — a short or missing column draws
+            // nothing but must not shift a later session's color.
+            series.push(stroke(Vec::new(), Vec::new(), false));
             continue;
         }
         let (freqs, psd) = welch_psd(&kept, 1.0 / SAMPLE_S, 4096, 0.5);
@@ -561,7 +607,9 @@ fn time_panel(series: Vec<Series>, ymin: f32, ymax: f32, y_label: &str) -> Panel
     let mut panel = panel(String::new(), 0.0, 1.0, ymin, ymax, series);
     // `panel` turns a tiny span into +1. A flat trace should stay near its value.
     panel.ymin = ymin;
-    panel.ymax = if ymax > ymin { ymax } else { ymin + 1.0e-6 };
+    // A constant extreme trace still needs ymin < ymax - 1e-6 is a no-op
+    // past ~1e26 where the f32 ulp dwarfs it.
+    panel.ymax = if ymax > ymin { ymax } else { ymin.next_up() };
     panel.y_label = y_label.to_owned();
     panel
 }

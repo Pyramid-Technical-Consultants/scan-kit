@@ -95,23 +95,39 @@ pub fn sig6(value: f64) -> String {
 }
 
 /// `name_dvh.csv`: dose in Gy(RBE), one volume-% column per structure.
-pub fn dvh_csv(curves: &[DvhCurve]) -> Result<String, String> {
+pub fn dvh_csv(curves: &[DvhCurve], effective: bool) -> Result<String, String> {
     let Some(first) = curves.first() else {
         return Ok(String::new());
     };
     // Every curve's cumulative[i] is read against first.edges[i] - curves
     // with different bins would report volumes against the wrong dose.
-    if curves.iter().any(|curve| curve.edges != first.edges) {
+    if curves
+        .iter()
+        .any(|curve| curve.edges != first.edges || curve.cumulative.len() > curve.edges.len())
+    {
         return Err("dvh curves do not share the same dose bins".into());
     }
     // Row i is indexed positionally against first.edges; shorter curves fill
     // the remaining cells empty rather than fabricating zeros.
-    let mut out = String::from("dose_gy_rbe");
+    let mut out = String::from(if effective { "dose_gy_rbe" } else { "dose_gy" });
     for curve in curves {
         out.push(',');
         // A stray quote would open a quoted field on re-parse and swallow the
         // rest of the header line.
-        out.push_str(&curve.name.replace([',', '\n', '\r', '"'], " "));
+        let mut name = curve.name.replace([',', '\n', '\r', '"'], " ");
+        // A leading formula char would evaluate when the CSV lands in a
+        // spreadsheet — the ' prefix keeps the name legible and inert.
+        // A leading tab/space lets `=…` still evaluate in a spreadsheet —
+        // check the first non-whitespace char, not just the literal first.
+        if name
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@'))
+        {
+            name.insert(0, '\'');
+        }
+        out.push_str(&name);
         out.push_str(" volume %");
     }
     out.push('\n');
@@ -146,28 +162,34 @@ fn wrap(text: &str, size: f32, width: f32) -> Vec<String> {
     let mut line = String::new();
     // Split over-long tokens by characters first - provenance text (UIDs,
     // digests, paths) has no spaces to wrap on and would run off the page.
-    let mut pieces: Vec<String> = Vec::new();
+    // bool: piece continues the previous one (char-split token) — it must
+    // re-join without the space a real word break inserts.
+    let mut pieces: Vec<(String, bool)> = Vec::new();
     for word in text.split(' ') {
         if text_width(word, size) <= width {
-            pieces.push(word.to_owned());
+            pieces.push((word.to_owned(), false));
             continue;
         }
         let mut chunk = String::new();
+        let mut continued = false;
         for c in word.chars() {
             let mut trial = chunk.clone();
             trial.push(c);
             if !chunk.is_empty() && text_width(&trial, size) > width {
-                pieces.push(std::mem::take(&mut chunk));
+                pieces.push((std::mem::take(&mut chunk), continued));
+                continued = true;
             }
             chunk.push(c);
         }
         if !chunk.is_empty() {
-            pieces.push(chunk);
+            pieces.push((chunk, continued));
         }
     }
-    for word in &pieces {
+    for (word, continued) in &pieces {
         let candidate = if line.is_empty() {
             word.clone()
+        } else if *continued {
+            format!("{line}{word}")
         } else {
             format!("{line} {word}")
         };
@@ -218,7 +240,7 @@ enum Op {
 impl Op {
     fn bottom(&self) -> f32 {
         match *self {
-            Op::Text { y, .. } => y + 3.0,
+            Op::Text { y, size, .. } => y + size * 0.3,
             Op::Rule { y } => y + 1.0,
             Op::Image { y, h, .. } => y + h,
         }
@@ -315,11 +337,23 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
                 let sum: f32 = natural.iter().sum();
                 let widths: Vec<f32> = natural.iter().map(|w| w * TEXT_W / sum).collect();
                 let mut x = MARGIN;
+                let mut head_height = ROW_H;
                 for (col, label) in head.iter().enumerate() {
-                    text(&mut ops, x + 4.0, y + 10.0, 9.0, Ink::Faint, label);
+                    let label_lines = wrap(label, 9.0, (widths[col] - 8.0).max(20.0));
+                    head_height = head_height.max(ROW_H * label_lines.len() as f32);
+                    for (line_no, line) in label_lines.iter().enumerate() {
+                        text(
+                            &mut ops,
+                            x + 4.0,
+                            y + 10.0 + line_no as f32 * ROW_H,
+                            9.0,
+                            Ink::Faint,
+                            line,
+                        );
+                    }
                     x += widths[col];
                 }
-                y += ROW_H;
+                y += head_height;
                 ops.push(Op::Rule { y });
                 for row in rows {
                     let mut x = MARGIN;
@@ -352,10 +386,10 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
                 width,
                 height,
             } => {
-                if *width == 0
-                    || *height == 0
-                    || rgba.len() != *width as usize * *height as usize * 4
-                {
+                let expected = (*width as usize)
+                    .checked_mul(*height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4));
+                if *width == 0 || *height == 0 || expected != Some(rgba.len()) {
                     return Err("a report figure has invalid dimensions".into());
                 }
                 let scale = TEXT_W / *width as f32;
@@ -445,7 +479,7 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
                     } => {
                         surface.set_fill(Some(fill(ink)));
                         surface.draw_text(
-                            Point::from_xy(x, PAGE_H - y),
+                            Point::from_xy(x, y),
                             font.clone(),
                             size,
                             &text,
@@ -461,9 +495,10 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
                             ..Default::default()
                         }));
                         let mut path = PathBuilder::new();
-                        path.move_to(MARGIN, PAGE_H - y);
-                        path.line_to(PAGE_W - MARGIN, PAGE_H - y);
+                        path.move_to(MARGIN, y);
+                        path.line_to(PAGE_W - MARGIN, y);
                         surface.draw_path(&path.finish().unwrap());
+                        surface.set_stroke(None);
                     }
                     Op::Image {
                         y,
@@ -473,8 +508,7 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
                         height,
                     } => {
                         let image = Image::from_rgba8(rgba, width, height);
-                        surface
-                            .push_transform(&Transform::from_translate(MARGIN, PAGE_H - (y + h)));
+                        surface.push_transform(&Transform::from_translate(MARGIN, y));
                         surface.draw_image(image, Size::from_wh(TEXT_W, h).unwrap());
                         surface.pop();
                     }
@@ -509,6 +543,7 @@ pub fn patient_report(
     title: &str,
     metrics: &crate::patient_view::PatientMetrics,
     rbe_label: &str,
+    effective: bool,
     figure: Option<Figure>,
     provenance: Value,
 ) -> (Report, Vec<DvhCurve>) {
@@ -522,6 +557,12 @@ pub fn patient_report(
         if !figure.caption.is_empty() {
             sections.push(Section::Paragraph(figure.caption));
         }
+    }
+    if !metrics.dropped.is_empty() {
+        sections.push(Section::Paragraph(format!(
+            "Sessions with no usable plan match — excluded from the metrics: {}",
+            metrics.dropped.join(", ")
+        )));
     }
     if !metrics.matches.is_empty() {
         sections.push(Section::Heading("Delivery".into()));
@@ -569,13 +610,18 @@ pub fn patient_report(
     }
     if let Some(gamma) = &metrics.gamma {
         sections.push(Section::Heading("Gamma vs TPS".into()));
+        let outcome = if gamma.rate.is_finite() {
+            format!("{:.2} % of {} voxels pass", gamma.rate, gamma.scored)
+        } else {
+            // scored == 0 — the comparison never ran; "0% fail" would be a
+            // verdict on an unevaluated dose pair.
+            "no voxels scored above the cutoff".to_owned()
+        };
         sections.push(Section::Paragraph(format!(
-            "{} % / {} mm, {} % cutoff: {:.2} % of {} voxels pass",
+            "{} % / {} mm, {} % cutoff: {outcome}",
             sig6(f64::from(gamma.dose_pct)),
             sig6(f64::from(gamma.dta_mm)),
             sig6(f64::from(gamma.cutoff_pct)),
-            gamma.rate,
-            gamma.scored,
         )));
     }
     let goal_rows: Vec<Vec<String>> = metrics
@@ -583,14 +629,20 @@ pub fn patient_report(
         .iter()
         .flat_map(|structure| {
             structure.goals.iter().map(|(goal, check)| {
-                let text = format!(
-                    "{}: {} {} {} {}",
-                    goal.roi,
-                    goal.metric_text,
-                    goal.op,
-                    sig6(f64::from(goal.value)),
-                    goal.unit
-                );
+                let text = if goal.value.is_finite() {
+                    format!(
+                        "{}: {} {} {} {}",
+                        goal.roi,
+                        goal.metric_text,
+                        goal.op,
+                        sig6(f64::from(goal.value)),
+                        goal.unit
+                    )
+                } else {
+                    // A goal the grammar rejected carries NaN — render the
+                    // raw line, not a leaked "NaN" literal.
+                    format!("{}: {}", goal.roi, goal.metric_text)
+                };
                 match check {
                     Ok((measured, pass)) => vec![
                         text,
@@ -622,9 +674,11 @@ pub fn patient_report(
         })
         .collect();
     if !curves.is_empty() {
-        sections.push(Section::Heading(format!(
-            "Dose statistics (Gy(RBE), {rbe_label})"
-        )));
+        sections.push(Section::Heading(if effective {
+            format!("Dose statistics (Gy(RBE), {rbe_label})")
+        } else {
+            "Dose statistics (Gy, physical — LET scoring unavailable)".to_owned()
+        }));
         sections.push(dose_stats(
             &metrics
                 .structures
@@ -749,18 +803,21 @@ mod tests {
         let bytes = std::fs::read(&out).unwrap();
         assert!(bytes.starts_with(b"%PDF"));
         assert!(bytes.len() > 2000);
-        let csv = dvh_csv(&[
-            DvhCurve {
-                name: "PTV".into(),
-                edges: vec![0.0, 1.0, 2.0],
-                cumulative: vec![1.0, 0.5, 0.0],
-            },
-            DvhCurve {
-                name: "a, b".into(),
-                edges: vec![0.0, 1.0, 2.0],
-                cumulative: vec![1.0, 1.0, 0.25],
-            },
-        ])
+        let csv = dvh_csv(
+            &[
+                DvhCurve {
+                    name: "PTV".into(),
+                    edges: vec![0.0, 1.0, 2.0],
+                    cumulative: vec![1.0, 0.5, 0.0],
+                },
+                DvhCurve {
+                    name: "a, b".into(),
+                    edges: vec![0.0, 1.0, 2.0],
+                    cumulative: vec![1.0, 1.0, 0.25],
+                },
+            ],
+            true,
+        )
         .unwrap();
         assert!(csv.starts_with("dose_gy_rbe,PTV volume %,a  b volume %"));
         assert!(csv.contains("\n2,0,25\n"));
@@ -774,6 +831,7 @@ mod tests {
         let goal = crate::patient_view::Goal::parse("PTV: Dmean >= 1.9 Gy").unwrap();
         let metrics = crate::patient_view::PatientMetrics {
             matches: Vec::new(),
+            dropped: Vec::new(),
             structures: vec![crate::patient_view::StructureMetric {
                 id: 0,
                 name: "PTV".into(),
@@ -801,6 +859,7 @@ mod tests {
             "Patient QA",
             &metrics,
             "McNamara 2015",
+            true,
             None,
             serde_json::json!({"histories": 1000}),
         );
@@ -862,7 +921,7 @@ mod tests {
             edges: vec![0.0],
             cumulative: vec![100.0],
         }];
-        let csv = dvh_csv(&curves).unwrap();
+        let csv = dvh_csv(&curves, true).unwrap();
         // An interior newline would add a bogus column row.
         assert_eq!(csv.lines().count(), 2, "{csv}");
         assert!(csv.starts_with("dose_gy_rbe,PTV Cord volume %"));
@@ -893,7 +952,7 @@ mod tests {
                 cumulative: vec![1.0],
             },
         ];
-        let csv = dvh_csv(&curves).unwrap();
+        let csv = dvh_csv(&curves, true).unwrap();
         // Rows past the short curve's bins stay empty — a fabricated "0"
         // would report the structure as fully missed at every dose.
         assert!(
@@ -921,7 +980,7 @@ mod tests {
             edges: vec![0.0, 1.0],
             cumulative: vec![100.0, 50.0],
         }];
-        let csv = dvh_csv(&curves).unwrap();
+        let csv = dvh_csv(&curves, true).unwrap();
         // A stray quote would open a quoted field on re-parse and swallow the
         // rest of the header line.
         assert_eq!(csv.lines().next().unwrap().split(',').count(), 2, "{csv}");

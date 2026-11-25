@@ -63,13 +63,6 @@ fn scan_kit_about() -> Result<Value, String> {
 // These look trivial but every one blocks on the store lock — which a
 // library index holds for seconds — so they must not run on the main thread.
 #[tauri::command]
-async fn scan_kit_last_data_dir() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(scan_kit_io::read_last_data_dir)
-        .await
-        .map_err(|err| err.to_string())?
-}
-
-#[tauri::command]
 async fn scan_kit_window_geometry() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(scan_kit_io::read_window_geometry)
         .await
@@ -142,19 +135,22 @@ async fn scan_kit_start(
 
 /// One slice of a task: a progress report and, when this slice drew something, its payload.
 #[tauri::command]
-async fn scan_kit_poll(task: u64, generation: Option<u64>) -> Result<tauri::ipc::Response, String> {
-    let bytes =
-        tauri::async_runtime::spawn_blocking(move || scan_kit_compute::poll_task(task, generation))
-            .await
-            .map_err(|err| err.to_string())??;
+async fn scan_kit_poll(task: u64, generation: u64) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::poll_task(task, Some(generation))
+    })
+    .await
+    .map_err(|err| err.to_string())??;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
-async fn scan_kit_cancel(task: u64, generation: Option<u64>) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::cancel_task(task, generation))
-        .await
-        .map_err(|err| err.to_string())
+async fn scan_kit_cancel(task: u64, generation: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::cancel_task(task, Some(generation))
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -323,7 +319,18 @@ async fn scan_kit_reveal(path: String) -> Result<(), String> {
         }
         #[cfg(not(windows))]
         command.args(reveal_args(&target));
-        command.spawn().map(|_| ()).map_err(|err| err.to_string())
+        command
+            .spawn()
+            .map(|mut child| {
+                // Dropping a Child does not reap it — xdg-open/`open -R`
+                // exit right after handoff and would sit as zombies until
+                // the app exits. explorer.exe persists on Windows, so reap
+                // on a thread instead of waiting inline.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            })
+            .map_err(|err| err.to_string())
     })
     .await
     .map_err(|err| err.to_string())?
@@ -371,17 +378,27 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let folder = path.parent().unwrap_or(path);
+        // xdg-open can't select inside a folder — for a file open its
+        // parent, for a directory open the directory itself like the
+        // Windows arm. Root has no parent — `.` would open the app's cwd.
+        let folder = if path.is_dir() {
+            path
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("/"))
+        };
         vec![folder.as_os_str().to_os_string()]
     }
 }
 
 fn color4(values: &[f32], fallback: [f32; 4]) -> [f32; 4] {
-    let mut out = fallback;
-    for (index, value) in values.iter().take(4).enumerate() {
-        out[index] = *value;
+    // A short or non-finite array must not blend channels with the
+    // fallback — take it whole or not at all.
+    if values.len() == 4 && values.iter().all(|v| v.is_finite()) {
+        return [values[0], values[1], values[2], values[3]];
     }
-    out
+    fallback
 }
 
 /// Release builds have no console, so a panic is appended to the crash log for support.
@@ -423,7 +440,6 @@ pub fn run() {
             scan_kit_data_dirs,
             scan_kit_read_catalog,
             scan_kit_forget_data_dir,
-            scan_kit_last_data_dir,
             scan_kit_window_geometry,
             scan_kit_set_window_geometry,
             scan_kit_last_main_tab,

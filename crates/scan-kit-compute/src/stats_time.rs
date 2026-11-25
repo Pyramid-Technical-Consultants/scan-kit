@@ -65,6 +65,11 @@ fn reduce_input(
     var count = 0u;
     for (var i = gid.x * 256u + lid.x; i < n; i = i + stride) {
         let v = input[i];
+        // reduce_finite drops non-finite samples — the GPU must match or
+        // NaN folds into sum/count and min/max is driver-indeterminate.
+        if (!(abs(v) <= 3.4028235e38)) {
+            continue;
+        }
         if (count == 0u) {
             lo = v;
             hi = v;
@@ -304,7 +309,10 @@ impl Reducer {
                 timeout: Some(std::time::Duration::from_millis(50)),
             }) {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
-                Err(err) => return Err(err.to_string()),
+                Err(err) => {
+                    job.staging.unmap();
+                    return Err(err.to_string());
+                }
             }
             match receiver.try_recv() {
                 Ok(result) => {
@@ -312,9 +320,13 @@ impl Reducer {
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(err) => return Err(err.to_string()),
+                Err(err) => {
+                    job.staging.unmap();
+                    return Err(err.to_string());
+                }
             }
             if started.elapsed() > std::time::Duration::from_secs(30) {
+                job.staging.unmap();
                 return Err("GPU readback timed out".into());
             }
         }
@@ -446,7 +458,7 @@ fn a_short_column_matches_the_cpu_reduction() {
     assert_eq!(check.min, want.min);
     assert_eq!(check.max, want.max);
     let scale = want.sum.abs().max(1.0);
-    assert!((check.sum - want.sum).abs() / scale < 1.0e-4);
+    assert!((f64::from(check.sum) - want.sum).abs() / scale < 1.0e-4);
 }
 
 #[test]
@@ -478,7 +490,7 @@ fn stats_cpu_vs_gpu_reduction() {
         assert_eq!(check.min, want.min, "n={n}");
         assert_eq!(check.max, want.max, "n={n}");
         let scale = want.sum.abs().max(1.0);
-        let sum_ratio = (check.sum - want.sum).abs() / scale;
+        let sum_ratio = (f64::from(check.sum) - want.sum).abs() / scale;
         assert!(
             sum_ratio < 1.0e-2,
             "n={n} gpu sum {} cpu {}",

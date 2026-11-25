@@ -82,6 +82,11 @@ pub fn rbe_limits(model: RbeModel, letd: f64, alpha_beta: f64) -> Option<(f64, f
 
 /// RBE per voxel: `dose` physical Gy per fraction, `letd` LETd keV/µm in water.
 pub fn rbe(model: RbeModel, dose: f64, letd: f64, alpha_beta: f64) -> f64 {
+    // A non-finite dose (masked/padding voxel) stays masked — `max(NaN, x)`
+    // would otherwise clamp to 1e-6 and paint RBEmax as a plausible value.
+    if !dose.is_finite() {
+        return f64::NAN;
+    }
     match model {
         RbeModel::Constant => RBE_CONSTANT,
         RbeModel::Unkelbach => 1.0 + UNKELBACH_C * letd.max(0.0),

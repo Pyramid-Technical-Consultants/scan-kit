@@ -116,7 +116,9 @@ fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan
     let pairs = [nx.checked_mul(ny), nx.checked_mul(nz), ny.checked_mul(nz)];
     let voxels = pairs[0]
         .and_then(|plane| plane.checked_mul(nz))
-        .filter(|voxels| pairs.iter().all(Option::is_some) && *voxels <= values.len());
+        .filter(|voxels| {
+            pairs.iter().all(Option::is_some) && *voxels <= values.len() && *voxels > 0
+        });
     let Some(voxels) = voxels else {
         return VolumeScan {
             bricks: Vec::new(),
@@ -336,7 +338,7 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
     if nx
         .checked_mul(ny)
         .and_then(|plane| plane.checked_mul(nz))
-        .is_none_or(|voxels| voxels > values.len())
+        .is_none_or(|voxels| voxels > values.len() || voxels == 0)
     {
         return VolumeScan {
             bricks: Vec::new(),
@@ -1169,16 +1171,17 @@ pub fn sample_mm(volume: &Volume, mm: [f32; 3], filter: u8) -> f32 {
 }
 
 pub fn sample_index(volume: &Volume, x: f32, y: f32, z: f32, filter: u8) -> f32 {
+    // NaN folds to index 0 through `as i32` in every filter branch — a
+    // non-finite coordinate is a miss, not corner-voxel data.
+    if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+        return 0.0;
+    }
     match filter {
         2 => cubic(volume, x, y, z),
         1 => linear(volume, x, y, z),
         _ => {
             // Python nearest is floor(cell), and a miss outside the grid is 0.
             // `x` is cell - 0.5, the same coordinate linear interpolation uses.
-            // NaN folds to index 0 through `as i32` — treat it as a miss too.
-            if !(x.is_finite() && y.is_finite() && z.is_finite()) {
-                return 0.0;
-            }
             let [nx, ny, nz] = volume.shape;
             let ix = (x + 0.5).floor() as i32;
             let iy = (y + 0.5).floor() as i32;
@@ -1328,7 +1331,20 @@ mod tests {
         assert!(integrate > 0.0);
         assert!(maximum <= 4.0 + 1e-3);
         assert!(transparent > 0.0);
-        assert!(integrate != maximum || transparent != maximum);
+        // The axis chord runs length-1 through the hot voxel, so integrate
+        // coincides with maximum on this fixture — pin the fog composite
+        // strictly below the peak it attenuates.
+        assert!(transparent < maximum, "fog {transparent} vs max {maximum}");
+        // A flat cube gives the modes room to disagree: the axis chord sums
+        // three voxels while the maximum reads one.
+        let mut flat = peaked();
+        flat.values.fill(1.0);
+        let integrate = ray_value(&flat, 0.4, 0.3, 0, 0, 0.5, 0.5);
+        let maximum = ray_value(&flat, 0.4, 0.3, 1, 0, 0.5, 0.5);
+        assert!(
+            integrate > maximum,
+            "integrate {integrate} vs max {maximum}"
+        );
     }
 
     #[test]

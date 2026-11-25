@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use scan_kit_core::{
-    column_is_integer, column_scale_factor, resolve_concept_column, resolve_requested_column,
-    DERIVED_SUMS, IC3_QUAD_ZERO_FILL,
+    column_is_integer, column_scale_factor, concept_of, normalize_column_name,
+    resolve_concept_column, resolve_requested_column, DERIVED_SUMS, IC3_QUAD_ZERO_FILL,
 };
 use serde_json::{json, Number, Value};
 
@@ -20,10 +20,15 @@ pub fn load_columns(
     if requested.is_empty() {
         return Err("columns is required".to_owned());
     }
+    // rows x requested materializes into `series` — cap the fan-out so a
+    // caller cannot turn a capped input file into an unbounded output.
+    if requested.len() > 256 {
+        return Err("at most 256 columns can be requested".to_owned());
+    }
     if !storage.exists() {
         return Err(format!("{} does not exist", storage.display()));
     }
-    let timeslices = discover::read_timeslices(storage);
+    let timeslices = discover::read_timeslices_for(storage, session_id);
     let map = discover::read_session_file(storage, session_id, "input_map.csv");
     let spots = discover::read_session_file(storage, session_id, "spot_data.csv");
     // Score the union of timeslice headers — a column that only appears in a
@@ -93,6 +98,8 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         resolve_concept_column(&headers, "energy").map(|name| header_index(&headers, name));
     let x = resolve_concept_column(&headers, "x_position").map(|name| header_index(&headers, name));
     let y = resolve_concept_column(&headers, "y_position").map(|name| header_index(&headers, name));
+    let layer_id =
+        resolve_concept_column(&headers, "layer_id").map(|name| header_index(&headers, name));
     let mut indexes = Vec::new();
     if let Some(Some(index)) = energy {
         indexes.push(index);
@@ -101,6 +108,9 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         indexes.push(index);
     }
     if let Some(Some(index)) = y {
+        indexes.push(index);
+    }
+    if let Some(Some(index)) = layer_id {
         indexes.push(index);
     }
     if indexes.is_empty() {
@@ -124,12 +134,21 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         None
     };
     let y_values = if y.and_then(|index| index).is_some() {
+        let values = columns.get(slot).cloned();
+        slot += 1;
+        values
+    } else {
+        None
+    };
+    let layer_ids = if layer_id.and_then(|index| index).is_some() {
         columns.get(slot).cloned()
     } else {
         None
     };
     let _ = slot;
-    let layers = energies.as_ref().and_then(|values| {
+    // layer_id is the identity the rest of the pipeline counts — a
+    // same-energy multi-layer plan undercounts under an energy tally.
+    let distinct = |values: &[Option<f64>]| -> Option<i32> {
         let mut seen = HashSet::new();
         for value in values.iter().flatten() {
             if value.is_finite() {
@@ -142,7 +161,11 @@ fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {
         } else {
             i32::try_from(seen.len()).ok()
         }
-    });
+    };
+    let layers = layer_ids
+        .as_deref()
+        .and_then(distinct)
+        .or_else(|| energies.as_deref().and_then(distinct));
     let mut spans = Vec::new();
     for values in [x_values, y_values].into_iter().flatten() {
         let finite: Vec<f64> = values
@@ -196,17 +219,19 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
     // file lacks it, not just the first.
     let mut seen = vec![false; requested.len()];
     let mut series = vec![Vec::new(); requested.len()];
+    let mut series_cells = 0_usize;
+    let mut failures = 0_usize;
     for file in files {
-        let file_headers = header_of(file)?;
+        // One corrupt file must not fail columns the healthy files cover —
+        // routing already tolerated the same failure via `is_ok_and`.
+        let Ok(file_headers) = header_of(file) else {
+            failures += 1;
+            continue;
+        };
         let file_sources: Vec<Source> = requested
             .iter()
             .map(|name| source_for(&file_headers, name))
             .collect();
-        for (column, source) in file_sources.iter().enumerate() {
-            if !matches!(source, Source::Missing) {
-                seen[column] = true;
-            }
-        }
         let mut indexes = Vec::new();
         for source in &file_sources {
             if let Some(list) = source.indexes() {
@@ -218,12 +243,36 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
             }
         }
         let (loaded, rows) = if indexes.is_empty() {
-            (Vec::new(), count_rows(file)?)
+            match count_rows(file) {
+                Ok(rows) => (Vec::new(), rows),
+                Err(_) => {
+                    failures += 1;
+                    continue;
+                }
+            }
         } else {
-            let indexed = read_indexed(file, &indexes)?;
-            let rows = indexed.columns.first().map(Vec::len).unwrap_or(0);
-            (indexed.columns, rows)
+            match read_indexed(file, &indexes) {
+                Ok(indexed) => {
+                    let rows = indexed.columns.first().map(Vec::len).unwrap_or(0);
+                    (indexed.columns, rows)
+                }
+                Err(_) => {
+                    failures += 1;
+                    continue;
+                }
+            }
         };
+        for (column, source) in file_sources.iter().enumerate() {
+            if !matches!(source, Source::Missing) {
+                seen[column] = true;
+            }
+        }
+        // `series` gets rows x requested cells per file — bound the total
+        // like read_indexed bounds its own materialization.
+        series_cells = series_cells.saturating_add(rows.saturating_mul(requested.len()));
+        if series_cells > 1 << 27 {
+            return Err("the table is too large".into());
+        }
         let mut index_slot = std::collections::HashMap::<usize, usize>::new();
         for (slot, index) in indexes.iter().enumerate() {
             index_slot.insert(*index, slot);
@@ -235,6 +284,9 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
         }
     }
     if seen.iter().all(|present| !present) {
+        if failures > 0 {
+            return Err("no session csv was readable".into());
+        }
         return Err(no_columns_message(requested));
     }
     let mut columns = Vec::new();
@@ -244,7 +296,21 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
             missing.push(name.clone());
             continue;
         }
-        columns.push(column_json(name, column_is_integer(name), &series[index]));
+        let concept = concept_of(name).unwrap_or(name);
+        // f32 rounding silently drops timestamp precision (ms past ~4.7 h,
+        // ns entirely) and finite values past ~3.4e38 — emit f64 when the
+        // concept or the data needs it.
+        let wide = matches!(concept, "timestamp" | "time_ns")
+            || series[index]
+                .iter()
+                .flatten()
+                .any(|v| v.is_finite() && !(*v as f32).is_finite());
+        columns.push(column_json(
+            name,
+            column_is_integer(concept),
+            wide,
+            &series[index],
+        ));
     }
     let rows = series.iter().map(Vec::len).max().unwrap_or(0);
     Ok(json!({
@@ -254,7 +320,7 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
     }))
 }
 
-fn column_json(name: &str, integer: bool, values: &[Option<f64>]) -> Value {
+fn column_json(name: &str, integer: bool, wide: bool, values: &[Option<f64>]) -> Value {
     if integer {
         json!({
             "name": name,
@@ -269,6 +335,15 @@ fn column_json(name: &str, integer: bool, values: &[Option<f64>]) -> Value {
                         None
                     }
                 }).map(|number| json!(number)).unwrap_or(Value::Null)
+            }).collect::<Vec<_>>(),
+        })
+    } else if wide {
+        json!({
+            "name": name,
+            "dtype": "f64",
+            "values": values.iter().map(|value| match value {
+                Some(number) if number.is_finite() => Value::from(*number),
+                _ => Value::Null,
             }).collect::<Vec<_>>(),
         })
     } else {
@@ -299,13 +374,13 @@ fn value_at(
                 .flatten()
                 .map(|value| value * scale)
         }
-        Source::Derived { indexes, scale } => {
+        Source::Derived { indexes, scales } => {
             let mut sum = 0.0;
-            for index in indexes {
+            for (index, scale) in indexes.iter().zip(scales) {
                 let slot = index_slot.get(index)?;
-                sum += loaded.get(*slot)?.get(row).copied().flatten()?;
+                sum += loaded.get(*slot)?.get(row).copied().flatten()? * scale;
             }
-            Some(sum * scale)
+            Some(sum)
         }
         Source::Zeros => Some(0.0),
         Source::Missing => None,
@@ -313,8 +388,14 @@ fn value_at(
 }
 
 enum Source {
-    Index { index: usize, scale: f64 },
-    Derived { indexes: Vec<usize>, scale: f64 },
+    Index {
+        index: usize,
+        scale: f64,
+    },
+    Derived {
+        indexes: Vec<usize>,
+        scales: Vec<f64>,
+    },
     Zeros,
     Missing,
 }
@@ -340,6 +421,7 @@ fn source_for(headers: &[String], requested: &str) -> Source {
     }
     if let Some(derived) = DERIVED_SUMS.iter().find(|item| item.target == requested) {
         let mut indexes = Vec::new();
+        let mut raws = Vec::new();
         for source in derived.sources {
             let Some(raw) = resolve_requested_column(headers, source) else {
                 indexes.clear();
@@ -350,15 +432,31 @@ fn source_for(headers: &[String], requested: &str) -> Source {
                 break;
             };
             indexes.push(index);
+            raws.push(raw);
         }
         if indexes.len() == derived.sources.len() {
+            // The r_ prefix marks raw coulombs needing derived.scale; a
+            // resolved source without it (G3 names are already nA) must
+            // not inherit the 1e12 factor — per component, so a mixed
+            // header applies the right factor per term.
             return Source::Derived {
                 indexes,
-                scale: derived.scale,
+                scales: raws
+                    .iter()
+                    .map(|raw| {
+                        if normalize_column_name(raw).starts_with("r_") {
+                            derived.scale
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect(),
             };
         }
     }
-    if IC3_QUAD_ZERO_FILL.contains(&requested)
+    if IC3_QUAD_ZERO_FILL
+        .iter()
+        .any(|name| normalize_column_name(name) == normalize_column_name(requested))
         && resolve_concept_column(headers, "ic3_current_a").is_some()
     {
         return Source::Zeros;
@@ -370,8 +468,49 @@ fn header_index(headers: &[String], raw: &str) -> Option<usize> {
     headers.iter().position(|header| header == raw)
 }
 
+/// Instrument exports sometimes banner a file with leading `#` lines —
+/// those are comments before the header. The csv comment option can't be
+/// used: it would also drop a `#`-prefixed header line and any data row
+/// whose first field starts with `#`.
+pub(crate) fn strip_csv_banner(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first() == Some(&b'#') {
+        let end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        if hash_header_line(&bytes[..end]) {
+            break;
+        }
+        bytes = match end == bytes.len() {
+            true => &bytes[bytes.len()..],
+            false => &bytes[end + 1..],
+        };
+    }
+    bytes
+}
+
+/// A `#`-leading line can be the schema itself (`#NO,ENERGY(MeV),...`): it is
+/// comma-separated, has no prose spacing, and carries no numeric fields. A
+/// `#`-first data row or a real banner comment does not match.
+pub(crate) fn hash_header_line(line: &[u8]) -> bool {
+    line.len() > 1
+        && line.contains(&b',')
+        && !line.contains(&b' ')
+        && line[1..]
+            .split(|&b| b == b',')
+            .filter(|field| !field.is_empty())
+            .all(|field| {
+                std::str::from_utf8(field)
+                    .ok()
+                    .and_then(|f| f.parse::<f64>().ok())
+                    .is_none()
+            })
+}
+
 fn header_of(bytes: &[u8]) -> Result<Vec<String>, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(strip_csv_banner(bytes));
     let headers = reader.headers().map_err(|err| err.to_string())?;
     Ok(headers.iter().map(clean_header).collect())
 }
@@ -381,7 +520,9 @@ struct IndexedCsv {
 }
 
 fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(strip_csv_banner(bytes));
     // The header row is consumed so the records below are data.
     reader.headers().map_err(|err| err.to_string())?;
     let mut columns = vec![Vec::new(); indexes.len()];
@@ -404,7 +545,9 @@ fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
 }
 
 fn count_rows(bytes: &[u8]) -> Result<usize, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(strip_csv_banner(bytes));
     let mut rows = 0;
     for record in reader.records() {
         record.map_err(|err| err.to_string())?;
@@ -422,11 +565,13 @@ fn parse_cell(text: &str) -> Option<f64> {
     if text.is_empty() {
         return None;
     }
-    match text {
-        "true" | "True" | "TRUE" => Some(1.0),
-        "false" | "False" | "FALSE" => Some(0.0),
-        _ => text.parse().ok(),
+    if text.eq_ignore_ascii_case("true") {
+        return Some(1.0);
     }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(0.0);
+    }
+    text.parse().ok()
 }
 
 #[cfg(test)]
@@ -435,13 +580,85 @@ mod tests {
 
     #[test]
     fn an_integer_column_keeps_nan_null_instead_of_reporting_zero() {
-        let column = column_json("spot_no", true, &[Some(3.0), Some(f64::NAN), None]);
+        let column = column_json("spot_no", true, false, &[Some(3.0), Some(f64::NAN), None]);
         assert_eq!(column["values"], json!([3, null, null]));
     }
 
     #[test]
     fn a_fractional_value_in_an_integer_column_is_null_not_floored() {
-        let column = column_json("spot_no", true, &[Some(3.7), Some(-3.7), Some(4.0)]);
+        let column = column_json("spot_no", true, false, &[Some(3.7), Some(-3.7), Some(4.0)]);
         assert_eq!(column["values"], serde_json::json!([null, null, 4]));
+    }
+
+    #[test]
+    fn a_corrupt_file_does_not_fail_columns_the_healthy_file_covers() {
+        let good = b"energy,x_position\n70.5,1.0\n80.0,2.0\n".to_vec();
+        let bad = vec![0xff, 0xfe, 0x00, b'a'];
+        let loaded = project_files(
+            &[good, bad],
+            &["energy".to_owned(), "x_position".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(loaded["rows"], 2);
+        assert!(loaded["missing"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_set_of_files_errors_instead_of_a_missing_column_list() {
+        let bad = vec![vec![0xff, 0xfe]];
+        let err = project_files(&bad, &["energy".to_owned()]).unwrap_err();
+        assert!(err.contains("readable"), "{err}");
+    }
+
+    #[test]
+    fn an_alias_of_an_integer_concept_stays_integer_typed() {
+        // "layer" resolves to the layer_id concept — the dtype must follow
+        // the data, not the caller's spelling.
+        let files = vec![b"layer,energy\n1,70.5\n2,80.0\n".to_vec()];
+        let loaded = project_files(&files, &["layer".to_owned()]).unwrap();
+        assert_eq!(loaded["columns"][0]["dtype"], "i32");
+    }
+
+    #[test]
+    fn a_timestamp_concept_column_keeps_f64_precision() {
+        // f32 rounds ms past ~4.7 h — the timestamp concept declares f64.
+        let files = vec![b"timestamp,energy\n1e12,70.5\n".to_vec()];
+        let loaded = project_files(&files, &["timestamp".to_owned()]).unwrap();
+        assert_eq!(loaded["columns"][0]["dtype"], "f64");
+        assert_eq!(loaded["columns"][0]["values"][0], json!(1e12));
+    }
+
+    #[test]
+    fn a_finite_value_past_f32_range_is_f64_not_null() {
+        let files = vec![b"energy\n1e40\n".to_vec()];
+        let loaded = project_files(&files, &["energy".to_owned()]).unwrap();
+        assert_eq!(loaded["columns"][0]["dtype"], "f64");
+        assert_eq!(loaded["columns"][0]["values"][0], json!(1e40));
+    }
+
+    #[test]
+    fn a_derived_sum_without_the_r_prefix_is_not_scaled_to_nanoamps() {
+        // G3 names are already nA — the resolved (non-r_) source must not
+        // inherit the 1e12 coulombs factor.
+        let files = vec![b"ic1_x_strip_sum,ic1_y_strip_sum\n3.0,4.0\n".to_vec()];
+        let loaded = project_files(&files, &["ic1_strip_sum".to_owned()]).unwrap();
+        assert_eq!(loaded["columns"][0]["values"][0], json!(7.0));
+    }
+
+    #[test]
+    fn a_derived_sum_on_raw_columns_scales_by_1e12() {
+        let files = vec![b"r_ic1_x_strip_sum,r_ic1_y_strip_sum\n3e-12,4e-12\n".to_vec()];
+        let loaded = project_files(&files, &["ic1_strip_sum".to_owned()]).unwrap();
+        assert_eq!(loaded["columns"][0]["values"][0], json!(7.0));
+    }
+
+    #[test]
+    fn the_zero_fill_check_matches_the_normalized_request() {
+        // "ic3_current_B" resolves the same concept as "ic3_current_b" —
+        // case must not change seen-vs-missing.
+        let files = vec![b"ic3_current_a,energy\n1.0,70.5\n".to_vec()];
+        let loaded = project_files(&files, &["ic3_current_B".to_owned()]).unwrap();
+        assert!(loaded["missing"].as_array().unwrap().is_empty());
+        assert_eq!(loaded["columns"][0]["values"][0], json!(0.0));
     }
 }

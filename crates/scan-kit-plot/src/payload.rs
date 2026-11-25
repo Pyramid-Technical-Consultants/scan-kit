@@ -153,18 +153,54 @@ pub fn encode_plot_reusing(
         .shape
         .iter()
         .fold(1usize, |acc, axis| acc.saturating_mul(*axis as usize));
+    // The decoder bounds session cubes at 64 total sharing a 1<<30 voxel
+    // budget — a scene past the ceiling would emit a payload its own
+    // decoder refuses, so keep the cubes that fit (volume_shape treatment).
+    fn keep_cubes(
+        cubes: &[scan_kit_core::SessionDose],
+        count: &mut usize,
+        voxels: &mut usize,
+    ) -> Vec<usize> {
+        let mut kept = Vec::new();
+        for (index, dose) in cubes.iter().enumerate() {
+            // The wire count is values.len() and read_cube refuses a cube
+            // past 1<<28 — charge the shared budget in the same units and
+            // keep only what the per-cube cap also admits.
+            let wire = dose.values.len();
+            if *count > 0 && wire <= (1usize << 28).min(*voxels) {
+                *count -= 1;
+                *voxels -= wire;
+                kept.push(index);
+            }
+        }
+        kept
+    }
+    let mut cube_count = 64usize;
+    let mut cube_voxels = 1usize << 30;
+    let kept_sessions = keep_cubes(&scene.volume.sessions, &mut cube_count, &mut cube_voxels);
+    let kept_plans = keep_cubes(&scene.volume.plans, &mut cube_count, &mut cube_voxels);
+    let kept_companions = keep_cubes(&scene.volume.companions, &mut cube_count, &mut cube_voxels);
+    // serde_json writes NaN/inf as null, which the decoder refuses — a
+    // non-finite scene float would sink the whole frame. Clamp at encode.
+    fn finite(value: f32) -> f32 {
+        if value.is_finite() {
+            value
+        } else {
+            0.0
+        }
+    }
     let header = PlotHeader {
         title: scene.title.clone(),
         controls: scene.controls.clone(),
         table: scene.table.clone(),
         panels: header_panels(&scene.panels),
         columns: scene.columns,
-        column_weights: scene.column_weights.clone(),
-        row_weights: scene.row_weights.clone(),
-        row_splits: scene.row_splits.clone(),
+        column_weights: scene.column_weights.iter().copied().map(finite).collect(),
+        row_weights: scene.row_weights.iter().copied().map(finite).collect(),
+        row_splits: scene.row_splits.iter().copied().map(finite).collect(),
         side: scene.side,
-        background,
-        foreground,
+        background: background.map(finite),
+        foreground: foreground.map(finite),
         quality: quality.into(),
         line_token: stamp.token.to_string(),
         reuse_lines: reuse,
@@ -174,35 +210,53 @@ pub fn encode_plot_reusing(
         lines: line_count,
         points: marks.points.len() as u32,
         quads: marks.quads.len() as u32,
-        volume_shape: if scene.volume.values.len() >= voxels {
+        volume_shape: if scene.volume.values.len() >= voxels && voxels <= (1 << 28) {
             scene.volume.shape
         } else {
-            // A shape the values don't fill would desync the decoder.
+            // A shape the values don't fill — or one over the decoder's
+            // cube bound — would desync or be refused on decode.
             [0, 0, 0]
         },
-        volume_origin: scene.volume.origin,
-        volume_voxel: scene.volume.voxel,
-        volume_spacing: scene.volume.spacing,
+        volume_origin: scene.volume.origin.map(finite),
+        volume_voxel: finite(scene.volume.voxel),
+        volume_spacing: scene.volume.spacing.map(finite),
         volume_ramp: scene.volume.ramp,
-        volume_lo: scene.volume.lo,
-        volume_hi: scene.volume.hi,
-        volume_base_lo: scene.volume.base_lo,
-        volume_base_hi: scene.volume.base_hi,
-        volume_gain: scene.volume.gain,
-        volume_opacity: scene.volume.opacity,
+        volume_lo: finite(scene.volume.lo),
+        volume_hi: finite(scene.volume.hi),
+        volume_base_lo: finite(scene.volume.base_lo),
+        volume_base_hi: finite(scene.volume.base_hi),
+        volume_gain: finite(scene.volume.gain),
+        volume_opacity: finite(scene.volume.opacity),
         volume_mode: scene.volume.mode,
         volume_filter: scene.volume.filter,
-        volume_gantry: scene.volume.gantry,
+        volume_gantry: finite(scene.volume.gantry),
         volume_unit: scene.volume.unit.clone(),
         volume_phantom: scene.volume.show_phantom,
-        volume_field: scene.volume.field,
+        volume_field: scene.volume.field.map(finite),
         volume_ct: scene.volume.ct.len() >= voxels,
         volume_labels: scene.volume.labels.len() >= voxels,
-        volume_sessions: scene.volume.sessions.len() as u32,
-        volume_plans: scene.volume.plans.len() as u32,
-        volume_companions: scene.volume.companions.len() as u32,
-        volume_session_focus: scene.volume.session_focus,
-        volume_colors: scene.volume.session_colors.clone(),
+        volume_sessions: kept_sessions.len() as u32,
+        volume_plans: kept_plans.len() as u32,
+        volume_companions: kept_companions.len() as u32,
+        // focus and colors index the full sessions list — a dropped
+        // mid-list cube shifts every later index, so renumber both or the
+        // decoder focuses/colors the wrong session.
+        volume_session_focus: kept_sessions
+            .iter()
+            .position(|&index| index as u32 == scene.volume.session_focus)
+            // The focused cube was dropped — snap to the nearest kept
+            // session before it, not the unrelated first cube.
+            .or_else(|| {
+                kept_sessions
+                    .partition_point(|&index| (index as u32) < scene.volume.session_focus)
+                    .checked_sub(1)
+            })
+            .unwrap_or(0) as u32,
+        volume_colors: kept_sessions
+            .iter()
+            .filter_map(|&index| scene.volume.session_colors.get(index).copied())
+            .map(|color| color.map(finite))
+            .collect(),
     };
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;
     let mut out = Vec::with_capacity(
@@ -233,7 +287,11 @@ pub fn encode_plot_reusing(
     for pixels in &marks.heatmaps {
         out.extend_from_slice(pixels.as_slice());
     }
-    if voxels > 0 && voxels != usize::MAX && scene.volume.values.len() >= voxels {
+    if voxels > 0
+        && voxels != usize::MAX
+        && voxels <= (1 << 28)
+        && scene.volume.values.len() >= voxels
+    {
         write_cube(&mut out, &scene.volume.values[..voxels]);
         if scene.volume.ct.len() >= voxels {
             write_f32s(&mut out, &scene.volume.ct[..voxels]);
@@ -275,12 +333,15 @@ pub fn encode_plot_reusing(
         }
         write_scan(&mut out, &scan);
     }
-    for session in scene
-        .volume
-        .sessions
+    for session in kept_sessions
         .iter()
-        .chain(&scene.volume.plans)
-        .chain(&scene.volume.companions)
+        .map(|&index| &scene.volume.sessions[index])
+        .chain(kept_plans.iter().map(|&index| &scene.volume.plans[index]))
+        .chain(
+            kept_companions
+                .iter()
+                .map(|&index| &scene.volume.companions[index]),
+        )
     {
         write_session(&mut out, session);
     }
@@ -366,6 +427,13 @@ fn write_cube(out: &mut Vec<u8>, values: &[f32]) {
 }
 
 fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
+    // ponytail: hard cap so a crafted header cannot force a giant alloc.
+    // Real patient scenes ship the full CT grid (512^2 x ~300 slices is
+    // routine); 2^28 voxels is ~1 GiB of f32 and still bounded for wasm32.
+    // Reject before the block walk — its per-block tuples amplify ~4x.
+    if count > 1 << 28 {
+        return Err("plot payload volume is too large".into());
+    }
     // Walk the blocks first, so a bad count fails before the cube is allocated.
     let mut walk = Reader {
         bytes: reader.bytes,
@@ -386,12 +454,6 @@ fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> 
             .ok_or("plot payload cube is malformed")?;
         blocks.push((start, end, walk.take(bytes)?));
         at = end;
-    }
-    // ponytail: hard cap so a crafted header cannot force a giant alloc.
-    // Real patient scenes ship the full CT grid (512^2 x ~300 slices is
-    // routine); 2^28 voxels is ~1 GiB of f32 and still bounded for wasm32.
-    if count > 1 << 28 {
-        return Err("plot payload volume is too large".into());
     }
     let mut values = vec![0.0f32; count];
     for (start, end, raw) in blocks {
@@ -513,7 +575,17 @@ fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
 }
 
 pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
-    decode_plot(bytes).map(|(header, _, _, _, _)| header)
+    // The header is the leading JSON — decoding the whole payload would
+    // allocate every dose cube just to answer this.
+    if bytes.len() < 4 {
+        return Err("plot payload is truncated".into());
+    }
+    let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let end = 4usize
+        .checked_add(json_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or("plot payload is truncated")?;
+    serde_json::from_slice(&bytes[4..end]).map_err(|err| err.to_string())
 }
 
 impl PlotHeader {
@@ -562,10 +634,11 @@ pub(crate) fn decode_plot(
     let lines = decode_lines(&line_bytes);
     let points = decode_points(&point_bytes);
     let quads = decode_quads(&quad_bytes);
-    if header
-        .heatmap_size
-        .iter()
-        .any(|(cols, rows)| *cols == 0 || *rows == 0 || *cols > 4096 || *rows > 4096)
+    if header.heatmap_size.len() > 1024
+        || header
+            .heatmap_size
+            .iter()
+            .any(|(cols, rows)| *cols == 0 || *rows == 0 || *cols > 4096 || *rows > 4096)
     {
         return Err("plot payload heatmap size out of range".into());
     }
@@ -592,6 +665,11 @@ pub(crate) fn decode_plot(
     if marks.panels.len() != header.panels.len() {
         return Err("plot payload panel count mismatch".into());
     }
+    // Each panel costs a bind group, a uniform slot, and per-frame draws —
+    // a crafted header must not mint them unbounded.
+    if header.panels.len() > 1024 {
+        return Err("plot payload panel count out of range".into());
+    }
     let fits = |start: u32, count: u32, len: usize| {
         (start as usize)
             .checked_add(count as usize)
@@ -606,6 +684,13 @@ pub(crate) fn decode_plot(
         marks.lines.len()
     };
     for batch in &marks.panels {
+        if batch.heats.len() > 4096
+            || batch.line_runs.len() > 4096
+            || batch.point_runs.len() > 4096
+            || batch.clouds.len() > 4096
+        {
+            return Err("plot payload run count out of range".into());
+        }
         if !fits(batch.line_start, batch.line_count, line_len)
             || !fits(batch.point_start, batch.point_count, marks.points.len())
             || !fits(batch.quad_start, batch.quad_count, marks.quads.len())
@@ -616,6 +701,9 @@ pub(crate) fn decode_plot(
                 (*quad as usize) < solid_end
                     || *quad as usize >= marks.quads.len()
                     || *texture >= marks.heatmaps.len()
+                    // The GPU draws the pair's texture; the CPU sampler
+                    // reads the quad's own heatmap — they must agree.
+                    || marks.quads[*quad as usize].heatmap != Some(*texture)
             })
             || batch
                 .line_runs
@@ -625,6 +713,13 @@ pub(crate) fn decode_plot(
                 .point_runs
                 .iter()
                 .any(|run| !fits(run.start, run.count, marks.points.len()))
+            || batch.point_runs.iter().any(|run| {
+                run.timed && {
+                    let run = &marks.points[run.start as usize..(run.start + run.count) as usize];
+                    run.iter().any(|point| !point.time.is_finite())
+                        || run.windows(2).any(|pair| pair[0].time > pair[1].time)
+                }
+            })
             || batch.clouds.iter().any(|cloud| {
                 !fits(cloud.start, cloud.count, marks.points.len())
                     || cloud.heatmap.is_some_and(|index| {
@@ -635,11 +730,22 @@ pub(crate) fn decode_plot(
             return Err("plot payload index out of range".into());
         }
     }
+    let heated: std::collections::HashSet<u32> = marks
+        .panels
+        .iter()
+        .flat_map(|batch| batch.heats.iter().map(|(quad, _)| *quad))
+        .collect();
     if marks.quads.iter().any(|quad| {
         quad.heatmap
             .is_some_and(|index| index >= marks.heatmaps.len())
+    }) || marks.quads.iter().enumerate().any(|(index, quad)| {
+        // Solid is heat (-0.5,0.5]; a textured or dose heat (0.5,2.5) is
+        // only coherent on a heats-referenced quad — anything else reads
+        // screen-space on the GPU but fills data-space on the CPU.
+        !(-0.5..=0.5).contains(&quad.heat)
+            && !(heated.contains(&(index as u32)) && (0.5..2.5).contains(&quad.heat))
     }) {
-        return Err("plot payload heatmap index out of range".into());
+        return Err("plot payload quad value out of range".into());
     }
     let voxels = header
         .volume_shape
@@ -668,6 +774,17 @@ pub(crate) fn decode_plot(
         session_focus: header.volume_session_focus,
         ..VolumeMark::default()
     };
+    // Real scenes ship a handful of session cubes; a crafted count is a
+    // ~40-byte-per-GiB allocation amplifier. Header-known — check before
+    // the volume decode pays for a reject.
+    if header
+        .volume_sessions
+        .saturating_add(header.volume_plans)
+        .saturating_add(header.volume_companions)
+        > 64
+    {
+        return Err("plot payload session count out of range".into());
+    }
     let mut scan = None;
     if voxels > 0 {
         volume.values = read_cube(&mut reader, voxels)?;
@@ -685,16 +802,6 @@ pub(crate) fn decode_plot(
                 header.volume_shape[2] as usize,
             ],
         )?);
-    }
-    // Real scenes ship a handful of session cubes; a crafted count is a
-    // ~40-byte-per-GiB allocation amplifier.
-    if header
-        .volume_sessions
-        .saturating_add(header.volume_plans)
-        .saturating_add(header.volume_companions)
-        > 64
-    {
-        return Err("plot payload session count out of range".into());
     }
     let mut voxel_budget = 1usize << 30;
     volume.sessions = read_sessions(&mut reader, header.volume_sessions, &mut voxel_budget)?;
@@ -869,6 +976,70 @@ mod tests {
     }
 
     #[test]
+    fn a_guide_with_duplicate_vertices_round_trips_aligned() {
+        // The marks writer used to drop consecutive duplicates while the
+        // byte writer emitted them — header.lines under-counted and every
+        // section after the lines decoded at the wrong offset.
+        let scene = PlotScene {
+            title: "dup".into(),
+            panels: vec![Panel {
+                title: "a".into(),
+                y_label: String::new(),
+                x_label: String::new(),
+                xmin: 0.0,
+                xmax: 4.0,
+                ymin: 0.0,
+                ymax: 4.0,
+                series: vec![
+                    Series::Guide {
+                        xs: vec![0.0, 0.0, 1.0],
+                        ys: vec![0.0, 0.0, 1.0],
+                        color: [0.5, 0.5, 0.5, 1.0],
+                        thickness: 1.0,
+                    },
+                    Series::Points {
+                        xs: vec![1.0],
+                        ys: vec![2.0],
+                        color: [0.0, 1.0, 0.0, 1.0],
+                        radius: 3.0,
+                        times: Vec::new(),
+                    },
+                ],
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: vec![1.0],
+            row_weights: vec![1.0],
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
+        };
+        let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
+        let (header, marks, _, _, _) = decode_plot(&bytes).unwrap();
+        let built = build_marks(&scene.panels);
+        // NaN break records never `==`, so compare counts and placement.
+        assert_eq!(marks.lines.len(), built.lines.len());
+        assert_eq!(header.lines as usize, marks.lines.len());
+        assert_eq!(
+            marks
+                .lines
+                .iter()
+                .map(|l| l.a[0].is_nan())
+                .collect::<Vec<_>>(),
+            built
+                .lines
+                .iter()
+                .map(|l| l.a[0].is_nan())
+                .collect::<Vec<_>>()
+        );
+        assert!(marks.lines.iter().any(|l| l.a[0].is_nan()));
+        assert_eq!(marks.points, built.points);
+    }
+
+    #[test]
     fn a_payload_with_an_out_of_range_batch_is_rejected() {
         let scene = PlotScene {
             title: "t".into(),
@@ -1009,14 +1180,22 @@ mod tests {
         scene.volume.gain = 1.0;
         scene.volume.ct = vec![12.0];
         scene.volume.labels = vec![3];
-        scene.volume.session_colors = vec![[0.2, 0.3, 0.8, 1.0]];
+        scene.volume.session_colors = vec![[0.2, 0.3, 0.8, 1.0], [0.9, 0.4, 0.1, 1.0]];
         scene.volume.session_focus = 1;
-        scene.volume.sessions = vec![scan_kit_core::SessionDose {
-            values: vec![4.0, 5.0],
-            shape: [1, 1, 2],
-            origin: [1.0, 2.0, 3.0],
-            voxel: 2.0,
-        }];
+        scene.volume.sessions = vec![
+            scan_kit_core::SessionDose {
+                values: vec![4.0, 5.0],
+                shape: [1, 1, 2],
+                origin: [1.0, 2.0, 3.0],
+                voxel: 2.0,
+            },
+            scan_kit_core::SessionDose {
+                values: vec![6.0],
+                shape: [1, 1, 1],
+                origin: [0.0; 3],
+                voxel: 1.0,
+            },
+        ];
         scene.volume.plans = vec![scan_kit_core::SessionDose {
             values: vec![7.0],
             shape: [1, 1, 1],
@@ -1038,7 +1217,10 @@ mod tests {
         assert_eq!(scan.integrals, fresh.integrals);
         assert!((volume.gantry - 90.0).abs() < 1e-4);
         assert_eq!(volume.session_focus, 1);
-        assert_eq!(volume.session_colors, vec![[0.2, 0.3, 0.8, 1.0]]);
+        assert_eq!(
+            volume.session_colors,
+            vec![[0.2, 0.3, 0.8, 1.0], [0.9, 0.4, 0.1, 1.0]]
+        );
         assert_eq!(volume.sessions[0].values, vec![4.0, 5.0]);
         assert_eq!(volume.plans[0].values, vec![7.0]);
         assert_eq!(volume.companions[0].values, vec![8.0]);

@@ -358,7 +358,7 @@ async function main() {
       console.log(file);
     }
 
-    if (savedGeometry) {
+    if (savedGeometry && savedGeometry.width != null) {
       await shots(
         `invoke("scan_kit_set_window_geometry", { width: ${savedGeometry.width}, height: ${savedGeometry.height}, x: ${savedGeometry.x}, y: ${savedGeometry.y} })`,
       );

@@ -108,6 +108,10 @@ struct Cloud {
     /// The other chamber. Empty for the combined ray, and when only one chamber has spots.
     companion: Vec<Pencil>,
     plan: Vec<Pencil>,
+    /// The chamber positions fell back to the plan's commanded spots — the
+    /// cube is drawn, but gamma/difference against the plan would compare
+    /// the plan to itself and must stay "not evaluated".
+    commanded: bool,
 }
 
 pub fn volumetric(
@@ -393,6 +397,7 @@ pub fn volumetric(
         );
         // A partial MC run leaves one engine per cube — recompute the whole
         // session analytically rather than compare MC against analytic.
+        let mut rolled_back = false;
         if index == focus && model == "mc" {
             let attempted = [
                 cloud.pencils.is_empty(),
@@ -410,7 +415,8 @@ pub fn volumetric(
             .into_iter()
             .filter(|(done, tried)| *done && *tried)
             .count();
-            if succeeded > 0 && succeeded < attempted {
+            rolled_back = succeeded > 0 && succeeded < attempted;
+            if rolled_back {
                 (volume, _) = fill(
                     mat,
                     &cloud.pencils,
@@ -464,7 +470,13 @@ pub fn volumetric(
                 ran = None;
             }
         }
-        mc_note = mc_note.or(ran);
+        // Any fill's MC note counts - a plan-only run is still MC - but a
+        // rolled-back session must not keep one (its cubes are analytic).
+        mc_note = mc_note.or(if rolled_back {
+            None
+        } else {
+            ran.or(ran_c).or(ran_p)
+        });
         measured.push(volume);
         companions.push(companion);
         plans.push(plan);
@@ -477,10 +489,20 @@ pub fn volumetric(
         measured
             .iter()
             .zip(&plans)
-            .map(|(got, plan)| {
-                let (values, passed, scored) = gamma_with(got, plan, dd, dta, cutoff);
+            .enumerate()
+            .map(|(index, (got, plan))| {
+                // A cloud drawn on commanded positions is the plan compared
+                // to itself — always "not evaluated", never a pass.
+                let (values, passed, scored) =
+                    if clouds.get(index).is_some_and(|cloud| cloud.commanded) {
+                        (vec![f32::NAN; got.values.len()], 0, 0)
+                    } else {
+                        gamma_with(got, plan, dd, dta, cutoff)
+                    };
+                // Zero scored voxels is "not evaluated", not a 0% fail —
+                // NaN keeps the verdict text from asserting one.
                 let rate = if scored == 0 {
-                    0.0
+                    f32::NAN
                 } else {
                     100.0 * passed as f32 / scored as f32
                 };
@@ -494,7 +516,17 @@ pub fn volumetric(
         "difference" => measured
             .iter()
             .zip(&plans)
-            .map(|(got, plan)| difference(got, plan))
+            .enumerate()
+            .map(|(index, (got, plan))| {
+                if clouds.get(index).is_some_and(|cloud| cloud.commanded) {
+                    Volume {
+                        values: vec![f32::NAN; got.values.len()],
+                        ..got.clone()
+                    }
+                } else {
+                    difference(got, plan)
+                }
+            })
             .collect(),
         "gamma" => gamma_fields
             .iter()
@@ -565,8 +597,25 @@ pub fn volumetric(
         // usize::MAX makes every .get below miss, matching the MC focus.
         Err(_) => usize::MAX,
     };
+    // A hidden or removed focus session still owes the view a panel -
+    // an empty scene leaves the last picture painted like it is live.
+    if has_dose && shown.get(session_at).is_none() {
+        panels.push(note("The selected session is not in this view"));
+    }
+    // The entry exists but its cloud produced no pencils — a [0,0,0] cube
+    // paints six dead panels indistinguishable from a render bug.
+    if has_dose
+        && shown
+            .get(session_at)
+            .is_some_and(|volume| volume.values.is_empty())
+    {
+        panels.push(note("The selected session has no dose"));
+    }
     if has_dose {
-        if let Some(volume) = shown.get(session_at) {
+        if let Some(volume) = shown
+            .get(session_at)
+            .filter(|volume| !volume.values.is_empty())
+        {
             let scan = scan_kit_core::scan_volume(volume);
             let [ix, iy, iz] = scan.peak_at;
             let cells = crate::workspace::cells_from(&[
@@ -576,8 +625,13 @@ pub fn volumetric(
                 options.get("cell3").and_then(Value::as_str),
             ]);
             let mut dvh_lines = Vec::new();
+            // `volume` is the displayed cube — under compare:gamma or
+            // difference it is a residual field, not dose. DVH needs the
+            // measured one.
             if plots.contains(&crate::workspace::PlotKind::Dvh) {
-                push_dvh(&mut dvh_lines, volume);
+                if let Some(dose) = measured.get(session_at) {
+                    push_dvh(&mut dvh_lines, dose);
+                }
             }
             let gamma = plots
                 .contains(&crate::workspace::PlotKind::Gamma)
@@ -634,9 +688,9 @@ pub fn volumetric(
             {
                 view.x_label = depth_axis_title(medium_key);
             }
-            if let Some(depth) = panels
+            for depth in panels
                 .iter_mut()
-                .find(|panel| panel.title.starts_with("Depth"))
+                .filter(|panel| panel.title.starts_with("Depth"))
             {
                 if let Some(result) = &mc_note {
                     let incident = result.ledger[0];
@@ -666,7 +720,14 @@ pub fn volumetric(
                     .map(|(volume, _)| volume.clone())
                     .collect();
                 for panel in &mut panels {
-                    crate::workspace::overlay_sessions(panel, &shown, at, &gamma_volumes);
+                    crate::workspace::overlay_sessions(
+                        panel,
+                        &shown,
+                        at,
+                        &gamma_volumes,
+                        &measured,
+                        y_name(quantity),
+                    );
                 }
                 mark.session_focus = session_at as u32;
                 mark.sessions = shown
@@ -700,8 +761,24 @@ pub fn volumetric(
             }
             if compare == "gamma" {
                 if let (Some(got), Some(plan)) = (measured.get(session_at), plans.get(session_at)) {
-                    if plan.shape == got.shape && plan.values.len() == got.values.len() {
-                        let planes = scan_kit_core::projected_gamma(got, plan, dd, dta, cutoff);
+                    if plan.shape == got.shape
+                        && plan.values.len() == got.values.len()
+                        && plan.origin == got.origin
+                        && plan.spacing == got.spacing
+                    {
+                        // Commanded positions are the plan against itself —
+                        // planes keep their shape but score nothing, like the
+                        // 3D gamma's all-NaN "not evaluated".
+                        let planes = if clouds.get(session_at).is_some_and(|c| c.commanded) {
+                            let [nx, ny, nz] = got.shape;
+                            [
+                                (vec![f32::NAN; nx * ny], f32::NAN),
+                                (vec![f32::NAN; nx * nz], f32::NAN),
+                                (vec![f32::NAN; ny * nz], f32::NAN),
+                            ]
+                        } else {
+                            scan_kit_core::projected_gamma(got, plan, dd, dta, cutoff)
+                        };
                         integral_rates = Some(planes.each_ref().map(|(_, rate)| *rate));
                         mark.integrals = planes.into_iter().map(|(gamma, _)| gamma).collect();
                     }
@@ -934,10 +1011,22 @@ pub fn volumetric(
             wash.level.as_ref(),
         );
         if let Some([axial, coronal, sagittal]) = integral_rates {
+            let rate_text = |rate: f32| {
+                if rate.is_nan() {
+                    "—".to_owned()
+                } else {
+                    format!("{rate:.0}%")
+                }
+            };
             controls.push(crate::workspace::readout(
                 "Integral",
                 "gamma_integral",
-                &format!("Axial {axial:.0}% · Coronal {coronal:.0}% · Sagittal {sagittal:.0}%"),
+                &format!(
+                    "Axial {} · Coronal {} · Sagittal {}",
+                    rate_text(axial),
+                    rate_text(coronal),
+                    rate_text(sagittal)
+                ),
                 "Gamma",
             ));
         }
@@ -965,7 +1054,12 @@ pub fn volumetric(
 pub fn voxel_spacing(options: &Value) -> f32 {
     let raw = options.get("voxel").and_then(Value::as_str).unwrap_or("1");
     let text = raw.trim().trim_end_matches("mm").trim();
-    let value = text.parse::<f32>().unwrap_or(1.0);
+    // "2 cm"-style input: a leading number still parses — jumping to 1.0
+    // would build a grid 20x finer than the user typed.
+    let value = text
+        .parse::<f32>()
+        .or_else(|_| text.split_whitespace().next().unwrap_or("").parse())
+        .unwrap_or(1.0);
     if !value.is_finite() {
         return 1.0;
     }
@@ -1337,7 +1431,9 @@ fn analytic_cached(
     }
     let volume = deposit();
     let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
-    if held(&mut kept).is_none() {
+    // A cube bigger than the whole budget is searched again rather than
+    // pinning the three-cube floor at GB scale.
+    if held(&mut kept).is_none() && volume.values.len() <= BUDGET {
         kept.push((key, volume.clone()));
         let total = |kept: &Kept| {
             kept.iter()
@@ -1352,11 +1448,13 @@ fn analytic_cached(
 }
 
 fn session_dose(volume: &Volume, blank: bool) -> scan_kit_core::SessionDose {
+    // Difference cubes are signed — an all-nonpositive field is still
+    // data (plan above measured everywhere), not a blank.
     let live = !blank
         && volume
             .values
             .iter()
-            .any(|value| value.is_finite() && *value > 1.0e-8);
+            .any(|value| value.is_finite() && value.abs() > 1.0e-8);
     scan_kit_core::SessionDose {
         values: if live {
             volume.values.clone()
@@ -1382,6 +1480,17 @@ fn load_cloud(
     plan_sigma: &str,
     sigma_ref: &str,
 ) -> Cloud {
+    // A timeslice session has no spot positions — but the merged Sample
+    // table can carry geometry columns unioned in by an earlier fill ask,
+    // which would fabricate one unit-weight pencil per millisecond row.
+    if grain == "timeslice" {
+        return Cloud {
+            pencils: Vec::new(),
+            companion: Vec::new(),
+            plan: Vec::new(),
+            commanded: true,
+        };
+    }
     let table = if grain == "timeslice" {
         super::tables::timeslice_signals(root, session)
     } else {
@@ -1393,7 +1502,7 @@ fn load_cloud(
     let ic1_dose = col(&table, "ic1_dose");
     let ic2_dose = col(&table, "ic2_dose");
     let xml = devices_xml(root, session);
-    let (ic1_x, ic1_y) = or_plan(&table, "ic1_x", "ic1_y");
+    let (ic1_x, ic1_y, ic1_commanded) = or_plan(&table, "ic1_x", "ic1_y");
     let ic1 = pencils_from(
         &energy,
         &ic1_x,
@@ -1419,6 +1528,12 @@ fn load_cloud(
         false,
     );
     let (cx, cy) = iso_positions(&table);
+    // iso_positions falls back to the real ic1 pair when any column is
+    // missing — the flag must reflect what it used, not all four columns.
+    let combined_commanded = {
+        let check = |key: &str| -> bool { col(&table, key).iter().any(|v| v.is_finite()) };
+        !(check("ic1_x") && check("ic1_y"))
+    };
     let combined = pencils_from(
         &energy,
         &cx,
@@ -1439,19 +1554,19 @@ fn load_cloud(
         n,
         false,
     );
-    let donor = if plan_sigma == "reference" {
+    let (donor, donor_is_self) = if plan_sigma == "reference" {
         let id = if sessions.iter().any(|item| item == sigma_ref) {
             sigma_ref
         } else {
             sessions.first().map(String::as_str).unwrap_or(session)
         };
-        spot_table(root, id)
+        (spot_table(root, id), id == session)
     } else {
-        table.clone()
+        (table.clone(), false)
     };
     let (psx, psy) = if plan_sigma == "interlock" {
         (Vec::new(), Vec::new())
-    } else if plan_sigma == "reference" {
+    } else if plan_sigma == "reference" && !donor_is_self {
         // The donor is a different session — its spot list can order or
         // filter differently, so join sigmas on energy, not row index.
         join_donor_sigmas(
@@ -1494,22 +1609,27 @@ fn load_cloud(
         n,
         plan_sigma == "interlock",
     );
-    let (pencils, companion) = if chambers == "combined" {
-        (combined, Vec::new())
-    } else if ic1.is_empty() {
-        (ic2, Vec::new())
+    let (pencils, companion, commanded) = if chambers == "combined" {
+        (combined, Vec::new(), combined_commanded)
+    } else if ic1.is_empty() || (ic1_commanded && !ic2.is_empty()) {
+        // A real second chamber beats a fabricated first one.
+        (ic2, Vec::new(), false)
     } else {
-        (ic1, ic2)
+        (ic1, ic2, ic1_commanded)
     };
     Cloud {
         pencils,
         companion,
+        commanded,
         plan,
     }
 }
 
 fn usable_sigma(value: f32) -> bool {
-    value.is_finite() && value > 0.2
+    // Upper bound: the beam model cannot carry a metre-wide pencil, so a
+    // corrupt-but-positive reading would only blow the lattice out to the
+    // 512³ cap (~500 MB per fill).
+    value.is_finite() && (0.2..=100.0).contains(&value)
 }
 
 fn usable_dose(value: f32) -> bool {
@@ -1553,7 +1673,7 @@ fn pencils_from(
         if !e.is_finite()
             || !px.is_finite()
             || !py.is_finite()
-            || e <= 1.0
+            || !(1.0..=300.0).contains(&e)
             || px.abs() >= ABS_INVALID_MM
             || py.abs() >= ABS_INVALID_MM
         {
@@ -1592,7 +1712,9 @@ fn sigma_at(
 ) -> f32 {
     if interlock {
         if let Some(mm) = interlock_sigma_mm(xml, device, f64::from(energy)) {
-            return mm as f32;
+            if mm.is_finite() && mm > 0.2 {
+                return mm as f32;
+            }
         }
     }
     values
@@ -1624,7 +1746,13 @@ fn corrected(values: &[f32], plan: &[f32]) -> Vec<f32> {
     // The chamber zero offset is median(measured) - median(plan). Subtracting
     // the measured median alone would also erase a genuinely off-axis field,
     // fabricating a displacement between the measured and plan clouds.
-    let offset = finite_median(values) - finite_median(plan);
+    // With no plan reference there is no offset to find — keeping the raw
+    // positions beats re-centering the cloud on a fabricated zero.
+    let offset = if plan.iter().any(|v| v.is_finite()) {
+        finite_median(values) - finite_median(plan)
+    } else {
+        0.0
+    };
     values.iter().map(|value| value - offset).collect()
 }
 
@@ -1652,7 +1780,11 @@ fn axis_iso_z(near: &[f32], far: &[f32], plan: &[f32]) -> Option<f32> {
             continue;
         }
         let z = IC2_Z_MM + (spot - a) / slope;
-        if z.is_finite() && z > IC2_Z_MM {
+        // Bound the crossing to a plausible iso plane — a noise-dominated
+        // chamber pair can intersect metres past the isocenter and drag the
+        // median, and t = z/IC_SEP would scale the projected positions by
+        // the same bogus factor.
+        if z.is_finite() && z > IC2_Z_MM && z < IC1_Z_MM + 10.0 * IC_SEP_MM {
             zs.push(z);
         }
     }
@@ -1683,7 +1815,8 @@ pub(crate) fn iso_positions(
         || !y1.iter().any(|v| v.is_finite())
         || !y2.iter().any(|v| v.is_finite())
     {
-        return or_plan(table, "ic1_x", "ic1_y");
+        let (x, y, _) = or_plan(table, "ic1_x", "ic1_y");
+        return (x, y);
     }
     let px = col(table, "plan_x");
     let py = col(table, "plan_y");
@@ -1736,15 +1869,15 @@ fn or_plan(
     table: &std::collections::BTreeMap<String, Vec<f32>>,
     key_x: &str,
     key_y: &str,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, bool) {
     let x = col(table, key_x);
     let y = col(table, key_y);
     // Fall back as a pair — measured x with planned y fabricates a position
     // that exists in neither record.
     if x.iter().any(|v| v.is_finite()) && y.iter().any(|v| v.is_finite()) {
-        (x, y)
+        (x, y, false)
     } else {
-        (col(table, "plan_x"), col(table, "plan_y"))
+        (col(table, "plan_x"), col(table, "plan_y"), true)
     }
 }
 
@@ -1762,13 +1895,28 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
     let mut hcc = None;
     let mut any = None;
     for chunk in xml.split("<ion_chamber").skip(1) {
-        let head = chunk.split('>').next().unwrap_or("");
         // The chamber name sits on a <device name="..."> child in devices.xml,
-        // not on the <ion_chamber> tag itself — search the whole block.
-        let name = attr(head, "name")
-            .or_else(|| attr(chunk, "name"))
+        // not on the <ion_chamber> tag itself.
+        let name = chunk
+            .split("<device")
+            .skip(1)
+            .filter_map(|tail| tail.split('>').next())
+            .find_map(|tag| attr(tag, "name"))
             .unwrap_or_default();
-        let k = attr(chunk, "K_MU").or_else(|| attr(chunk, "k_mu"));
+        // K_MU lives on the gain_conversion with in_units="MU"
+        // (core::tune::mu_gain) — prefer that tag so a stray K_MU
+        // attribute elsewhere in the block cannot win; older files carry
+        // k_mu on the device tag itself, so keep the block-wide search as
+        // the fallback.
+        let k = chunk
+            .split("<gain_conversion")
+            .skip(1)
+            .filter_map(|tail| tail.split('>').next())
+            .filter(|tag| {
+                attr(tag, "in_units").is_some_and(|units| units.eq_ignore_ascii_case("MU"))
+            })
+            .find_map(|tag| attr(tag, "K_MU").or_else(|| attr(tag, "k_mu")))
+            .or_else(|| attr(chunk, "K_MU").or_else(|| attr(chunk, "k_mu")));
         if let Some(Ok(value)) = k.map(|raw| raw.parse::<f32>()) {
             if value.is_finite() && value > 0.0 {
                 if name.eq_ignore_ascii_case("IC_1_HCC") {
@@ -1782,19 +1930,22 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
 }
 
 fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!("{name}=\"");
+    let key = format!("{name}=");
     let mut offset = 0;
     while let Some(pos) = tag[offset..].find(&key) {
         let at = offset + pos;
         // A whole attribute boundary — `name=` must not match the tail of
         // `long_name=` or `machine-name=`.
         if at == 0 || tag.as_bytes()[at - 1].is_ascii_whitespace() {
-            let start = at + key.len();
-            let rest = &tag[start..];
-            // An unclosed value keeps looking — a later attribute may
-            // still match cleanly.
-            if let Some(end) = rest.find('"') {
-                return Some(&rest[..end]);
+            let rest = tag[at + key.len()..].trim_start();
+            // Single-quoted values parse too (tables::xml_attr).
+            if let Some(&quote) = rest.as_bytes().first() {
+                if quote == b'"' || quote == b'\'' {
+                    let body = &rest[1..];
+                    if let Some(end) = body.find(quote as char) {
+                        return Some(&body[..end]);
+                    }
+                }
             }
         }
         offset = at + 1;
@@ -1915,8 +2066,9 @@ fn gamma_with(
         cutoff_pct,
     );
     // A blank Monte Carlo capture scores nothing and is instant; keeping it
-    // would push out a real pair.
-    if result.2 > 0 {
+    // would push out a real pair. A cube over the per-entry bound (~128 MB
+    // for the two kept pairs) is searched again rather than pinned.
+    if result.2 > 0 && measured.values.len() <= (64 << 20) / 6 {
         let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
         if kept.len() >= KEEP {
             kept.remove(0);
@@ -2076,11 +2228,13 @@ mod tests {
         table.insert("ic2_x".to_owned(), vec![1.0, 2.0]);
         table.insert("ic1_y".to_owned(), vec![f32::NAN, f32::NAN]);
         table.insert("ic2_y".to_owned(), vec![0.5, 0.5]);
-        table.insert("ic1_x_plan".to_owned(), vec![9.0, 9.0]);
-        let (x, _y) = iso_positions(&table);
+        table.insert("plan_x".to_owned(), vec![9.0, 9.0]);
+        table.insert("plan_y".to_owned(), vec![7.0, 7.0]);
+        let (x, y) = iso_positions(&table);
         // Combined mode used to propagate the NaN into every position and
         // empty the cloud — the plan fallback must keep the session.
-        assert!(x.iter().all(|v| v.is_finite()));
+        assert_eq!(x, vec![9.0, 9.0]);
+        assert_eq!(y, vec![7.0, 7.0]);
     }
 
     #[test]
@@ -2149,6 +2303,7 @@ mod tests {
                         values: vec![1.0; request.shape.iter().product()],
                     },
                     uncertainty: 0.01,
+                    histories: 0,
                     ledger: [0.0; 6],
                     let_d: Vec::new(),
                 })
@@ -2461,6 +2616,7 @@ mod tests {
                         values: vec![7.0; n],
                     },
                     uncertainty: 0.0,
+                    histories: 0,
                     ledger: [0.0; 6],
                     let_d: Vec::new(),
                 })
@@ -3013,6 +3169,15 @@ mod tests {
             1
         );
         assert!(super::session_at(&serde_json::json!({ "session": "zzz" }), &ids).is_err());
+    }
+
+    #[test]
+    fn a_noise_iso_crossing_is_rejected() {
+        // near/far equal within 1e-3 → slope 1e-5 → a 10 mm plan offset
+        // crosses at z = 1e6 mm. Unbounded, that drags the iso median.
+        assert!(super::axis_iso_z(&[10.0], &[10.001], &[20.0]).is_none());
+        // A plausible crossing (z = 200 mm) is still accepted.
+        assert_eq!(super::axis_iso_z(&[5.0], &[10.0], &[15.0]), Some(200.0));
     }
 
     fn fieldsets(controls: &[scan_kit_core::Control]) -> Vec<&str> {

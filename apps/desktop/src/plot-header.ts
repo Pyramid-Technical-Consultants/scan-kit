@@ -94,7 +94,16 @@ export function sameChrome(current: PlotHeader | null, next: PlotHeader): boolea
   for (let index = 0; index < current.controls.length; index += 1) {
     const left = current.controls[index];
     const right = next.controls[index];
-    if (left == null || right == null || left.id !== right.id || left.value !== right.value) {
+    if (
+      left == null ||
+      right == null ||
+      left.id !== right.id ||
+      left.value !== right.value ||
+      left.label !== right.label ||
+      // Option lists change with the study (energies, sessions) - a kept
+      // chrome would otherwise show the stale choices.
+      JSON.stringify(left.options) !== JSON.stringify(right.options)
+    ) {
       return false;
     }
   }
@@ -254,7 +263,21 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
   return {
     title: text(parsed.title),
     controls: Array.isArray(parsed.controls) ? parsed.controls.map(viewControl) : [],
-    table: parsed.table ?? null,
+    table: (() => {
+      const shape = parsed.table as { columns?: unknown; rows?: unknown } | null;
+      if (shape == null || !Array.isArray(shape.columns) || !Array.isArray(shape.rows)) {
+        return null;
+      }
+      // Glide cells are typed strings — coerce anything else like text()
+      // does for the other header fields.
+      const cell = (v: unknown) => (typeof v === "string" ? v : String(v ?? ""));
+      return {
+        columns: shape.columns.map(cell),
+        rows: shape.rows.map((row) =>
+          Array.isArray(row) ? row.map(cell) : [],
+        ),
+      };
+    })(),
     panels: Array.isArray(parsed.panels) ? parsed.panels : [],
     quality: quality.length > 0 ? quality : "final",
     lineToken: text(parsed.line_token),
@@ -262,6 +285,27 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
 }
 
 /** Canvas backing size in device pixels for a CSS box. */
+/// A devicePixelRatio change (the window moved to a differently-scaled
+/// monitor) fires no ResizeObserver event — refit on it. The query names the
+/// current scale, so it re-arms after every change.
+export function watchDpr(refit: () => void): () => void {
+  let media: MediaQueryList | null = null;
+  const onChange = () => {
+    media?.removeEventListener("change", onChange);
+    try {
+      refit();
+    } finally {
+      arm();
+    }
+  };
+  const arm = () => {
+    media = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    media.addEventListener("change", onChange, { once: true });
+  };
+  arm();
+  return () => media?.removeEventListener("change", onChange);
+}
+
 export function backingSize(cssWidth: number, cssHeight: number, ratio: number): { width: number; height: number } {
   const scale = ratio > 0 ? ratio : 1;
   return {

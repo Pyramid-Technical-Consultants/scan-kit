@@ -68,7 +68,9 @@ pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
         "columns": listed,
         // The energy column has one row per spot - layers are the distinct
         // energies, not the row count.
-        "energy_layers": energy.iter().map(|e| e.to_bits()).collect::<std::collections::BTreeSet<_>>().len(),
+        // NaN to_bits is a distinct pattern — a corrupt cell must not
+        // count as an energy layer.
+        "energy_layers": energy.iter().filter(|e| e.is_finite()).map(|e| e.to_bits()).collect::<std::collections::BTreeSet<_>>().len(),
     })
 }
 
@@ -93,13 +95,21 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
     // span pads around its midpoint too).
     let (xmin, xmax) = if xmax <= xmin || xmin.is_nan() || xmax.is_nan() {
         let mid = (xmin + xmax) / 2.0;
-        (mid - 0.5, mid + 0.5)
+        if mid.is_finite() {
+            (mid - 0.5, mid + 0.5)
+        } else {
+            (0.0, 1.0)
+        }
     } else {
         (xmin, xmax)
     };
     let (ymin, ymax) = if ymax <= ymin || ymin.is_nan() || ymax.is_nan() {
         let mid = (ymin + ymax) / 2.0;
-        (mid - 0.5, mid + 0.5)
+        if mid.is_finite() {
+            (mid - 0.5, mid + 0.5)
+        } else {
+            (0.0, 1.0)
+        }
     } else {
         (ymin, ymax)
     };
@@ -114,6 +124,21 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
         series,
         x_labels: Vec::new(),
         equal: false,
+    }
+}
+
+/// Whether the series takes the next palette slot — alpha>0 marks and
+/// session-ramp heatmaps do; alpha-0 linked marks, guides, and raw clouds
+/// do not (apply_palette's rule).
+fn consumes_slot(series: &Series) -> bool {
+    match series {
+        Series::Polyline { color, .. }
+        | Series::Points { color, .. }
+        | Series::Bars { color, .. }
+        | Series::Rects { color, .. }
+        | Series::Triangles { color, .. } => color[3] > 0.0,
+        Series::Heatmap { ramp, .. } => scan_kit_core::is_session(*ramp),
+        _ => false,
     }
 }
 
@@ -154,8 +179,13 @@ fn span(values: &[f32]) -> (f32, f32) {
     let Some((lo, hi)) = finite_minmax(values) else {
         return (0.0, 1.0);
     };
-    if (hi - lo).abs() < 1e-4 {
-        (lo - 0.5, hi + 0.5)
+    // Near-constant data needs a window sized to the data - an absolute
+    // 1e-4 would collapse a real narrow column (µs clocks, ratios) into a
+    // point on a ~1-unit axis, and ±0.5 overflows away at huge magnitudes.
+    let scale = lo.abs().max(hi.abs());
+    if hi - lo < 1e-4 * scale.max(1e-30) {
+        let pad = (0.5 * scale).max(0.5);
+        (lo - pad, hi + pad)
     } else {
         (lo, hi)
     }
@@ -254,7 +284,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             session.join("spot_data.csv"),
-            "ic1_total_dose,ic2_total_dose,position_x,position_y\n1.1,1.0,0,0\n1.8,2.1,5,1\n3.2,2.7,10,2\n",
+            "ic1_total_dose,ic2_total_dose,position_x,position_y,ic1_x_spot_position,ic1_y_spot_position,ic2_x_spot_position,ic2_y_spot_position\n1.1,1.0,0,0,0,0,0,0\n1.8,2.1,5,1,5,1,5,1\n3.2,2.7,10,2,10,2,10,2\n",
         )
         .unwrap();
         let mut timeslice = String::from(
@@ -1307,6 +1337,7 @@ mod tests {
                         values: vec![1.0; request.material.len()],
                     },
                     uncertainty: 0.0,
+                    histories: 0,
                     ledger: [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
                     let_d: Vec::new(),
                 })
@@ -1532,5 +1563,15 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn a_narrow_real_span_keeps_its_data_window() {
+        // The old absolute 1e-4 collapsed a real sub-100um spread into a
+        // ~1-unit window - the column became an invisible point.
+        let (lo, hi) = span(&[1.0e-5, 2.0e-5]);
+        assert!((lo, hi) == (1.0e-5, 2.0e-5), "{lo} {hi}");
+        // A true constant still gets a proportional window.
+        let (lo, hi) = span(&[70.0, 70.0]);
+        assert!(lo < 70.0 && hi > 70.0, "{lo} {hi}");
     }
 }

@@ -220,6 +220,11 @@ pub(super) fn smoothed_power(nu: f64, r: f64, sigma: f64) -> f64 {
 
 /// Bortfeld depth dose per proton (MeV/mm), integrated over the beam cross-section.
 pub fn bragg_idd(medium: Medium, energy_mev: f64, spread_pct: f64, depth_mm: f64) -> f64 {
+    // Upstream of the phantom the dose is zero — r0 - depth grows past the
+    // range and the model's power terms diverge instead of decaying.
+    if depth_mm < 0.0 {
+        return 0.0;
+    }
     let table = range_table(medium.key);
     let e0 = energy_mev.max(1.0);
     let p = table.exponent;
@@ -298,7 +303,7 @@ pub(super) fn layer_energies(energy: &[f32]) -> Vec<f32> {
     let raw: Vec<f64> = energy
         .iter()
         .copied()
-        .filter(|e| e.is_finite() && *e > 1.0)
+        .filter(|e| e.is_finite() && *e > 1.0 && *e <= 400.0)
         .map(f64::from)
         .collect();
     if raw.is_empty() {
@@ -481,8 +486,8 @@ pub(super) fn row_at(kernel: &LayerKernel, row: usize, at: f32, mcs: bool) -> f3
 }
 
 pub(super) fn lerp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
-    if xp.is_empty() {
-        return 0.0;
+    if xp.is_empty() || x.is_nan() {
+        return if xp.is_empty() { 0.0 } else { fp[0] };
     }
     if x <= xp[0] {
         return fp[0];
@@ -501,6 +506,10 @@ pub(super) fn lerp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
 
 /// Energy left and primary protons kept after `wet_mm` of water.
 pub fn through_wet(energy_mev: f64, wet_mm: f64) -> (f64, f64) {
+    // A negative thickness is "no absorber" like the MC path's clamp —
+    // unclamped it would *raise* the exit energy and multiply the kept
+    // primaries, a boosted dose instead of an attenuated one.
+    let wet_mm = wet_mm.max(0.0);
     let e = energy_mev.max(1.0);
     let r = csda_range_mm(WATER, e);
     let left = r - wet_mm;
@@ -514,7 +523,12 @@ pub fn through_wet(energy_mev: f64, wet_mm: f64) -> (f64, f64) {
 }
 
 pub fn protons_from_mu(mu: f64, energy: f64, gap_mm: f64, k_mu: f64) -> f64 {
-    let gap_cm = gap_mm.max(1e-6) / 10.0;
+    if gap_mm <= 0.0 || !gap_mm.is_finite() {
+        // prepare()'s weight <= 0 guard drops a zero-proton pencil — a
+        // near-zero gap would otherwise inflate the count ~1e5x.
+        return 0.0;
+    }
+    let gap_cm = gap_mm / 10.0;
     let stop = mass_stopping(AIR, energy.max(1.0));
     let de = stop * RHO_AIR * gap_cm;
     let q = (de / (W_AIR_EV * 1e-6)) * E_CHARGE_C;
@@ -525,6 +539,21 @@ pub fn protons_from_mu(mu: f64, energy: f64, gap_mm: f64, k_mu: f64) -> f64 {
 mod tests {
     use super::super::WATER;
     use super::{bragg_idd, build_kernel, csda_range_mm, mcs_along, mcs_at, protons_from_mu};
+
+    #[test]
+    fn a_negative_wet_is_no_absorber_not_a_boost() {
+        // Unclamped, wet < 0 makes `left` exceed the CSDA range — the exit
+        // energy rises and `kept` multiplies primaries past their incident
+        // count, a boosted dose. It must behave like no absorber at all.
+        let (e_out, kept) = super::through_wet(100.0, -50.0);
+        let (e_ref, kept_ref) = super::through_wet(100.0, 0.0);
+        assert_eq!(e_out, e_ref);
+        // Table inversion overshoots ~4e-5 MeV even at wet=0 — the clamped
+        // result must match that, not a 30 MeV boost.
+        assert!(e_out <= 100.001, "{e_out}");
+        assert!(kept <= 1.0, "{kept}");
+        assert_eq!(kept, kept_ref);
+    }
 
     #[test]
     fn protons_per_mu_follow_the_commissioned_beam_data() {

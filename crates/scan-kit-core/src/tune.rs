@@ -206,6 +206,9 @@ fn tune_sigma(
         return Err("sigma tolerance must be below 100%".into());
     }
     let headroom = number(params, "sigma_lower_headroom_percent", 1.0)?.max(0.0);
+    if headroom >= 100.0 {
+        return Err("sigma lower headroom must be below 100%".into());
+    }
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
@@ -588,6 +591,13 @@ fn tune_distance(
             ));
             continue;
         }
+        if !fit.bias.is_finite() || fit.bias.abs() > 100.0 {
+            warnings.push(format!(
+                "{device}: fitted offset bias {:.4} mm is implausible; left unchanged.",
+                fit.bias
+            ));
+            continue;
+        }
         let old_sdd = text_f64(&chamber.children[sdd_index].text);
         let old_offset = text_f64(&chamber.children[offset_index].text);
         let new_sdd = old_sdd * fit.gain;
@@ -802,8 +812,18 @@ fn tune_kmu(
             known
         }
         "percent" => {
-            if percent <= -100.0 {
-                warnings.push("Percent adjustment must be greater than -100.".into());
+            if percent < -99.0 {
+                warnings.push(
+                    "Percent adjustment must be at least -99 - past that the MU target collapses."
+                        .into(),
+                );
+                return empty_kmu(warnings);
+            }
+            if percent > 100.0 {
+                warnings.push(
+                    "Percent adjustment must be at most +100 — a larger value would more than double the MU target."
+                        .into(),
+                );
                 return empty_kmu(warnings);
             }
             sum_pri * (1.0 + percent / 100.0)
@@ -1128,12 +1148,20 @@ fn is_sigma_band(elem: &Elem) -> bool {
 }
 
 fn band_coeffs(elem: &Elem) -> Option<(f64, f64, f64, f64, f64, f64)> {
-    let min_e = elem.attr("min_energy")?.parse::<f64>().ok()?;
-    let max_e = elem.attr("max_energy")?.parse::<f64>().ok()?;
+    let min_e = elem.attr("min_energy")?.trim().parse::<f64>().ok()?;
+    let max_e = elem.attr("max_energy")?.trim().parse::<f64>().ok()?;
     if !min_e.is_finite() || !max_e.is_finite() {
         return None;
     }
-    let coeff = |name: &str| elem.attr(name)?.parse::<f64>().ok();
+    // A non-finite coefficient (NaN parses) would slip a band past the
+    // min/max skip guard and poison the fit.
+    let coeff = |name: &str| {
+        elem.attr(name)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
     Some((
         min_e,
         max_e,
@@ -1528,7 +1556,8 @@ fn text_f64(text: &str) -> f64 {
 
 fn format_k0(value: f64) -> String {
     if !value.is_finite() {
-        return "0".into();
+        // Fail loudly on re-parse - a written 0 would read as a real gain.
+        return "NaN".into();
     }
     if value.abs() >= 1000.0 || (value.abs() > 0.0 && value.abs() < 1e-4) {
         return format!("{value:.6E}");
@@ -1543,7 +1572,7 @@ fn format_k0(value: f64) -> String {
 
 fn format_distance(value: f64) -> String {
     if !value.is_finite() {
-        return "0".into();
+        return "NaN".into();
     }
     let text = format!("{value:.4}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
@@ -1718,6 +1747,13 @@ mod tests {
         )
         .unwrap();
         assert!(band_coeffs(&dom.children[0]).is_none());
+        // NaN parses as f64 — a non-finite coefficient must fail the band
+        // like a malformed one does.
+        let nan = parse_xml(
+            r#"<devices><band min_energy="70" max_energy="250" K0="5" K1="NaN" K2="0" K3="0"/></devices>"#,
+        )
+        .unwrap();
+        assert!(band_coeffs(&nan.children[0]).is_none());
         let ok = parse_xml(
             r#"<devices><band min_energy="70" max_energy="250" K0="5" K1="1" K2="0" K3="0"/></devices>"#,
         )

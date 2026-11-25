@@ -88,7 +88,9 @@ fn stats_rel(
     if (i < P.n && n > 0.0) {
         let dose = dose_sum[i];
         if (dose > 0.5 * bitcast<f32>(atomicLoad(&stats[0u]))) {
-            acc = sqrt(max(n * (dose_sq[i] * n / (dose * dose) - 1.0), 0.0)) / n;
+            // (n·Σb² − (Σb)²)/((n−1)·(Σb)²) — the unbiased form; the n
+            // divisor under-reports by √((n−1)/n).
+            acc = sqrt(max((n * dose_sq[i] - dose * dose) / max(n - 1.0, 1.0), 0.0)) / dose;
             cnt = 1u;
         }
     }
@@ -105,7 +107,7 @@ fn stats_rel(
     if (lid == 0u) {
         // An out-of-range float→u32 cast is a dynamic error — clamp first so a
         // huge accumulation can't wrap into a valid-looking dose sum.
-        let q = u32(min(red_s[0] * 1e6, 4294967295.0));
+        let q = u32(min(red_s[0] * 1e6, 4294967040.0));
         let old = atomicAdd(&stats[1u], q);
         if (old + q < old) { atomicAdd(&stats[2u], 1u); }
         atomicAdd(&stats[3u], red_c[0]);
@@ -149,21 +151,12 @@ struct Launch {
     origin_mm: [f32; 3],
 }
 
-/// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`.
+/// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`. Read
+/// from the shared device: a fresh adapter request here could name a
+/// different GPU than the one the dose ran on, and it parks the poll thread
+/// for the full adapter timeout on a wedged driver.
 pub fn adapter_info() -> String {
-    block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = tokio::time::timeout(
-            Duration::from_secs(30),
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        let info = adapter.get_info();
-        Some(format!("{} / {:?}", info.name, info.backend))
-    })
-    .unwrap_or_default()
+    block_on(async { shared_gpu().await.ok().map(|gpu| gpu.info.clone()) }).unwrap_or_default()
 }
 
 pub fn run_mc(job: &McJob) -> Result<McResult, ComputeError> {
@@ -189,7 +182,7 @@ impl McRun {
             McJob::Slab(request) => slab_launch(request)?,
             McJob::Patient(request) => patient_launch(request)?,
         };
-        if launch.protons <= 0.0 || launch.spots.is_empty() {
+        if launch.protons <= 0.0 || launch.spots.is_empty() || launch.histories == 0 {
             // The empty path skips prepare's binding-cap check — bound the
             // placeholder allocation itself.
             let nvox = launch.shape[0]
@@ -256,16 +249,24 @@ impl McRun {
         let Some(live) = self.live.as_mut() else {
             return false;
         };
+        // saturating_mul can land on u32::MAX — not a per_batch multiple,
+        // but the last submission folds its tail batch anyway.
         let target = histories
             .div_ceil(live.per_batch)
             .max(1)
             .saturating_mul(live.per_batch);
-        if target < live.next {
+        // A run cannot shrink — a smaller request must not drop issued
+        // work or rewrite delivered history counts.
+        if target < live.next || target < live.histories {
             return false;
         }
         if target != live.histories {
             live.histories = target;
             live.finished = false;
+            // A preview parked when the target moved is stale the moment
+            // the run resumes — it would publish a pre-extend snapshot as
+            // the resumed run's first result.
+            live.pending_read = None;
             self.done = None;
         }
         true
@@ -333,7 +334,7 @@ struct Live {
     /// Transport submissions queued but not yet known retired. A step only
     /// waits on the oldest once the window fills, so the GPU keeps a few
     /// chunks deep — the shared queue never drains dry between worker polls.
-    inflight: VecDeque<wgpu::SubmissionIndex>,
+    inflight: VecDeque<(wgpu::SubmissionIndex, u32)>,
     /// A preview copy already submitted. Its map lands whenever the copy
     /// retires — collecting it never blocks a step.
     pending_read: Option<ReadTicket>,
@@ -357,6 +358,29 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         .ok_or_else(|| ComputeError::Message(format!("no material {}", request.medium)))?
         as i32;
     let n = request.energy.len();
+    // The shader bounds voxel_index against f32(dims) — an odd axis past
+    // 2^24 rounds up and admits the boundary index into the next row.
+    if request.shape.iter().any(|dim| *dim > (1 << 23)) {
+        return Err(ComputeError::Message(
+            "a grid axis cannot exceed 8M voxels".into(),
+        ));
+    }
+    // A ragged spot array silently truncates or zero-fills a spot —
+    // same contract patient_launch already enforces.
+    if [
+        request.protons.len(),
+        request.x.len(),
+        request.y.len(),
+        request.sx.len(),
+        request.sy.len(),
+    ]
+    .iter()
+    .any(|&len| len != n)
+    {
+        return Err(ComputeError::Message(
+            "spot arrays must carry one entry per energy".into(),
+        ));
+    }
     let mut spots = Vec::new();
     let mut weights = Vec::new();
     for i in 0..n {
@@ -366,12 +390,18 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         let y = request.y.get(i).copied().unwrap_or(f32::NAN);
         let sx = request.sx.get(i).copied().unwrap_or(0.0);
         let sy = request.sy.get(i).copied().unwrap_or(0.0);
+        let spread = f64::from(request.spread_pct).max(0.0) / 100.0 * f64::from(energy);
         if energy.is_finite()
             && weight.is_finite()
             && x.is_finite()
             && y.is_finite()
+            && sx.is_finite()
+            && sy.is_finite()
             && energy > 0.0
+            && energy <= 400.0
             && weight > 0.0
+            && spread.is_finite()
+            && spread <= f64::from(f32::MAX)
         {
             spots.extend([
                 x / 10.0,
@@ -381,7 +411,7 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
                 sx.max(0.2) / 10.0,
                 sy.max(0.2) / 10.0,
                 energy,
-                request.spread_pct.max(0.0) / 100.0 * energy,
+                spread as f32,
                 0.0,
                 0.0,
             ]);
@@ -397,6 +427,24 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         }
         let last = spots.len() - 2;
         spots[last] = 1.0;
+    }
+    if !request.spread_pct.is_finite()
+        || !request.voxel_mm.is_finite()
+        || !request.depth_mm.is_finite()
+        || !request.wet_mm.is_finite()
+        || request.origin.iter().any(|v| !v.is_finite())
+    {
+        return Err(ComputeError::Message(
+            "slab scalars and origin must be finite".into(),
+        ));
+    }
+    // spread = pct * energy / 100 and energy <= 400 — a pct past MAX/4 makes
+    // at least one spot's spread unrepresentable, and the per-spot gate
+    // would drop it silently into an empty launch.
+    if f64::from(request.spread_pct) * 4.0 > f64::from(f32::MAX) {
+        return Err(ComputeError::Message(
+            "slab spread_pct is unrepresentable".into(),
+        ));
     }
     let voxel = request.voxel_mm.max(0.25);
     let cm = voxel / 10.0;
@@ -433,9 +481,33 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     if request.material.iter().any(|&m| m as usize >= media) {
         return Err(ComputeError::Message("material index out of range".into()));
     }
-    if request.density.iter().any(|d| !d.is_finite() || *d <= 0.0) {
+    // LET-in-water is only meaningful when LET is scored — a bare flag
+    // silently returns an empty buffer.
+    if request.let_water && !request.score_let {
+        return Err(ComputeError::Message("let_water needs score_let".into()));
+    }
+    if !request.spacing_mm.iter().all(|v| v.is_finite())
+        || !request.origin_mm.iter().all(|v| v.is_finite())
+        || request
+            .spacing_mm
+            .iter()
+            .zip(request.shape.iter())
+            .any(|(mm, n)| {
+                let extent = f64::from(*mm) * (*n as f64);
+                *mm <= 0.0 || extent.is_nan() || extent > 1e5
+            })
+    {
         return Err(ComputeError::Message(
-            "density must be finite and positive".into(),
+            "grid origin and spacing must be finite and the extent physical".into(),
+        ));
+    }
+    if request
+        .density
+        .iter()
+        .any(|d| !d.is_finite() || *d <= 0.0 || *d > 30.0)
+    {
+        return Err(ComputeError::Message(
+            "density must be finite, positive, and within the material range".into(),
         ));
     }
     // smx/smy are divisors in the shader — zero produces a NaN particle
@@ -448,7 +520,7 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             .as_chunks::<16>()
             .0
             .iter()
-            .any(|r| r[13] <= 0.0 || r[14] <= 0.0)
+            .any(|r| r[12] <= 0.0 || r[13] <= 0.0 || r[14] <= 0.0)
     {
         return Err(ComputeError::Message(
             "beams must be whole finite 16-float records".into(),
@@ -469,19 +541,44 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     }
     for row in 0..rows {
         let weight = request.protons.get(row).copied().unwrap_or(0.0);
-        if weight.is_finite() && weight > 0.0 {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(ComputeError::Message(format!(
+                "spot {row} has a non-finite or negative meterset weight"
+            )));
+        }
+        if weight > 0.0 {
             let record = &request.spots[row * 40..(row + 1) * 40];
             if !record.iter().all(|value| value.is_finite()) {
                 return Err(ComputeError::Message(
                     "spot record holds a non-finite field".into(),
                 ));
             }
+            if !(0.0..=1.0).contains(&record[4]) {
+                return Err(ComputeError::Message(
+                    "spot gaussian share outside 0..=1".into(),
+                ));
+            }
+            // Outside the table the shader clamps the stopping power —
+            // error rather than transport with the wrong physics. The
+            // floor matters too: a non-positive energy silently lands in
+            // the bottom bin (slab_launch requires the same range).
+            if record[2] <= 0.0 || record[2] > 400.0 {
+                return Err(ComputeError::Message(
+                    "spot energy outside the table range".into(),
+                ));
+            }
             let beam = record[6];
             if beam < 0.0 || beam.fract() != 0.0 || beam as usize >= request.beams.len() / 16 {
                 return Err(ComputeError::Message("spot beam index out of range".into()));
             }
-            // spots[32..35] = range shifter (lo, material, rho); a shifted
+            // spots[32..35] = range shifter (thickness, exit, material,
+            // rho); a shifted
             // spot's material indexes mc_tables().media like slab_launch's.
+            if record[32] < 0.0 || record[33] < 0.0 {
+                return Err(ComputeError::Message(
+                    "spot range-shifter fields out of range".into(),
+                ));
+            }
             if record[32] > 0.0 {
                 if !(0.0..media as f32).contains(&record[34]) || record[34].fract() != 0.0 {
                     return Err(ComputeError::Message(
@@ -556,8 +653,15 @@ fn empty_result(launch: &Launch) -> McResult {
             values: vec![0.0; nvox],
         },
         uncertainty: 0.0,
+        histories: 0,
         ledger: [0.0; 6],
-        let_d: Vec::new(),
+        // values pairs voxel-for-voxel with let_d when the job asked for
+        // LET — the empty path follows the same shape contract.
+        let_d: if launch.flags & 2 != 0 {
+            vec![0.0; nvox]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -570,10 +674,60 @@ struct McGpu {
     fold_pipe: wgpu::ComputePipeline,
     stats_peak_pipe: wgpu::ComputePipeline,
     stats_rel_pipe: wgpu::ComputePipeline,
-    /// Consecutive 30 s poll timeouts across runs sharing this device.
-    /// Sibling backlog explains one or two; a device whose submissions never
-    /// retire is wedged and must be evicted like a lost one.
+    /// Consecutive stuck-queue checks across runs sharing this device.
+    /// Sibling backlog explains one or two; a device whose queue head never
+    /// retires is wedged and must be evicted like a lost one.
     timeouts: std::sync::atomic::AtomicUsize,
+    /// Adapter identity for `scan_kit.gpu.adapter_info` provenance —
+    /// captured at open so a later probe can't name a different GPU.
+    info: String,
+    /// (index, submitted-at) for every submission on the shared queue,
+    /// oldest first. The flat wait bound can't tell a wedged device from
+    /// sibling backlog — every earlier submission must retire before ours
+    /// can — so the wait loops probe the oldest recorded submission: if it
+    /// retired, the queue drains; if it's older than the bound and still
+    /// pending, the device is wedged.
+    submissions: Mutex<VecDeque<(wgpu::SubmissionIndex, Instant)>>,
+}
+
+/// Is the shared queue's oldest recorded submission stuck? Returns true
+/// when nothing is pending ahead (our own index is then the head, already
+/// bounded by the caller) or when the oldest pending submission is itself
+/// past the bound — every chunk is designed well under it. A head that
+/// retires proves the queue drains, so the caller waits another window.
+fn head_stuck(device: &wgpu::Device, gpu: &McGpu) -> bool {
+    let mut subs = gpu
+        .submissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    while let Some((index, at)) = subs.front() {
+        if device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index.clone()),
+                timeout: Some(Duration::ZERO),
+            })
+            .is_ok()
+        {
+            subs.pop_front();
+            continue;
+        }
+        return at.elapsed() > Duration::from_secs(30);
+    }
+    true
+}
+
+/// Record a submission for `head_stuck`. Bounded — a wedge stops pops,
+/// not pushes, so cap the deque and drop the oldest (losing an entry only
+/// makes the probe see a younger head, which errs toward waiting).
+fn record_submit(gpu: &McGpu, index: &wgpu::SubmissionIndex) {
+    let mut subs = gpu
+        .submissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if subs.len() >= 128 {
+        subs.pop_front();
+    }
+    subs.push_back((index.clone(), Instant::now()));
 }
 
 /// One device and one compiled transport for the process. Opening a device and
@@ -617,7 +771,7 @@ async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
 }
 
 async fn open_gpu() -> Result<McGpu, ComputeError> {
-    let (device, queue) = mc_device().await?;
+    let (device, queue, info) = mc_device().await?;
     let transport = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mc transport"),
         source: wgpu::ShaderSource::Wgsl(TRANSPORT.into()),
@@ -658,6 +812,8 @@ async fn open_gpu() -> Result<McGpu, ComputeError> {
         stats_peak_pipe: pipeline(&device, &fold_layout, &fold, "stats_peak"),
         stats_rel_pipe: pipeline(&device, &fold_layout, &fold, "stats_rel"),
         timeouts: std::sync::atomic::AtomicUsize::new(0),
+        info,
+        submissions: Mutex::new(VecDeque::new()),
         device,
         queue,
         transport_layout,
@@ -675,18 +831,25 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     // so bound it here where the failure is a clean ComputeError.
     let limits = gpu.device.limits();
     let binding_cap = limits.max_storage_buffer_binding_size as usize;
-    // The LET buffer binds nvox*16 but readback stages nvox*20+80 — both
-    // caps bind the run, and max_buffer_size can sit near the binding limit.
-    let staging = nvox.saturating_mul(20).saturating_add(80);
-    if nvox > binding_cap / 16 || staging > limits.max_buffer_size as usize {
+    // Storage buffers bind under min(binding, max_buffer_size) — an adapter
+    // may report either one smaller, and the LET buffer is nvox*16.
+    let buffer_cap = binding_cap.min(limits.max_buffer_size as usize);
+    // With LET on, the LET buffer binds nvox*16 and readback stages
+    // nvox*20+80; off, the largest binding is tally at nvox*8 and staging is
+    // nvox*4+80. Both caps bind the run, and max_buffer_size can sit near
+    // the binding limit.
+    let score_let = launch.flags & 2 != 0;
+    let (bind_mul, stage_mul) = if score_let { (16, 20) } else { (8, 4) };
+    let staging = nvox.saturating_mul(stage_mul).saturating_add(80);
+    if nvox > buffer_cap / bind_mul || staging > limits.max_buffer_size as usize {
         return Err(ComputeError::Message(format!(
             "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
         )));
     }
     // spots/beams bind whole — oversized ones hit create_bind_group
     // validation as a panic, same class as the nvox guard above.
-    if launch.spots.len().saturating_mul(4) > binding_cap
-        || launch.beams.len().saturating_mul(4) > binding_cap
+    if launch.spots.len().saturating_mul(4) > buffer_cap
+        || launch.beams.len().saturating_mul(4) > buffer_cap
     {
         return Err(ComputeError::Message(
             "job buffers exceed the GPU binding limit".into(),
@@ -710,18 +873,23 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         * f64::from(launch.spacing_cm[1])
         * f64::from(launch.spacing_cm[2]);
     let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
+    if !scale.is_finite() {
+        // A non-finite scale poisons every tally — the fold's u32 casts and
+        // peak stats are indeterminate on NaN, and the readback reports
+        // uncertainty 0.0 on a garbage cube.
+        return Err(ComputeError::Message("dose scale is not finite".into()));
+    }
 
-    let spots = storage_init(&device, &f32_bytes(&launch.spots));
-    let floats = storage_init(&device, &f32_bytes(&tables.floats));
-    let ints = storage_init(&device, &i32_bytes(&tables.ints));
+    let spots = storage_init(&device, &f32_bytes(&launch.spots))?;
+    let floats = storage_init(&device, &f32_bytes(&tables.floats))?;
+    let ints = storage_init(&device, &i32_bytes(&tables.ints))?;
     let tally = storage_zero(&device, (nvox * 8) as u64);
     let ledger = storage_zero(&device, 64);
     let params = uniform_buf(&device, 80);
-    let material = storage_init(&device, &u32_bytes(&launch.material));
-    let density = storage_init(&device, &f32_bytes(&launch.density));
-    let score_let = launch.flags & 2 != 0;
+    let material = storage_init(&device, &u32_bytes(&launch.material))?;
+    let density = storage_init(&device, &f32_bytes(&launch.density))?;
     let let_buf = storage_zero(&device, if score_let { (nvox * 16) as u64 } else { 4 });
-    let beams = storage_init(&device, &f32_bytes(&launch.beams));
+    let beams = storage_init(&device, &f32_bytes(&launch.beams))?;
     let sum = storage_zero(&device, (nvox * 4) as u64);
     let sq = storage_zero(&device, (nvox * 4) as u64);
     let out = storage_zero(&device, (nvox * 4) as u64);
@@ -779,7 +947,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         shape,
         origin: launch.origin_mm,
         spacing: launch.spacing_cm.map(|cm| cm * 10.0),
-        inflight: VecDeque::new(),
+        inflight: VecDeque::<(wgpu::SubmissionIndex, u32)>::new(),
         pending_read: None,
         finished: false,
         previews: 0,
@@ -794,6 +962,17 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
 impl Live {
     fn report(&self, preview: bool) -> Report {
         let uncertainty = self.cached_uncertainty;
+        // `next` counts submitted histories — the bar used to run up to
+        // MAX_INFLIGHT chunks ahead of GPU truth.
+        // Entries retire chunk-by-chunk, not per_batch-by-per_batch —
+        // subtracting len()*per_batch over-counts by up to the full window.
+        let queued = self
+            .inflight
+            .iter()
+            .map(|&(_, count)| u64::from(count))
+            .sum::<u64>()
+            .min(u64::from(u32::MAX)) as u32;
+        let done = self.next.saturating_sub(queued);
         Report {
             task: 0,
             generation: 0,
@@ -802,9 +981,9 @@ impl Live {
             } else {
                 Phase::Compute
             },
-            done: u64::from(self.next),
+            done: u64::from(done),
             total: u64::from(self.histories),
-            note: history_note(self.next, self.histories, uncertainty),
+            note: history_note(done, self.histories, uncertainty),
         }
     }
 
@@ -835,6 +1014,10 @@ impl Live {
                 return Err(ComputeError::Message("cancelled".into()));
             }
         }
+        // finish()'s staged copy sits behind every queued chunk — its map
+        // landing certifies all transport retired; stale indices would only
+        // pollute report() and extend() bookkeeping.
+        self.inflight.clear();
         self.finish(cancel)
     }
 
@@ -874,14 +1057,15 @@ impl Live {
                     published = Some(result);
                 }
                 Ok(Err(err)) => {
+                    // A failed map is not proof of device loss — the queue
+                    // waits diagnose that; evicting here drops a healthy
+                    // device for a recoverable error class.
                     self.pending_read = None;
-                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(err) => {
                     self.pending_read = None;
-                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
@@ -965,10 +1149,14 @@ impl Live {
             self.queue.write_buffer(&self.params, 0, &self.base);
             self.queue
                 .write_buffer(&self.ledger, 56, &0u32.to_le_bytes());
+            // The run's last submission folds even off a batch boundary —
+            // a u32::MAX target is no per_batch multiple, and its tail
+            // batch still counts toward dose_sq and the stats sample.
             let fold = self
                 .next
                 .saturating_add(count)
-                .is_multiple_of(self.per_batch);
+                .is_multiple_of(self.per_batch)
+                || self.next.saturating_add(count) >= self.histories;
             if fold {
                 self.queue.write_buffer(
                     &self.fold_params,
@@ -991,8 +1179,9 @@ impl Live {
                     pass.dispatch_workgroups(x, y, 1);
                 }
             }
-            self.inflight
-                .push_back(self.queue.submit(Some(encoder.finish())));
+            let index = self.queue.submit(Some(encoder.finish()));
+            record_submit(&self.gpu, &index);
+            self.inflight.push_back((index, count));
             self.next += count;
         }
     }
@@ -1000,19 +1189,20 @@ impl Live {
     /// Wait on the oldest in-flight submission and pop it. Callers bound the
     /// window before calling, so the queue keeps the rest of the chunks.
     fn wait_fence(&mut self, cancel: &Cancel) -> Result<Duration, ComputeError> {
-        let Some(index) = self.inflight.pop_front() else {
+        let Some((index, _)) = self.inflight.pop_front() else {
             return Ok(Duration::ZERO);
         };
-        let started = Instant::now();
+        let mut started = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Ok(started.elapsed());
             }
-            if started.elapsed() > Duration::from_secs(30) {
+            if started.elapsed() > Duration::from_secs(30) && head_stuck(&self.device, &self.gpu) {
                 // This run's submission retires only after every earlier
-                // submission on the shared queue - sibling backlog explains a
-                // strike or two, but a device that never retires anything is
-                // wedged and would poison every future run.
+                // submission on the shared queue — the flat bound alone
+                // can't tell sibling backlog (cancelled runs leave their
+                // chunks queued) from a wedged device, so probe the queue's
+                // oldest submission before striking.
                 if self
                     .gpu
                     .timeouts
@@ -1024,6 +1214,10 @@ impl Live {
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                // Queue alive, just backlogged — restart the window.
+                started = Instant::now();
             }
             // A short wait so a new voxel size can abandon this chunk instead of
             // sitting behind the rest of the histories already queued. Only
@@ -1100,6 +1294,7 @@ impl Live {
             );
         }
         let index = self.queue.submit(Some(encoder.finish()));
+        record_submit(&self.gpu, &index);
         let (sender, receiver) = std::sync::mpsc::channel();
         staging
             .slice(..)
@@ -1117,16 +1312,16 @@ impl Live {
     fn collect_read(&self, ticket: &ReadTicket, cancel: &Cancel) -> Result<McResult, ComputeError> {
         // Only the copy submission is awaited: a transport chunk submitted
         // after it keeps the GPU busy while the dose is on its way back.
-        let started = Instant::now();
+        let mut started = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Err(ComputeError::Message("cancelled".into()));
             }
-            if started.elapsed() > Duration::from_secs(30) {
+            if started.elapsed() > Duration::from_secs(30) && head_stuck(&self.device, &self.gpu) {
                 // This run's submission retires only after every earlier
-                // submission on the shared queue - sibling backlog explains a
-                // strike or two, but a device that never retires anything is
-                // wedged and would poison every future run.
+                // submission on the shared queue — the flat bound alone
+                // can't tell sibling backlog from a wedged device, so probe
+                // the queue's oldest submission before striking.
                 if self
                     .gpu
                     .timeouts
@@ -1139,11 +1334,15 @@ impl Live {
                     "GPU submission did not retire".into(),
                 ));
             }
+            if started.elapsed() > Duration::from_secs(30) {
+                started = Instant::now();
+            }
             match self.device.poll(wgpu::PollType::Wait {
                 submission_index: Some(ticket.index.clone()),
                 timeout: Some(Duration::from_millis(50)),
             }) {
-                Ok(_) | Err(wgpu::PollError::Timeout) => {}
+                Ok(_) => {}
+                Err(wgpu::PollError::Timeout) => {}
                 Err(err) => {
                     gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
@@ -1152,7 +1351,9 @@ impl Live {
             match ticket.receiver.try_recv() {
                 Ok(result) => {
                     if let Err(err) = result {
-                        gpu_lost(&self.gpu);
+                        // A failed map is not proof of device loss — same
+                        // policy the preview path uses; the wait probes
+                        // diagnose a real wedge instead.
                         return Err(ComputeError::Message(err.to_string()));
                     }
                     self.gpu
@@ -1160,7 +1361,13 @@ impl Live {
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                // The retired index makes Wait return instantly — the map
+                // callback can lag a poll behind it, so pace the retry or an
+                // instant-Ok/Empty loop spins a core until the 30 s bound.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 Err(err) => {
                     gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
@@ -1218,6 +1425,7 @@ impl Live {
                 spacing: self.spacing,
                 values: dose,
             },
+            histories: ticket.histories,
             uncertainty: if rel_count == 0 {
                 0.0
             } else {
@@ -1235,7 +1443,7 @@ impl Live {
         let ticket = self.begin_read(
             1,
             1.0 / (self.histories.max(1) as f32),
-            self.histories.max(1) / self.per_batch.max(1),
+            self.histories.max(1).div_ceil(self.per_batch.max(1)),
             self.histories.max(1),
         )?;
         let result = self.collect_read(&ticket, cancel)?;
@@ -1398,7 +1606,7 @@ fn pipeline(
     })
 }
 
-fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
+fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> Result<wgpu::Buffer, ComputeError> {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: bytes.len().max(4) as u64,
@@ -1408,14 +1616,13 @@ fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("storage buffer mapped at creation");
+        let mut mapped = buffer.slice(..).get_mapped_range_mut().map_err(|_| {
+            ComputeError::Message("the GPU device was lost mapping a buffer".into())
+        })?;
         mapped.slice(..bytes.len()).copy_from_slice(bytes);
     }
     buffer.unmap();
-    buffer
+    Ok(buffer)
 }
 
 fn storage_zero(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
@@ -1475,7 +1682,7 @@ fn pack_i64(lo: u32, hi: u32) -> i64 {
     i64::from_le_bytes(bytes)
 }
 
-async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
+async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue, String), ComputeError> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     // The only GPU waits with no deadline — a wedged driver would park the
     // worker thread forever, past cancel and join.
@@ -1495,7 +1702,7 @@ async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
             "this GPU allows fewer than 9 storage buffers".into(),
         ));
     }
-    tokio::time::timeout(
+    let (device, queue) = tokio::time::timeout(
         Duration::from_secs(30),
         adapter.request_device(&wgpu::DeviceDescriptor {
             required_limits: limits,
@@ -1504,7 +1711,9 @@ async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
     )
     .await
     .map_err(|_| ComputeError::Message("the GPU device request timed out".into()))?
-    .map_err(|err| ComputeError::Message(err.to_string()))
+    .map_err(|err| ComputeError::Message(err.to_string()))?;
+    let info = adapter.get_info();
+    Ok((device, queue, format!("{} / {:?}", info.name, info.backend)))
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -1894,8 +2103,12 @@ mod tests {
     #[test]
     fn patient_launch_rejects_bad_payloads() {
         fn request() -> PatientRequest {
+            // spots[2] is the energy — it must be inside the table range
+            // (0, 400] for later checks to be reached.
+            let mut spots = vec![0.0; 40];
+            spots[2] = 100.0;
             PatientRequest {
-                spots: vec![0.0; 40],
+                spots,
                 protons: vec![1.0],
                 // A real record — an all-zero one is itself invalid (smx/smy
                 // are shader divisors and a zero produces a NaN particle).
@@ -1951,6 +2164,64 @@ mod tests {
         bad.spots[32] = 1.0;
         bad.spots[34] = 99.0;
         assert!(patient_launch(&bad).is_err());
+        // +inf survives .max() floors and NaN passes untouched — the grid
+        // scalars must be finite or the shader deposits indeterminate voxels.
+        let mut bad = request();
+        bad.spacing_mm[0] = f32::INFINITY;
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.origin_mm[1] = f32::NAN;
+        assert!(patient_launch(&bad).is_err());
+        // beams[12] is the nozzle distance — <= 0 is finite, wrong geometry.
+        let mut bad = request();
+        bad.beams[12] = -1.0;
+        assert!(patient_launch(&bad).is_err());
+        // spots[4] is the Gaussian mixture share — outside [0,1] the shader
+        // silently samples one tail forever.
+        let mut bad = request();
+        bad.spots[4] = 2.0;
+        assert!(patient_launch(&bad).is_err());
         assert!(patient_launch(&request()).is_ok());
+    }
+
+    #[test]
+    fn slab_launch_rejects_non_finite_scalars() {
+        // The .max() floors pass +inf through and origin goes unchecked.
+        for bad in [f32::INFINITY, f32::NAN] {
+            assert!(slab_launch(&SlabRequest {
+                spread_pct: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                voxel_mm: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                depth_mm: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                wet_mm: bad,
+                ..slab(1)
+            })
+            .is_err());
+            assert!(slab_launch(&SlabRequest {
+                origin: [bad, 0.0, 0.0],
+                ..slab(1)
+            })
+            .is_err());
+        }
+        // A non-finite spot sigma drops the spot like a non-finite energy —
+        // with one spot the launch then has no protons, not an inf sigma.
+        let dropped = slab_launch(&SlabRequest {
+            sx: vec![f32::INFINITY],
+            ..slab(1)
+        })
+        .unwrap();
+        assert!(dropped.spots.is_empty());
+        assert!(slab_launch(&slab(1)).is_ok());
     }
 }

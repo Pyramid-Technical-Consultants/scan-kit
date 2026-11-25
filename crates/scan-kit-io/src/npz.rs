@@ -141,8 +141,17 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     // bound the decompressed total like the session readers do.
     let mut total = 0u64;
     for index in 0..archive.len() {
-        let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
-        let name = file.name().map_err(|err| err.to_string())?;
+        // Same rule as the session readers — one undecodable member must not
+        // brick every read. np.load opens members lazily, so a stray
+        // unsupported-compression note.txt is not a corrupt archive.
+        let Ok(mut file) = archive.by_index(index) else {
+            continue;
+        };
+        // A member name that is not UTF-8 cannot be a .npy array — skip it
+        // like the stray-note rule below instead of failing the archive.
+        let Ok(name) = file.name() else {
+            continue;
+        };
         // Metadata-fork members (__MACOSX/x.npy) flatten to the same basename
         // as the real array — skip them before they collide or win.
         if name.split(['/', '\\']).any(|part| part == "__MACOSX") {
@@ -187,11 +196,22 @@ pub fn load_npz(path: &Path) -> Result<BTreeMap<String, Npy>, String> {
 /// Write a deflated `.npz` (`np.savez_compressed` compatible); each pair's
 /// string becomes the entry name without its `.npy` suffix.
 pub fn write_npz(path: &Path, entries: &[(String, Npy)]) -> Result<(), String> {
-    let file = fs::File::create(path).map_err(|err| format!("{path:?}: {err}"))?;
-    let mut writer = zip::ZipWriter::new(file);
+    // Build the archive in memory and land it atomically — a mid-write
+    // error must not leave a truncated zip at the destination.
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     for (name, entry) in entries {
+        // The reader keys members on the basename — a separator in `name`
+        // would write `a/b.npy` and read it back as `b`.
+        if name.contains(['/', '\\']) {
+            return Err(format!("npz entry name holds a separator: {name}"));
+        }
+        // An empty name writes `.npy`, which the reader's basename strip
+        // silently drops — refuse it instead.
+        if name.is_empty() {
+            return Err("npz entry name is empty".into());
+        }
         writer
             .start_file(format!("{name}.npy"), options)
             .map_err(|err| err.to_string())?;
@@ -199,8 +219,8 @@ pub fn write_npz(path: &Path, entries: &[(String, Npy)]) -> Result<(), String> {
             .write_all(&serialize_npy(entry)?)
             .map_err(|err| err.to_string())?;
     }
-    writer.finish().map_err(|err| err.to_string())?;
-    Ok(())
+    let done = writer.finish().map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(path, &done.into_inner())
 }
 
 pub fn npy_f64(shape: &[usize], data: &[f64]) -> Npy {
@@ -319,8 +339,21 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
     // may emit `"fortran_order": True` or `'fortran_order' : True`, and a
     // Fortran-order array read as C-order is a silent transposition.
     if let Some((_, rest)) = header.split_once("fortran_order") {
-        let value = rest.trim_start_matches(['\'', '"', ' ', ':']);
-        if value.starts_with("True") || value.starts_with("true") {
+        // Fail closed — NumPy treats any truthy literal as Fortran order,
+        // so anything not an explicit False is rejected, not pattern-matched.
+        // The value follows the key's ':'. A quoted 'False' is a truthy
+        // string to NumPy — still Fortran order — and 'Falsehood' must not
+        // pass on its prefix either.
+        let after = rest.split_once(':').map(|(_, tail)| tail).unwrap_or("");
+        let value = after.trim_start();
+        if value.starts_with('\'') || value.starts_with('"') {
+            return Err("fortran npy".into());
+        }
+        let tail = value
+            .strip_prefix("False")
+            .or_else(|| value.strip_prefix("false"))
+            .ok_or("fortran npy")?;
+        if tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             return Err("fortran npy".into());
         }
     }
@@ -330,29 +363,37 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
     Ok(Npy { descr, shape, data })
 }
 
-fn quoted(header: &str, key: &str) -> Result<String, String> {
-    let needle = format!("'{key}':");
-    let rest = header
-        .split_once(&needle)
-        .ok_or_else(|| format!("npy {key}"))?
-        .1
-        .trim_start();
-    let rest = rest
-        .strip_prefix('\'')
+// NumPy parses the header with ast.literal_eval, so either quote char and
+// optional whitespace around the colon are spec-valid.
+fn value_at<'a>(header: &'a str, key: &str) -> Result<&'a str, String> {
+    let single = format!("'{key}'");
+    let double = format!("\"{key}\"");
+    let (_, rest) = header
+        .split_once(&single)
+        .or_else(|| header.split_once(&double))
         .ok_or_else(|| format!("npy {key}"))?;
-    Ok(rest.split('\'').next().unwrap_or("").to_owned())
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':').ok_or_else(|| format!("npy {key}"))?;
+    Ok(rest.trim_start())
+}
+
+fn quoted(header: &str, key: &str) -> Result<String, String> {
+    let rest = value_at(header, key)?;
+    let mark = rest
+        .chars()
+        .next()
+        .filter(|c| *c == '\'' || *c == '"')
+        .ok_or_else(|| format!("npy {key}"))?;
+    Ok(rest[1..].split(mark).next().unwrap_or("").to_owned())
 }
 
 fn quoted_or_tuple(header: &str, key: &str) -> Result<String, String> {
-    let needle = format!("'{key}':");
-    let rest = header
-        .split_once(&needle)
-        .ok_or_else(|| format!("npy {key}"))?
-        .1
-        .trim_start();
-    if let Some(inner) = rest.strip_prefix('(') {
-        let body = inner.split(')').next().unwrap_or("");
-        return Ok(format!("({body})"));
+    let rest = value_at(header, key)?;
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        if let Some(inner) = rest.strip_prefix(open) {
+            let body = inner.split(close).next().unwrap_or("");
+            return Ok(format!("({body})"));
+        }
     }
     quoted(header, key)
 }
@@ -454,7 +495,7 @@ mod tests {
         for v in [0.0f32, 1.0, -1.0, 0.5, 65_504.0, 6e-5, 1e-8, f32::INFINITY] {
             let h = f32_to_f16(v);
             let back = f16_to_f32(h);
-            if v.is_finite() && v.abs() >= 6e-5 && v.abs() < 65_504.0 {
+            if v.is_finite() && v.abs() >= 6e-5 && v.abs() <= 65_504.0 {
                 assert!((back - v).abs() <= v.abs() * 0.001 + 1e-7, "{v} -> {back}");
             } else {
                 assert_eq!(back.is_infinite(), v.is_infinite(), "{v}");

@@ -38,6 +38,8 @@ pub struct PatientTolerances {
     pub d95: f64,
     pub d2: f64,
     pub let_tol: f64,
+    /// Ledger closure: |incident - (deposit+leak+lost+line+off)| / incident.
+    pub closure: f64,
 }
 
 // fast runs 10x fewer GPU histories than the goldens, so its noise allows less.
@@ -72,6 +74,7 @@ pub const PATIENT_TOL: PatientTolerances = PatientTolerances {
     d95: 0.02,
     d2: 0.02,
     let_tol: 0.03,
+    closure: 0.02,
 };
 
 #[derive(Clone)]

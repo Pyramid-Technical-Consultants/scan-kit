@@ -143,7 +143,9 @@ fn px_to_clip(px: vec2<f32>) -> vec4<f32> {
 
 fn shade(rgb: vec3<f32>, alpha: f32, coverage: f32) -> vec4<f32> {
     let a = alpha * coverage;
-    if (a < 0.004) {
+    // a < 0.004 is false for NaN — write the gate NaN-safe so a crafted
+    // mark can't push NaN premultiplied into the target.
+    if (!(a >= 0.004)) {
         discard;
     }
     return vec4<f32>(rgb * a, a);
@@ -696,9 +698,11 @@ fn axis_step(cell: f32, dir_mm: f32, voxel: f32, best: f32) -> f32 {
     let brick = floor(cell / 8.0) * 8.0;
     var bound = brick;
     if (dir_i > 0.0) { bound = brick + 8.0; }
+    // step >= 0 inside a brick — the nearest face IS the constraint, and
+    // skipping a ~0 distance hops the very face being crossed (the CPU
+    // march at dose/ray.rs carries this same comment).
     let step = (bound - cell) / dir_i;
-    if (step > 0.0001) { return min(best, step); }
-    return best;
+    return min(best, step);
 }
 
 fn steps_to_leave(cell: vec3<f32>, dir: vec3<f32>, spacing: vec3<f32>, step: f32) -> i32 {
@@ -1329,8 +1333,8 @@ pub(crate) struct PointRec {
     pub radius: f32,
     pub color: [f32; 4],
     pub id: u32,
-    /// Sample time. Non-finite times are dropped at encode, so every record
-    /// that reaches the payload has a finite time.
+    /// Sample time. Timed series drop non-finite samples at build; untimed
+    /// points ship `NaN` and are only read when a run flags `timed`.
     pub time: f32,
 }
 
@@ -2598,14 +2602,31 @@ impl Plot {
                 self.persp_fov = previous.persp_fov;
                 self.pan = previous.pan;
             }
-            if previous.turns.len() == self.panels.len() {
-                self.turns.clone_from(&previous.turns);
-            }
-            if previous.integral.len() == self.panels.len() {
-                self.integral.clone_from(&previous.integral);
-            }
-            if previous.profile_integral.len() == self.panels.len() {
-                self.profile_integral.clone_from(&previous.profile_integral);
+            for index in 0..self.panels.len().min(previous.panels.len()) {
+                // These flags only make sense for the same view kind — a
+                // rotated Axial displaced by 3D must not hand its turn to
+                // whatever lands in the slot.
+                if dose_plane(&previous.panels[index].title)
+                    != dose_plane(&self.panels[index].title)
+                {
+                    continue;
+                }
+                if let (Some(at), Some(was)) =
+                    (previous.turns.get(index), self.turns.get_mut(index))
+                {
+                    *was = *at;
+                }
+                if let (Some(at), Some(was)) =
+                    (previous.integral.get(index), self.integral.get_mut(index))
+                {
+                    *was = *at;
+                }
+                if let (Some(at), Some(was)) = (
+                    previous.profile_integral.get(index),
+                    self.profile_integral.get_mut(index),
+                ) {
+                    *was = *at;
+                }
             }
             if previous.profile_window.len() == self.panels.len()
                 && previous.home.len() == self.home.len()
@@ -2627,7 +2648,10 @@ impl Plot {
         for index in 0..count {
             let panel = &self.panels[index];
             let previous_panel = &previous.panels[index];
-            if panel.x_label != previous_panel.x_label || panel.y_label != previous_panel.y_label {
+            if panel.x_label != previous_panel.x_label
+                || panel.y_label != previous_panel.y_label
+                || dose_plane(&panel.title) != dose_plane(&previous_panel.title)
+            {
                 continue;
             }
             // A fit the user has not touched tracks the new data, so a session
@@ -2808,7 +2832,7 @@ impl Plot {
         // column keep their own axes.
         self.panels
             .get(index)
-            .is_some_and(|panel| panel.x_label.is_empty())
+            .is_some_and(|panel| panel.x_label.is_empty() && dose_plane(&panel.title).is_none())
             && index.saturating_add(self.side as usize) < self.panels.len()
     }
 
@@ -3013,8 +3037,11 @@ impl Plot {
             .filter(|cloud| cloud.panel == cell.panel && !cloud.crosshair)
         {
             for line in cloud.lines.iter().rev() {
-                let a = project(matrix, line.a, w, h);
-                let b = project(matrix, line.b, w, h);
+                let mut a = project(matrix, line.a, w, h);
+                let mut b = project(matrix, line.b, w, h);
+                // Hit-test the snapped stroke the renderers draw, not the
+                // unsnapped projection.
+                snap_hairline(&mut a, &mut b);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
                     if let Some(series) = hit(line.id) {
                         return Some(series);
@@ -3037,8 +3064,9 @@ impl Plot {
             let start = (*start as usize).min(line_records);
             let end = start.saturating_add(*count as usize).min(line_records);
             for line in self.marks.lines[start..end].iter().rev() {
-                let a = project(matrix, line.a, w, h);
-                let b = project(matrix, line.b, w, h);
+                let mut a = project(matrix, line.a, w, h);
+                let mut b = project(matrix, line.b, w, h);
+                snap_hairline(&mut a, &mut b);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
                     if let Some(series) = hit(line.id) {
                         return Some(series);
@@ -3071,15 +3099,20 @@ impl Plot {
             }
         }
         for (index, _) in batch.heats.iter().rev() {
-            let quad = &self.marks.quads[*index as usize];
+            let Some(quad) = self.marks.quads.get(*index as usize) else {
+                continue;
+            };
             if covers(quad) {
                 if let Some(series) = hit(quad.id) {
                     return Some(series);
                 }
             }
         }
-        let quads = &self.marks.quads
-            [batch.quad_start as usize..(batch.quad_start + batch.quad_count) as usize];
+        // Same stale-batch clamp as the line path — a reuse payload can
+        // carry quad ranges past the suffix buffer.
+        let qstart = (batch.quad_start as usize).min(self.marks.quads.len());
+        let qend = (batch.quad_start + batch.quad_count) as usize;
+        let quads = &self.marks.quads[qstart..qend.min(self.marks.quads.len())];
         quads
             .iter()
             .rev()
@@ -3364,9 +3397,10 @@ impl Plot {
                 };
                 // `chrome` is a band the shell reserved inside one shared canvas.
                 let top = top.max(self.chrome);
-                let mut plot = if cell.w <= 0.0 || cell.h <= 0.0 {
-                    // A zero-weight cell has no room — a forced 8 px plot
-                    // would smear this panel into the neighbor's gutter.
+                let mut plot = if cell.w - left - right <= 0.0 || cell.h - top - bottom <= 0.0 {
+                    // A cell with no room inside its chrome has no plot — a
+                    // forced 8 px rect would smear this panel into the
+                    // neighbor's gutter.
                     PlotRect {
                         x: cell.x,
                         y: cell.y,
@@ -3381,7 +3415,7 @@ impl Plot {
                         h: (cell.h - top - bottom).max(8.0),
                     })
                 };
-                if cell.w > 0.0 && plane.is_some_and(|plane| plane < 3) {
+                if plot.w > 0.0 && plane.is_some_and(|plane| plane < 3) {
                     let turns = self.turns.get(index).copied().unwrap_or(0);
                     let fitted = fit_domain(camera, &plot, turns);
                     let wider = axis_name_width(&panel.y_label) + y_tick_width(&fitted) + 8.0;
@@ -3436,10 +3470,18 @@ impl Plot {
             width as f32,
             height as f32,
         );
+        // Same contract as fill_quad_cpu: NaN-projected quads discard, and
+        // a degenerate quad produces no GPU fragments.
+        if !p0.iter().all(|v| v.is_finite()) || !p1.iter().all(|v| v.is_finite()) {
+            return;
+        }
         let left = p0[0].min(p1[0]);
         let right = p0[0].max(p1[0]);
         let top = p0[1].min(p1[1]);
         let bottom = p0[1].max(p1[1]);
+        if right == left || bottom == top {
+            return;
+        }
         let span_x = (right - left).max(1.0);
         let span_y = (bottom - top).max(1.0);
         let aspect = span_x / span_y;
@@ -3466,7 +3508,8 @@ impl Plot {
                     .max((x as f32 + 0.5) - right)
                     .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
                 let coverage = (0.5 - outside).clamp(0.0, 1.0);
-                if coverage <= 0.0 {
+                // NaN coverage must not reach blend — a NaN alpha erases.
+                if coverage <= 0.0 || coverage.is_nan() {
                     continue;
                 }
                 let u = ((x as f32 + 0.5 - left + 1.0) / (span_x + 2.0)).clamp(0.0, 1.0);
@@ -3523,9 +3566,9 @@ impl Plot {
                     );
                 }
             }
-            let solid: Vec<QuadRec> = self.marks.quads
-                [batch.quad_start as usize..(batch.quad_start + batch.quad_count) as usize]
-                .to_vec();
+            let qstart = (batch.quad_start as usize).min(self.marks.quads.len());
+            let qend = ((batch.quad_start + batch.quad_count) as usize).min(self.marks.quads.len());
+            let solid: Vec<QuadRec> = self.marks.quads[qstart..qend].to_vec();
             let heated: Vec<QuadRec> = batch
                 .heats
                 .iter()
@@ -3587,6 +3630,11 @@ impl Plot {
                     .collect::<Vec<_>>()
             };
             for (start, count, timed) in runs {
+                // Match visible_draws — a stale range clamps to the records
+                // that exist rather than dropping the run.
+                let total = self.marks.points.len() as u32;
+                let start = start.min(total);
+                let count = count.min(total - start);
                 let Some(points) = self
                     .marks
                     .points
@@ -3898,9 +3946,9 @@ impl Plot {
                     pass.draw(0..6, 0..batch_count as u32);
                 }
                 for (start, texture) in &batch.heats {
-                    let start = u64::from(*start).min(quad_records.saturating_sub(1));
-                    if quad_records == 0 {
-                        break;
+                    let start = u64::from(*start);
+                    if start >= quad_records {
+                        continue;
                     }
                     pass.set_bind_group(1, &marks.heats[*texture].group, &[]);
                     pass.set_vertex_buffer(0, marks.quads.slice(start * QUAD_STRIDE..));
@@ -5228,11 +5276,18 @@ pub(crate) struct LineStamp {
 pub(crate) fn line_stamp(panels: &[Panel]) -> LineStamp {
     let mut state = 0x9E37_79B1_85EB_CA87u64;
     let mut prefix = 0u32;
+    // Series ordinals are baked into the reused bytes — every series in
+    // every panel consumes one, so hidden panels and non-polylines still
+    // advance the counter and a scene edit can't donate stale ids.
+    let mut next_id = 1u32;
     for panel in panels {
-        if hides_polylines(panel) {
-            continue;
-        }
+        let hidden = hides_polylines(panel);
         for series in &panel.series {
+            let id = next_id;
+            next_id = next_id.saturating_add(1);
+            if hidden {
+                continue;
+            }
             let Series::Polyline {
                 xs,
                 ys,
@@ -5242,6 +5297,7 @@ pub(crate) fn line_stamp(panels: &[Panel]) -> LineStamp {
             else {
                 continue;
             };
+            state = mix(state, u64::from(id));
             state = mix(state, xs.len() as u64);
             state = mix(state, ys.len() as u64);
             for value in xs.iter().chain(ys) {
@@ -5601,10 +5657,17 @@ fn write_polyline(
         }
         let point = [*x, *y];
         if let Some(start) = previous {
+            // fill_solid NaN's a duplicated segment — the sparse path must
+            // too or it would paint a dot and pick the invisible mark.
+            let a = if start == point {
+                [f32::NAN, f32::NAN, 0.0]
+            } else {
+                [start[0], start[1], 0.0]
+            };
             push_line_word(
                 out,
                 &LineRec {
-                    a: [start[0], start[1], 0.0],
+                    a,
                     b: [point[0], point[1], 0.0],
                     color,
                     thickness: thick,
@@ -5665,10 +5728,17 @@ fn stroke_workers(count: usize) -> usize {
 
 fn fill_solid(part: &mut [u8], xs: &[f32], ys: &[f32], color: [f32; 4], thickness: f32, id: u32) {
     for (index, word) in part.chunks_mut(LINE_STRIDE as usize).enumerate() {
+        // A duplicated vertex has no direction — NaN out the record so it
+        // is non-drawing and non-picking on every consumer like the GPU.
+        let a = if xs[index] == xs[index + 1] && ys[index] == ys[index + 1] {
+            [f32::NAN, f32::NAN, 0.0]
+        } else {
+            [xs[index], ys[index], 0.0]
+        };
         store_line(
             word,
             &LineRec {
-                a: [xs[index], ys[index], 0.0],
+                a,
                 b: [xs[index + 1], ys[index + 1], 0.0],
                 color,
                 thickness,
@@ -5695,9 +5765,14 @@ fn push_polyline(
             continue;
         }
         let point = [*x, *y, 0.0];
+        // A duplicated vertex still takes a record — write_strokes emits
+        // one per consecutive finite pair, and header.lines counting fewer
+        // than the byte section writes would misalign every section after.
         if let Some(start) = prev {
+            // NaN'd like fill_solid: invisible and unpickable either way.
+            let a = if start == point { [f32::NAN; 3] } else { start };
             lines.push(LineRec {
-                a: start,
+                a,
                 b: point,
                 color,
                 thickness: thickness.max(1.0),
@@ -6532,8 +6607,15 @@ fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
     // an unbounded count is an unbounded loop. The WGSL hang_ticks caps at 96;
     // match it here.
     const MAX_TICKS: usize = 96;
-    let k0 = (lo / STEP - 1e-9).ceil() as i64;
-    let k1 = (hi / STEP + 1e-9).floor() as i64;
+    let k0f = (lo / STEP - 1e-9).ceil();
+    let k1f = (hi / STEP + 1e-9).floor();
+    // The i64 casts saturate near ±9e18 — a crafted extent that large would
+    // stamp up to 96 ticks at the same saturated position.
+    if !k0f.is_finite() || !k1f.is_finite() || k0f < -4.0e18 || k1f > 4.0e18 {
+        return vec![(lo, true), (hi, true)];
+    }
+    let k0 = k0f as i64;
+    let k1 = k1f as i64;
     // One-sided saturation (lo = f32::MIN, hi normal) overflows k1 - k0 + 1 —
     // saturate the subtraction before the cap, not after.
     let count = k1
@@ -6553,10 +6635,12 @@ fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
             || (k.rem_euclid(every) == 0 && gap as f32 >= 0.6 * every as f32);
         ticks.push((k as f32 * STEP, major));
     }
-    if ticks.first().is_none_or(|(value, _)| *value - lo > 1e-4) {
+    // Match the WGSL stub threshold — a labeled end tick with no stub
+    // under it is a floating number.
+    if ticks.first().is_none_or(|(value, _)| *value - lo > 0.05) {
         ticks.insert(0, (lo, true));
     }
-    if ticks.last().is_none_or(|(value, _)| hi - *value > 1e-4) {
+    if ticks.last().is_none_or(|(value, _)| hi - *value > 0.05) {
         ticks.push((hi, true));
     }
     ticks
@@ -6859,6 +6943,10 @@ fn labels_for(
             [0.0, 0.0],
             color,
         );
+    }
+    if cell.plot.w <= 0.0 || cell.plot.h <= 0.0 {
+        // Every data-anchored glyph would project onto the same pixel.
+        return out;
     }
     // A rotated dose slice shows source-Y on the x edge (and vice versa)
     // for odd turns; for turns=2 the x edge runs mirrored. Tick the SOURCE
@@ -7204,8 +7292,11 @@ fn profile_quantity(plot: &Plot, panel: usize) -> String {
         .find_map(|item| {
             let label = bare_quantity(&item.y_label);
             let name = label.to_ascii_lowercase();
-            (name.starts_with("gy") || name.starts_with("mu") || name.starts_with("proton"))
-                .then(|| label.to_string())
+            (name.starts_with("gy")
+                || name.starts_with("mu")
+                || name.starts_with("proton")
+                || name.starts_with("gamma"))
+            .then(|| label.to_string())
         })
         .unwrap_or_else(|| "Gy".to_string())
 }
@@ -7739,8 +7830,16 @@ fn split_rows(
     let mut y = margin;
     for row in 0..rows {
         let cell_h = inner_h * clean[row] / row_sum;
-        let left = row_splits[row * 2].max(0.0);
-        let right = row_splits[row * 2 + 1].max(0.0);
+        let left = if row_splits[row * 2].is_finite() {
+            row_splits[row * 2].max(0.0)
+        } else {
+            0.0
+        };
+        let right = if row_splits[row * 2 + 1].is_finite() {
+            row_splits[row * 2 + 1].max(0.0)
+        } else {
+            0.0
+        };
         let sum = (left + right).max(1.0e-6);
         let left_w = inner_w * left / sum;
         let right_w = inner_w * right / sum;
@@ -7901,6 +8000,11 @@ fn scissor(plot: PlotRect, width: u32, height: u32) -> (u32, u32, u32, u32) {
     // `snap_plot` makes this an exact pixel range. Truncation is that range.
     let x = (plot.x.max(0.0) as u32).min(width.saturating_sub(1));
     let y = (plot.y.max(0.0) as u32).min(height.saturating_sub(1));
+    if plot.w <= 0.0 || plot.h <= 0.0 {
+        // A dead cell owns no pixels — a forced 1-px scissor still paints
+        // the collapsed mark dot into the neighbor's gutter.
+        return (x, y, 0, 0);
+    }
     let w = (plot.w.max(1.0) as u32).min(width.saturating_sub(x)).max(1);
     let h = (plot.h.max(1.0) as u32)
         .min(height.saturating_sub(y))
@@ -7930,6 +8034,14 @@ fn fill_quad_cpu(
     marks: &Marks,
     plot: PlotRect,
 ) {
+    // The GPU clip discards any primitive a NaN projects from — a NaN
+    // ordinate would cast to 0 and smear or erase across the scissor.
+    if !quad.a.iter().all(|v| v.is_finite())
+        || !quad.b.iter().all(|v| v.is_finite())
+        || quad.c.is_some_and(|c| !c.iter().all(|v| v.is_finite()))
+    {
+        return;
+    }
     if let Some(c) = quad.c {
         let p0 = project(
             *matrix,
@@ -7983,6 +8095,11 @@ fn fill_quad_cpu(
     let right = p0[0].max(p1[0]);
     let top = p0[1].min(p1[1]);
     let bottom = p0[1].max(p1[1]);
+    // The GPU pass produces no fragments for a zero-area quad — the CPU
+    // coverage math would still paint a sliver at a pixel center.
+    if right == left || bottom == top {
+        return;
+    }
     let span_x = (right - left).max(1.0);
     let span_y = (bottom - top).max(1.0);
     let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
@@ -7995,10 +8112,11 @@ fn fill_quad_cpu(
                 .max((x as f32 + 0.5) - right)
                 .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
             let coverage = (0.5 - outside).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
+            // NaN coverage must not reach blend — a NaN alpha erases.
+            if coverage <= 0.0 || coverage.is_nan() {
                 continue;
             }
-            let mut color = if let Some(index) = quad.heatmap {
+            let mut color = if let Some(index) = quad.heatmap.filter(|_| quad.heat > 0.5) {
                 // uv interpolates the +1px-grown quad — the same mapping the
                 // shader samples mark_tex with.
                 let u = (x as f32 + 0.5 - left + 1.0) / (span_x + 2.0);
@@ -8136,7 +8254,8 @@ fn stroke_cpu(
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
             let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
             let coverage = pattern_coverage(dist, radius, phase + t * len, line.pattern);
-            if coverage <= 0.0 {
+            // An inf/NaN phase yields NaN coverage — skip, don't erase.
+            if coverage <= 0.0 || coverage.is_nan() {
                 continue;
             }
             let mut ink = line.color;
@@ -8205,6 +8324,7 @@ fn heat_texel(px: &[u8], cols: u32, rows: u32, u: f32, v: f32) -> [f32; 4] {
     let y1 = (y0 + 1).min(rows.saturating_sub(1));
     let tx = fx - x0 as f32;
     let ty = fy - y0 as f32;
+    debug_assert_eq!(px.len(), (cols * rows * 4) as usize);
     let read = |x: u32, y: u32| {
         let i = (y * cols + x) as usize * 4;
         [
@@ -8239,6 +8359,10 @@ fn disc_cpu(
     color: [f32; 4],
     plot: PlotRect,
 ) {
+    // A NaN center would cast to the origin — the GPU discards the point.
+    if !center.iter().all(|v| v.is_finite()) || !radius.is_finite() {
+        return;
+    }
     let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
     // A payload radius can exceed i64::MAX — a disc bigger than the canvas
     // covers it anyway, so clamp before the cast, not after.
@@ -8276,6 +8400,11 @@ fn disc_cpu(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], glyph: &GlyphRec) {
+    // A NaN anchor or uv floors to 0 and stamps the glyph at the corner —
+    // the GPU discards the vertex.
+    if !glyph.anchor.iter().all(|v| v.is_finite()) || !glyph.uv.iter().all(|v| v.is_finite()) {
+        return;
+    }
     let origin = if glyph.anchor[3] > 0.5 {
         project(
             *matrix,
@@ -8286,6 +8415,11 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
     } else {
         [glyph.anchor[0], glyph.anchor[1]]
     };
+    if !origin[0].is_finite() || !origin[1].is_finite() {
+        // NaN as i32 is 0 — an unprojectable anchor would stamp the
+        // glyph's pixels at the frame corner.
+        return;
+    }
     let font = atlas();
     let (sin_t, cos_t) = glyph.anchor[2].sin_cos();
     let turned = glyph.anchor[3] < 0.5 && glyph.anchor[2] > 0.5;
@@ -8296,7 +8430,13 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
     let rows = glyph.size[1] as u32;
     for row in 0..rows {
         for col in 0..columns {
-            let coverage = font.pixels[((v0 + row) * font.size + u0 + col) as usize] as f32 / 255.0;
+            let Some(&coverage) = font
+                .pixels
+                .get((v0 + row) as usize * font.size as usize + (u0 + col) as usize)
+            else {
+                continue;
+            };
+            let coverage = coverage as f32 / 255.0;
             if coverage < 0.004 {
                 continue;
             }
@@ -8352,12 +8492,19 @@ fn blend(
         return;
     }
     let alpha = color[3].clamp(0.0, 1.0);
-    if alpha < 0.004 {
+    // clamp propagates NaN — a NaN alpha passes the gate below and a NaN
+    // rgb writes 0 into the destination: a crafted mark could erase pixels.
+    if !alpha.is_finite() || alpha < 0.004 {
         return;
     }
     let pixel = index * 4;
     for channel in 0..3 {
-        let src = color[channel].clamp(0.0, 1.0) * alpha * 255.0;
+        let rgb = if color[channel].is_finite() {
+            color[channel].clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let src = rgb * alpha * 255.0;
         let dst = frame[pixel + channel] as f32;
         frame[pixel + channel] = (src + dst * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
     }
@@ -8425,7 +8572,16 @@ pub(crate) fn decode_lines(bytes: &[u8]) -> Vec<LineRec> {
             color: f32x4_at(chunk, 8),
             thickness: f32_at(chunk, 12),
             id: u32_at(chunk, 13),
-            pattern: f32_at(chunk, 3) as u8,
+            pattern: {
+                let pattern = f32_at(chunk, 3);
+                if pattern < 0.5 {
+                    LINE_SOLID
+                } else if pattern > 1.5 {
+                    LINE_DOT
+                } else {
+                    LINE_DASH
+                }
+            },
             phase: f32_at(chunk, 7),
         })
         .collect()
@@ -8692,6 +8848,8 @@ fn upload_buffer(
     buffer
 }
 
+// Grow-only: bytes past the new prefix are stale from prior frames — every
+// draw range must be recomputed and bounded to the bytes just written.
 fn write_grow(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -10553,6 +10711,7 @@ mod tests {
         scene.volume.gantry = 90.0;
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let (width, height) = (960u32, 640u32);
@@ -10933,6 +11092,7 @@ mod tests {
     #[test]
     fn the_shader_dash_opens_gaps_on_the_stroke() {
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut scene = line_scene();
@@ -11808,12 +11968,12 @@ mod tests {
             hi: 1.0,
         }];
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.9, 0.9, 0.9, 1.0]);
-        let layout = plot.layout(64, 64);
-        let frame = plot.paint_cpu(64, 64, &layout);
+        let layout = plot.layout(256, 256);
+        let frame = plot.paint_cpu(256, 256, &layout);
         let rect = layout[0].plot;
         let x = (rect.x + rect.w * 0.5) as u32;
         let y = (rect.y + rect.h * 0.5) as u32;
-        let pixel = (y * 64 + x) as usize * 4;
+        let pixel = (y * 256 + x) as usize * 4;
         assert_eq!(&frame[pixel..pixel + 3], &[255, 255, 255]);
     }
 
@@ -12316,6 +12476,7 @@ mod tests {
     #[test]
     fn gpu_and_cpu_pictures_agree() {
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut scene = line_scene();
@@ -13200,6 +13361,7 @@ mod tests {
             ..scan_kit_core::VolumeMark::default()
         };
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut plot = Plot::new(&scene, [0.1, 0.1, 0.1, 1.0], [1.0, 1.0, 1.0, 1.0]);
@@ -13347,6 +13509,20 @@ mod tests {
         // wrapped into an unbounded loop.
         let ticks = axis_ticks(-2.5e10, 2.5e10);
         assert!(ticks.len() <= 98, "{} ticks", ticks.len());
+        assert!(
+            ticks
+                .iter()
+                .all(|(value, _)| *value >= -2.5e10 - 1e-3 && *value <= 2.5e10 + 1e-3),
+            "{ticks:?}"
+        );
+        // Positions merge at f32 precision this far out — non-decreasing
+        // inside the range is what the order can pin.
+        assert!(ticks.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        // Past the i64-cast range only the box ends survive.
+        assert_eq!(
+            axis_ticks(1e30, 2e30),
+            vec![(1e30f32, true), (2e30f32, true)]
+        );
     }
 
     #[test]
@@ -13471,6 +13647,36 @@ mod tests {
                 xs.iter().any(|x| (*x - at).abs() < 1e-3),
                 "source-y {v} should label at display x {at}: {xs:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_crafted_pattern_word_quantizes_to_the_shader_thresholds() {
+        // Word 3 is a free f32 on the wire — decode must land it on the same
+        // solid/dash/dot thresholds the WGSL uses or CPU paint, GPU paint,
+        // and pick disagree on a crafted payload.
+        let rec = LineRec {
+            a: [0.0; 3],
+            b: [1.0, 0.0, 0.0],
+            color: [0.0; 4],
+            thickness: 1.0,
+            id: 0,
+            pattern: LINE_SOLID,
+            phase: 0.0,
+        };
+        let mut bytes = encode_lines(&[rec]);
+        for (crafted, want) in [
+            (0.0f32, LINE_SOLID),
+            (0.49, LINE_SOLID),
+            (0.5, LINE_DASH),
+            (1.5, LINE_DASH),
+            (1.51, LINE_DOT),
+            (3.0, LINE_DOT),
+            (f32::NAN, LINE_DASH),
+            (f32::INFINITY, LINE_DOT),
+        ] {
+            bytes[12..16].copy_from_slice(&crafted.to_le_bytes());
+            assert_eq!(decode_lines(&bytes)[0].pattern, want, "{crafted}");
         }
     }
 }

@@ -1,4 +1,4 @@
-import { createElement, useEffect, useRef, useState } from "react";
+import { createElement, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft } from "lucide-react";
@@ -38,6 +38,7 @@ import { optionIcon } from "@/option-icons";
 import {
   applyLevelPaint,
   backingSize,
+  watchDpr,
   plotHeader,
   shownHeader,
   type PlotHeader,
@@ -261,6 +262,14 @@ function plotterFor(node: HTMLCanvasElement): Promise<Plotter> {
   return pending;
 }
 
+function releasePlotter(node: HTMLCanvasElement): void {
+  const pending = plotters.get(node);
+  if (pending != null) {
+    plotters.delete(node);
+    pending.then((plot) => plot.free()).catch(() => {});
+  }
+}
+
 function parseColor(value: string): [number, number, number, number] {
   const canvas = document.createElement("canvas");
   canvas.width = 1;
@@ -385,6 +394,9 @@ export function AnalysisView({
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotter = useRef<Plotter | null>(null);
+  // The canvas whose WebPlot.create is in flight — a width write while the
+  // surface is being configured resets the only context it will ever get.
+  const creating = useRef<HTMLCanvasElement | null>(null);
   const payload = useRef<Uint8Array | null>(null);
   const hold = useRef(0);
   const taskId = useRef(0);
@@ -417,6 +429,8 @@ export function AnalysisView({
   const metaRef = useRef<PlotHeader | null>(null);
   const liveRef = useRef(true);
   const openingRef = useRef(false);
+  const scannerPickRef = useRef(false);
+  const scannerSeq = useRef(0);
   useEffect(() => {
     liveRef.current = true;
     return () => {
@@ -453,6 +467,13 @@ export function AnalysisView({
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [scanners, setScanners] = useState<{ label: string; folder: string }[]>([]);
+  // gridTheme() runs DOM probes — memoize it instead of re-probing on
+  // every poll-driven render.
+  const editorTheme = useMemo(() => gridTheme(), []);
+  const exportArgsRef = useRef({ studyPath, scanners, sessions, hidden, folder });
+  useEffect(() => {
+    exportArgsRef.current = { studyPath, scanners, sessions, hidden, folder };
+  });
   const [size, setSize] = useState({ width: 960, height: 640 });
   const shown = (meta?.panels.length ?? 0) > 0;
   const viewRef = useRef(viewId);
@@ -474,11 +495,14 @@ export function AnalysisView({
       return;
     }
     let live = true;
+    const listed_at = scannerSeq.current;
     void invoke<{ scanners: { label: string; folder: string }[] }>("scan_kit_scanners", {
       action: "list",
     })
       .then((listed) => {
-        if (live) {
+        // A register-add that resolved first owns the registry — this
+        // list was issued before it and would restore the stale set.
+        if (live && scannerSeq.current === listed_at) {
           // A fresh array per resolve would restart the task effect below -
           // only adopt it when the content actually changed.
           setScanners((prev) =>
@@ -528,7 +552,7 @@ export function AnalysisView({
     const rect = node.getBoundingClientRect();
     const next = backingSize(rect.width, rect.height, window.devicePixelRatio);
     // The plotter configures the drawing buffer. Assigning width here resets it.
-    if (plotter.current == null && (node.width !== next.width || node.height !== next.height)) {
+    if (plotter.current == null && creating.current !== node && (node.width !== next.width || node.height !== next.height)) {
       node.width = next.width;
       node.height = next.height;
     }
@@ -663,10 +687,10 @@ export function AnalysisView({
   };
 
   const loadPayload = (): string => {
-    if (payload.current != null) {
-      picture.current = payload.current;
-    }
-    if (picture.current == null) {
+    // No promotion: loadPlot reads payload.current first and only the
+    // success path may write picture.current — promoting here would stash
+    // bad bytes where the catch's payload.current = null can't reach them.
+    if (picture.current == null && payload.current == null) {
       return "";
     }
     const jobs: [Plotter, number | null][] =
@@ -727,9 +751,17 @@ export function AnalysisView({
     let live = true;
     const observer = new ResizeObserver(fitCanvas);
     observer.observe(node);
+    const unwatchDpr = watchDpr(fitCanvas);
     fitCanvas();
+    creating.current = node;
+    const settle = () => {
+      if (creating.current === node) {
+        creating.current = null;
+      }
+    };
     plotterFor(node)
       .then((plot) => {
+        settle();
         if (!live) {
           return;
         }
@@ -738,11 +770,19 @@ export function AnalysisView({
         fitCanvas();
         loadPayload();
       })
-      .catch((reason: unknown) => notifyError(messageOf(reason), "analysis"));
+      .catch((reason: unknown) => {
+        settle();
+        notifyError(messageOf(reason), "analysis");
+      });
     return () => {
       live = false;
       observer.disconnect();
+      unwatchDpr();
+      creating.current = null;
       plotter.current = null;
+      // Free the device now — WebPlot::drop runs device.destroy but only on
+      // GC, and a switched-back view must not reuse a stale cache entry.
+      releasePlotter(node);
       cancelAnimationFrame(frame.current);
       frame.current = 0;
     };
@@ -756,8 +796,11 @@ export function AnalysisView({
   }, [shown, viewId]);
 
   const orderKey = sessions.map((session) => session.id).join("\0");
-  const hiddenKey = hidden.join("\0");
+  const hiddenKey = [...hidden].sort().join("\0");
   const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options, studyPath != null)) : options;
+  // The scanner list is only sent with a study — outside the volumetric
+  // view a registry load must not restart the task or shift the request key.
+  const scannerKey = studyPath != null ? JSON.stringify(scanners) : "";
   const pictureKey = JSON.stringify([
     viewId,
     folder,
@@ -765,7 +808,7 @@ export function AnalysisView({
     hiddenKey,
     sceneKey,
     studyPath ?? "",
-    scanners,
+    scannerKey,
     plotHost,
   ]);
   const requestKey = JSON.stringify([pictureKey, lineEpoch]);
@@ -791,15 +834,15 @@ export function AnalysisView({
     void driveTask(
       {
         view,
-        path: folder,
+        path: exportArgsRef.current.folder,
         sessionIds: shownSessionIds(
-          sessions.map((session) => session.id),
-          hidden,
+          exportArgsRef.current.sessions.map((session) => session.id),
+          exportArgsRef.current.hidden,
         ),
         options: {
           ...optionsRef.current,
-          study: studyPath,
-          scanners: JSON.stringify(scanners),
+          study: exportArgsRef.current.studyPath,
+          scanners: JSON.stringify(exportArgsRef.current.scanners),
           dest,
           ...extra,
         },
@@ -808,15 +851,23 @@ export function AnalysisView({
         palette: [],
       },
       (report) => setExportReport(report.finished ? null : report),
+      // stop: () => false is deliberate — an export is a write task, so it
+      // finishes even if the view unmounts; liveRef suppresses the toasts.
       () => false,
     )
-      .then(() => {
+      .then((ran) => {
         setExportReport(null);
-        notifySaved(dest, { title: view === "write_dose" ? "Dose exported" : "Report exported" });
+        if (liveRef.current && ran) {
+          notifySaved(dest, { title: view === "write_dose" ? "Dose exported" : "Report exported" });
+        }
       })
       .catch((reason: unknown) => {
         setExportReport(null);
-        notifyError(reason);
+        // A dead instance's export-cancelled toast is routine supersession,
+        // not an error the user needs.
+        if (liveRef.current) {
+          notifyError(reason);
+        }
       })
       .finally(() => {
         exportBusyRef.current = false;
@@ -854,7 +905,7 @@ export function AnalysisView({
       }
       if (viewId === "volumetric" && studyPath != null) {
         plotOptions.study = studyPath;
-        plotOptions.scanners = JSON.stringify(scanners);
+        plotOptions.scanners = scannerKey;
       }
       if (lineToken.current !== "") {
         plotOptions._lines = lineToken.current;
@@ -890,8 +941,12 @@ export function AnalysisView({
           // The start lost the slot race and has no ticket to poll - settle
           // or the view sweeps "Loading plot" forever. Releasing useScrub's
           // pending latch too, or every later commit is silently dropped.
-          setArrivedKey(requestKey);
-          setSettled((count) => count + 1);
+          // But a stale run must not settle the live ticket's latch or stamp
+          // its requestKey as arrived.
+          if (!stop && openSeq.current === ticket) {
+            setArrivedKey(requestKey);
+            setSettled((count) => count + 1);
+          }
           return;
         }
         if (stop || openSeq.current !== ticket) {
@@ -929,6 +984,9 @@ export function AnalysisView({
             return;
           }
           const parsed = parsePoll(bytesOf(raw));
+          if (parsed.report == null || typeof parsed.report !== "object") {
+            throw new Error("bad poll frame");
+          }
           if (!acceptReport(parsed.report, started.task, started.generation)) {
             // A removed task comes back under another generation. Polling it
             // again fills memory and the bar never settles.
@@ -1017,7 +1075,7 @@ export function AnalysisView({
         // chain was polling, but only while it still owns the slot: the plot
         // slot reuses task ids on retarget, so a superseded ticket's cancel
         // would kill its successor's live task.
-        if (polledTask != null && openSeq.current === ticket) {
+        if (polledTask != null && polledGeneration != null && openSeq.current === ticket) {
           void invoke("scan_kit_cancel", {
             task: polledTask,
             generation: polledGeneration,
@@ -1046,7 +1104,7 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scanners, lineEpoch, plotHost, requestKey]);
+  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scannerKey, lineEpoch, plotHost, requestKey]);
 
   useEffect(() => {
     if (viewId === "volumetric") {
@@ -1056,7 +1114,7 @@ export function AnalysisView({
     if (node == null) {
       return;
     }
-    let dragging = false;
+    let dragId: number | null = null;
     const locate = (event: { clientX: number; clientY: number }) => {
       const rect = node.getBoundingClientRect();
       const sx = rect.width > 0 ? node.width / rect.width : 1;
@@ -1075,18 +1133,20 @@ export function AnalysisView({
       requestDraw();
     };
     const onDown = (event: PointerEvent) => {
-      if (event.button !== 0) {
+      if (event.button !== 0 || dragId !== null) {
         return;
       }
-      dragging = true;
+      dragId = event.pointerId;
       node.setPointerCapture(event.pointerId);
       node.focus({ preventScroll: true });
     };
-    const onUp = () => {
-      dragging = false;
+    const onUp = (event: PointerEvent) => {
+      if (event.pointerId === dragId) {
+        dragId = null;
+      }
     };
     const onMove = (event: PointerEvent) => {
-      if (!dragging) {
+      if (event.pointerId !== dragId) {
         return;
       }
       const point = locate(event);
@@ -1181,6 +1241,24 @@ export function AnalysisView({
   const sections = controlSections(controls).filter(
     (section) => viewId !== "volumetric" || (section.title !== "Cell" && section.title !== "Plot"),
   );
+  // Options that name a structure or fraction by position belong to the
+  // study that was open when they were picked - a new study must not
+  // inherit them.
+  const clearStudyOptions = () => {
+    setOptions((current) => {
+      const next = { ...current };
+      for (const key of Object.keys(next)) {
+        if (
+          key.startsWith("roi") ||
+          ["goals", "fraction", "beams", "segment", "scanner"].includes(key)
+        ) {
+          delete next[key];
+        }
+      }
+      optionsRef.current = next;
+      return next;
+    });
+  };
   const apply = (id: string, value: string) => {
     const held = optionsRef.current[id];
     // The control echoes the value already on screen when its header arrives.
@@ -1193,6 +1271,17 @@ export function AnalysisView({
       // describes the first apply's options, not `current` — recompute it.
       const latest = resolveOptions(metaRef.current?.controls ?? [], current);
       const next = applyOption(current, latest, grains.current, id, value);
+      // The backend swaps cells positionally: the first stored "3D" keeps
+      // the slot and the loser's option still says "3D" while drawing the
+      // displaced view. Write the swap through so the select stays true.
+      if (id.startsWith("cell") && value === "3D") {
+        const holder = ["cell0", "cell1", "cell2", "cell3"].find(
+          (cell) => cell !== id && next[cell] === "3D",
+        );
+        if (holder != null) {
+          next[holder] = latest[id] ?? "Axial";
+        }
+      }
       optionsRef.current = next;
       return next;
     });
@@ -1424,7 +1513,7 @@ export function AnalysisView({
             columns={columns}
             rows={gridRows.length}
             getCellContent={getCellContent}
-            theme={gridTheme()}
+            theme={editorTheme}
             rowMarkers="none"
             onColumnResize={onColumnResize}
           />
@@ -1441,6 +1530,7 @@ export function AnalysisView({
             resolved={resolved}
             plots={dosePlots}
             acquire={plotterFor}
+            release={releasePlotter}
             onChange={apply}
             onAction={(panel, action) => {
               dosePlots.current[panel]?.dose_action(panel, action);
@@ -1557,6 +1647,7 @@ export function AnalysisView({
                     }
                     setStudyPath(selected);
                     setStudy(opened.report);
+                    clearStudyOptions();
                     setOpening(false);
                   })
                   .catch((reason: unknown) => {
@@ -1581,6 +1672,7 @@ export function AnalysisView({
             onClick={() => {
               setStudyPath(null);
               setStudy(null);
+              clearStudyOptions();
             }}
           >
             Close Study
@@ -1590,8 +1682,12 @@ export function AnalysisView({
           <Button
             variant="outline"
             onClick={() => {
-              void open({ directory: true, title: "MCsquare scanner folder" }).then(
-                (selected) => {
+              if (scannerPickRef.current) {
+                return;
+              }
+              scannerPickRef.current = true;
+              void open({ directory: true, title: "MCsquare scanner folder" })
+                .then((selected) => {
                   if (typeof selected !== "string") {
                     return;
                   }
@@ -1601,13 +1697,16 @@ export function AnalysisView({
                   )
                     .then((listed) => {
                       if (liveRef.current) {
+                        scannerSeq.current += 1;
                         setScanners(listed.scanners);
                       }
                     })
                     .catch((reason: unknown) => notifyError(reason));
-                },
-              )
-                .catch((reason: unknown) => notifyError(reason));
+                })
+                .catch((reason: unknown) => notifyError(reason))
+                .finally(() => {
+                  scannerPickRef.current = false;
+                });
             }}
           >
             Register scanner

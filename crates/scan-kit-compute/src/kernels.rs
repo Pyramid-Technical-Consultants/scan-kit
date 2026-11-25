@@ -16,19 +16,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (!(spot.sigma > 0.0)) { return; }
     // sigma=inf or spacing=0 would saturate u32() and wrap reach*2 into a
     // ~4e9-iteration loop; the splat never needs a 64-voxel reach anyway.
-    let reach = min(u32(ceil(3.0 * spot.sigma / grid.spacing.x)), 64u);
+    let reach_x = min(u32(ceil(3.0 * spot.sigma / grid.spacing.x)), 64u);
+    let reach_y = min(u32(ceil(3.0 * spot.sigma / grid.spacing.y)), 64u);
+    let reach_z = min(u32(ceil(3.0 * spot.sigma / grid.spacing.z)), 64u);
     let center = vec3<i32>(vec3<f32>(
         (spot.x - grid.origin.x) / grid.spacing.x,
         (spot.y - grid.origin.y) / grid.spacing.y,
         (spot.z - grid.origin.z) / grid.spacing.z
     ));
     let inv = 1.0 / (2.0 * spot.sigma * spot.sigma);
-    for (var dz = 0u; dz <= reach * 2u; dz++) {
-        for (var dy = 0u; dy <= reach * 2u; dy++) {
-            for (var dx = 0u; dx <= reach * 2u; dx++) {
-                let ix = center.x + i32(dx) - i32(reach);
-                let iy = center.y + i32(dy) - i32(reach);
-                let iz = center.z + i32(dz) - i32(reach);
+    for (var dz = 0u; dz <= reach_z * 2u; dz++) {
+        for (var dy = 0u; dy <= reach_y * 2u; dy++) {
+            for (var dx = 0u; dx <= reach_x * 2u; dx++) {
+                let ix = center.x + i32(dx) - i32(reach_x);
+                let iy = center.y + i32(dy) - i32(reach_y);
+                let iz = center.z + i32(dz) - i32(reach_z);
                 if (ix < 0 || iy < 0 || iz < 0) { continue; }
                 if (u32(ix) >= grid.size.x || u32(iy) >= grid.size.y || u32(iz) >= grid.size.z) { continue; }
                 let p = grid.origin + vec3<f32>(f32(ix), f32(iy), f32(iz)) * grid.spacing;
@@ -83,7 +85,7 @@ const DVH: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
     if (i >= arrayLength(&dose) || arrayLength(&hist) == 0u) { return; }
-    let bin = min(u32(max(dose[i], 0.0) * 10.0), arrayLength(&hist) - 1u);
+    let bin = u32(min(max(dose[i], 0.0) * 10.0, f32(arrayLength(&hist) - 1u)));
     atomicAdd(&hist[bin], 1u);
 }
 "#;

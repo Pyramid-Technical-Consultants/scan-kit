@@ -257,6 +257,34 @@ it("diffs the loaded config against each selected session", async () => {
   vi.useRealTimers();
 });
 
+it("prunes exclusions when the selection set changes", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const sessions = [
+    { id: "sess", note: "" },
+    { id: "other", note: "" },
+  ];
+  await act(async () => {
+    root = createRoot(host);
+    root.render(<ConfigTuning folder="C:/data" sessions={sessions} selectedIds={["sess", "other"]} />);
+  });
+  const otherBox = () => document.querySelector("[aria-label='Include other']");
+  expect(otherBox()?.getAttribute("aria-checked")).toBe("true");
+  // Exclude "other", then drop it from the selection set entirely.
+  await act(async () => {
+    otherBox()?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  expect(otherBox()?.getAttribute("aria-checked")).toBe("false");
+  await act(async () => {
+    root?.render(<ConfigTuning folder="C:/data" sessions={sessions} selectedIds={["sess"]} />);
+  });
+  // Re-selecting it must not revive the stale exclusion.
+  await act(async () => {
+    root?.render(<ConfigTuning folder="C:/data" sessions={sessions} selectedIds={["sess", "other"]} />);
+  });
+  expect(otherBox()?.getAttribute("aria-checked")).toBe("true");
+});
+
 it("keeps short xml values in a short field", () => {
   expect(fieldBoxClass({ kind: "int", value: "1" })).toBe("w-28");
   expect(fieldBoxClass({ kind: "string", value: "device" })).toBe("w-36");

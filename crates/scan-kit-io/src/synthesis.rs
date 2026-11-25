@@ -22,13 +22,21 @@ pub fn catalog(db: &Path) -> Value {
 }
 
 pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
-    let path = input
-        .get("path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned);
-    if let Some(csv_value) = input.get("csv") {
+    // A present-but-blank path is a caller error — silently degrading to
+    // preview means the caller thinks a file was written.
+    let path = match input.get("path") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str().map(str::trim) {
+            Some("") | None => return Err("path must be a non-empty string".into()),
+            Some(text) => Some(text.to_owned()),
+        },
+    };
+    // Every write lands through write_csv — fail a bad path before the
+    // document build, not after a 64-256 MiB plan parse.
+    if let Some(path) = &path {
+        validate_csv_path(Path::new(path))?;
+    }
+    if let Some(csv_value) = input.get("csv").filter(|value| !value.is_null()) {
         let Some(csv) = csv_value.as_str() else {
             return Err("csv must be a string".into());
         };
@@ -40,11 +48,15 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
         return Ok(json!({ "written": path }));
     }
 
-    let template = input
-        .get("template")
-        .and_then(Value::as_str)
-        .ok_or("template is required")?;
+    let template = match input.get("template") {
+        None | Some(Value::Null) => return Err("template is required".into()),
+        Some(value) if !value.is_string() => return Err("template must be a string".into()),
+        Some(value) => value.as_str().unwrap_or(""),
+    };
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return Err("params must be an object".to_owned());
+    }
     let mut errors = scan_kit_core::validate_plan(template, &params);
     if template == "dicom_rt_plan" {
         errors.splice(0..0, dicom_path_errors(&text(&params, "dicom_path")));
@@ -61,17 +73,21 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
             if plan.spots.is_empty() {
                 return Err("No planned spots with positive MU found in DICOM plan".into());
             }
-            let use_dicom = params
-                .get("use_dicom_beam_size")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            let use_dicom = match params.get("use_dicom_beam_size") {
+                None | Some(Value::Null) => true,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err("use_dicom_beam_size must be a boolean".into()),
+            };
             let fallback = if use_dicom {
                 3.61
             } else {
-                params
-                    .get("beam_size_override_mm")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(3.61)
+                match params.get("beam_size_override_mm") {
+                    None | Some(Value::Null) => 3.61,
+                    Some(value) => value
+                        .as_f64()
+                        .filter(|v| v.is_finite())
+                        .ok_or("beam_size_override_mm must be a finite number")?,
+                }
             };
             let spots: Vec<ImportSpot> = plan
                 .spots
@@ -134,20 +150,47 @@ fn document_json(document: &PlanDocument, written: Option<String>) -> Value {
     })
 }
 
-fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
-    // The csv+path pair crosses the invoke boundary — confine the write to
-    // a .csv name or any text becomes an arbitrary file-write primitive.
+fn validate_csv_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("the plan path must be absolute".into());
+    }
     if !path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
     {
         return Err("the plan path must end in .csv".into());
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        }
+    // Windows refuses DOS device stems even with an extension — writing
+    // NUL.csv would discard into the device, not a file.
+    if !path
+        .file_name()
+        .is_some_and(|name| scan_kit_core::valid_session_id(&name.to_string_lossy()))
+    {
+        return Err("the plan filename is reserved or invalid".into());
     }
+    // A bare "map.csv" lands in the process CWD and then stores CWD as the
+    // next save's default — the zip-dest check names the same failure. A
+    // Prefix-only "C:" parent is the same ambient-CWD destination.
+    match path.parent() {
+        Some(parent)
+            if parent
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Prefix(_))) =>
+        {
+            Ok(())
+        }
+        _ => Err("the plan path must name a directory to write into".into()),
+    }
+}
+
+fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
+    // The csv+path pair crosses the invoke boundary — confine the write to
+    // a .csv name or any text becomes an arbitrary file-write primitive.
+    validate_csv_path(path)?;
+    let Some(parent) = path.parent() else {
+        return Err("the plan path must name a directory to write into".into());
+    };
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     scan_kit_core::atomic_write(path, csv.as_bytes())?;
     if let Some(parent) = path.parent() {
         // Store the resolved directory - a bare "." or a relative parent is
@@ -169,10 +212,9 @@ fn dicom_path_errors(path: &str) -> Vec<String> {
     if !file.is_file() {
         return vec![format!("DICOM plan file not found: {text}")];
     }
-    match file.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("dcm") => Vec::new(),
-        _ => vec!["Plan file must have a .dcm extension.".into()],
-    }
+    // No extension check: PACS exports routinely name files by UID.
+    // read_ion_plan verifies the DICM preamble and RT-Ion SOP class.
+    Vec::new()
 }
 
 fn pld_path_errors(path: &str) -> Vec<String> {

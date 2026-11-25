@@ -58,6 +58,20 @@ pub fn open_folder(
         (Some(dir), Some(id)) => session_config_dir(dir, id),
         _ => None,
     };
+    // A half-specified session lookup would fall through to remembered
+    // and answer for a different folder's files.
+    if data_dir.is_some() != session_id.is_some() {
+        return Err("data_dir and session_id must come together".into());
+    }
+    // Both named — the answer cannot be one folder's files or the other's.
+    if explicit.is_some() && data_dir.is_some() {
+        return Err("path and data_dir/session_id are alternatives".into());
+    }
+    // Asked for a session's config and it isn't there — the remembered
+    // fallback must not report a different folder's files as the answer.
+    if data_dir.is_some() && session_id.is_some() && from_session.is_none() && explicit.is_none() {
+        return Err("that session has no configuration folder".into());
+    }
     let chosen = explicit
         .or(from_session)
         .or_else(|| remembered_dir.map(PathBuf::from));
@@ -177,8 +191,10 @@ pub fn save_folder(
             let target = under(base, rel)?;
             let mut dir = target.parent();
             while dir.is_some_and(|d| d != base && d.starts_with(base)) {
-                if dir.is_some_and(|d| d.is_file()) {
-                    return Err(format!("{rel} sits under a file in the save"));
+                // A symlinked intermediate dir follows through to outside
+                // the tree — the same refusal the walkers carry.
+                if dir.is_some_and(|d| d.is_file() || d.is_symlink()) {
+                    return Err(format!("{rel} sits under a file or link in the save"));
                 }
                 dir = dir.and_then(|d| d.parent());
             }
@@ -213,9 +229,18 @@ pub fn save_folder(
         };
         // A failed source list would empty `kept` and delete every file at
         // dest — fail the save instead.
-        let kept: std::collections::HashSet<String> = list_tree(source)?.into_iter().collect();
+        // Compare on lowercase keys: the filesystem resolves
+        // case-insensitively, so dest/a.xml is covered by source/A.xml —
+        // a case-sensitive compare would delete the file it just copied.
+        let kept: std::collections::HashSet<String> = list_tree(source)?
+            .into_iter()
+            .map(|rel| rel.to_lowercase())
+            .collect();
         copy_tree(source, dest, 0)?;
-        for rel in stale.iter().filter(|rel| !kept.contains(*rel)) {
+        for rel in stale
+            .iter()
+            .filter(|rel| !kept.contains(&rel.to_lowercase()))
+        {
             if let Ok(stale) = under(dest, rel) {
                 let _ = fs::remove_file(&stale);
                 let _ = fs::remove_file(sidecar_path(&stale));
@@ -244,13 +269,20 @@ pub fn save_folder(
     }))
 }
 
-pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
+pub fn tune(input: &Value) -> Result<Value, String> {
     let workflow = text(input, "workflow")?;
     let mut xml = text(input, "xml")?.to_owned();
     if let Some(form) = input.get("form") {
         xml = apply_form(&xml, form)?;
     }
-    let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
+    let data_dir = match input.get("data_dir") {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value
+            .as_str()
+            .ok_or("data_dir must be a string")?
+            .trim()
+            .to_owned(),
+    };
     let session_ids = strings(input, "session_ids")?;
     if session_ids.is_empty() {
         return Err("Select at least one session.".into());
@@ -276,7 +308,12 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
     if found.is_empty() {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|id| seen.insert(id.clone()));
     let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return Err("params must be an object".to_owned());
+    }
     let timeslice = workflow == "position_offset_tuning"
         && params.get("data_source").and_then(Value::as_str) == Some("timeslice");
     let spots = load_spots(root, &found, timeslice, &mut warnings);
@@ -287,7 +324,7 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
     };
     let mut result = run_tune(workflow, &xml, &spots, &params, &label)?;
     if let Some(list) = result.get_mut("warnings").and_then(Value::as_array_mut) {
-        for warning in warnings {
+        for warning in warnings.into_iter().rev() {
             list.insert(0, json!(warning));
         }
     }
@@ -297,7 +334,10 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
 /// Read-only whole-tree diff: the loaded config folder vs each selected
 /// session's `config/` tree (map2map, dcs, nozzle), one column per session.
 pub fn diff(input: &Value) -> Result<Value, String> {
-    let config_dir = text(input, "config_dir").unwrap_or("").trim();
+    let config_dir = match input.get("config_dir") {
+        None | Some(Value::Null) => "",
+        Some(value) => value.as_str().ok_or("config_dir must be a string")?.trim(),
+    };
     if config_dir.is_empty() {
         return Err("Open a configuration folder.".into());
     }
@@ -308,7 +348,11 @@ pub fn diff(input: &Value) -> Result<Value, String> {
             loaded_dir.display()
         ));
     }
-    let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
+    let data_dir = match input.get("data_dir") {
+        None | Some(Value::Null) => String::new(),
+        Some(value) if !value.is_string() => return Err("data_dir must be a string".into()),
+        Some(value) => value.as_str().unwrap_or("").trim().to_owned(),
+    };
     let session_ids = strings(input, "session_ids")?;
     if session_ids.is_empty() {
         return Err("Select at least one session.".into());
@@ -331,12 +375,18 @@ pub fn diff(input: &Value) -> Result<Value, String> {
     if found.is_empty() {
         return Err(format!("No selected sessions were found under {data_dir}."));
     }
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|id| seen.insert(id.clone()));
     let base_root = diff_root(loaded_dir);
     let mut base_files = walk_files(&base_root)?;
     // The open file diffs its in-memory text (form edits applied) so pending
     // changes are visible; every other file diffs on disk.
     let mut edited = String::new();
-    let file_rel = text(input, "file").unwrap_or("").trim();
+    let file_raw = match input.get("file") {
+        None | Some(Value::Null) => "",
+        Some(value) => value.as_str().ok_or("file must be a string")?,
+    };
+    let file_rel = file_raw.trim();
     if !file_rel.is_empty() {
         let Some(xml) = input
             .get("xml")
@@ -515,7 +565,22 @@ fn walk_files_at(
             ));
         }
         {
-            let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+            let bytes = {
+                use std::io::Read;
+                let mut file = fs::File::open(&path).map_err(|err| err.to_string())?;
+                let mut buf = Vec::new();
+                file.by_ref()
+                    .take(MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|err| err.to_string())?;
+                if buf.len() as u64 > MAX_FILE_BYTES {
+                    return Err(format!(
+                        "config file {} exceeds the file cap",
+                        path.display()
+                    ));
+                }
+                buf
+            };
             *total = total.saturating_add(bytes.len() as u64);
             if *total > MAX_WALK_BYTES {
                 return Err(format!(
@@ -554,7 +619,12 @@ fn diff_trees(
                 None if ours.len() > DIFF_MAX_BYTES || other.len() > DIFF_MAX_BYTES => {
                     ("large", Vec::new())
                 }
-                None => ("binary", Vec::new()),
+                None if text_lines(ours).is_none() || text_lines(other).is_none() => {
+                    ("binary", Vec::new())
+                }
+                // Text that diverges past the edit-script cap is changed,
+                // not binary — the view just gets no hunks.
+                None => ("changed", Vec::new()),
             },
             (None, None) => continue,
         };
@@ -910,10 +980,12 @@ fn session_config_dir(data_dir: &str, session_id: &str) -> Option<PathBuf> {
     if data_dir.is_empty() || session_id.is_empty() {
         return None;
     }
-    let dir = discover::session_directory(Path::new(data_dir), session_id)
-        .join("config")
-        .join("map2map");
-    (dir.is_dir() && !dir.is_symlink()).then_some(dir)
+    let session = discover::session_directory(Path::new(data_dir), session_id);
+    let dir = session.join("config").join("map2map");
+    // Same refusal diff applies — a link at config/ or the session dir
+    // would serve files outside the session tree.
+    let linked = dir.ancestors().take(2).any(|a| a.is_symlink()) || session.is_symlink();
+    (dir.is_dir() && !linked).then_some(dir)
 }
 
 fn session_present(root: &Path, session_id: &str) -> bool {
@@ -1198,7 +1270,15 @@ fn under(root: &Path, rel: &str) -> Result<PathBuf, String> {
             Component::Normal(part) => Some(part),
             _ => None,
         })
-        .any(|part| dos(Path::new(part).file_stem().unwrap_or(part)))
+        .any(|part| {
+            let text = part.to_string_lossy();
+            let stem = text
+                .trim_end_matches(['.', ' '])
+                .split('.')
+                .next()
+                .unwrap_or_default();
+            dos(std::ffi::OsStr::new(stem))
+        })
     {
         return Err(format!("config path uses a reserved name: {rel}"));
     }
@@ -1427,17 +1507,13 @@ mod tests {
         )
         .unwrap();
         let xml = r#"<devices><ion_chamber><device name="IC_1_X"/><beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="1" K1="0" K2="0" K3="0"/></ion_chamber></devices>"#;
-        let db = root.join("unused.sqlite");
-        let result = tune(
-            &json!({
-                "workflow": "sigma_tuning",
-                "xml": xml,
-                "data_dir": root.to_string_lossy(),
-                "session_ids": ["sess"],
-                "params": {}
-            }),
-            &db,
-        )
+        let result = tune(&json!({
+            "workflow": "sigma_tuning",
+            "xml": xml,
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+            "params": {}
+        }))
         .unwrap();
         assert_eq!(result["changed"], true);
         assert!(result["summary"].as_str().unwrap().contains("from sess"));
@@ -1472,16 +1548,13 @@ mod tests {
         )
         .unwrap();
         let xml = r#"<devices><ion_chamber><device name="IC_1_X"/><beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="1" K1="0" K2="0" K3="0"/></ion_chamber></devices>"#;
-        let result = tune(
-            &json!({
-                "workflow": "sigma_tuning",
-                "xml": xml,
-                "data_dir": root.to_string_lossy(),
-                "session_ids": ["sess"],
-                "params": {}
-            }),
-            &root.join("unused.sqlite"),
-        )
+        let result = tune(&json!({
+            "workflow": "sigma_tuning",
+            "xml": xml,
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+            "params": {}
+        }))
         .unwrap();
         let after = preview_number(&result, "IC_1", "70", 4);
         // raw 1.4 mm ×2 = 2.8 min; 1% headroom below it, then the ±20% band.
@@ -1522,16 +1595,13 @@ mod tests {
         let form = config_form(&xml).unwrap();
         assert!(form_has(&form, "IC 1 X", true));
 
-        let sigma = tune(
-            &json!({
-                "workflow": "sigma_tuning",
-                "xml": &xml,
-                "data_dir": logs.to_string_lossy(),
-                "session_ids": ["1093436476"],
-                "params": {}
-            }),
-            &db,
-        )
+        let sigma = tune(&json!({
+            "workflow": "sigma_tuning",
+            "xml": &xml,
+            "data_dir": logs.to_string_lossy(),
+            "session_ids": ["1093436476"],
+            "params": {}
+        }))
         .unwrap();
         assert_eq!(sigma["changed"], true, "{sigma}");
         let k0 = preview_number(&sigma, "IC_1", "179.5", 4);
@@ -1541,16 +1611,13 @@ mod tests {
         );
 
         for workflow in ["position_offset_tuning", "ic_distance_tuning", "kmu_tuning"] {
-            let result = tune(
-                &json!({
-                    "workflow": workflow,
-                    "xml": &xml,
-                    "data_dir": logs.to_string_lossy(),
-                    "session_ids": ["1093436476"],
-                    "params": {}
-                }),
-                &db,
-            )
+            let result = tune(&json!({
+                "workflow": workflow,
+                "xml": &xml,
+                "data_dir": logs.to_string_lossy(),
+                "session_ids": ["1093436476"],
+                "params": {}
+            }))
             .unwrap_or_else(|err| panic!("{workflow}: {err}"));
             assert_eq!(result["changed"], true, "{workflow}: {}", result["summary"]);
         }
@@ -1921,6 +1988,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         let files = json!([{ "rel": "a.xml", "xml": "\u{feff}<a/>" }]);
         save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).unwrap();
+        assert!(dest.join("a.xml").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

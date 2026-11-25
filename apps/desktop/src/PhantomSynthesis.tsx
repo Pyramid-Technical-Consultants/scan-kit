@@ -42,7 +42,14 @@ export function PhantomSynthesis() {
   const [status, setStatus] = useState(IDLE);
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(true);
+  // catalog.save_dir is a mount-time value — a successful write moves the
+  // remembered dir and the next dialog should follow.
+  const [writtenDir, setWrittenDir] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
+  // A failed catalog load used to render a permanently blank tab — the pane
+  // is keepMounted, so nothing ever re-asked for it.
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [catalogRetry, setCatalogRetry] = useState(0);
   const writeBusy = useRef(false);
   const paramsRef = useRef(params);
   useLayoutEffect(() => {
@@ -66,12 +73,13 @@ export function PhantomSynthesis() {
           return;
         }
         setWaiting(false);
+        setCatalogError(reason instanceof Error ? reason.message : String(reason));
         notifyError(reason);
       });
     return () => {
       live = false;
     };
-  }, []);
+  }, [catalogRetry]);
 
   useEffect(() => {
     if (params == null) {
@@ -110,7 +118,22 @@ export function PhantomSynthesis() {
   }, [params]);
 
   if (catalog == null || params == null) {
-    return null;
+    return catalogError == null ? null : (
+      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
+        <p className="text-muted-foreground text-sm">{catalogError}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setWaiting(true);
+            setCatalogError(null);
+            setCatalogRetry((n) => n + 1);
+          }}
+        >
+          Retry
+        </Button>
+      </div>
+    );
   }
 
   const energies = [...catalog.energies].reverse();
@@ -126,7 +149,7 @@ export function PhantomSynthesis() {
     const selectedDir = await open({
       directory: true,
       title: "Folder for the synthetic study",
-      defaultPath: parentDir(catalog?.save_dir ?? null),
+      defaultPath: parentDir(writtenDir ?? catalog?.save_dir ?? null),
     }).catch((reason: unknown) => {
       notifyError(reason);
       return null;
@@ -144,6 +167,7 @@ export function PhantomSynthesis() {
         params: paramsRef.current,
       });
       setStatus(written.status);
+      setWrittenDir(parentDir(written.folder) ?? null);
       notifySaved(written.folder, { title: "Study written", folder: true });
     } catch (reason: unknown) {
       notifyError(reason);

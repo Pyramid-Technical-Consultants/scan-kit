@@ -50,6 +50,7 @@ import { dismissNotice, logError, notify, notifyError } from "@/notify";
 import { usePageLoad } from "@/page-load";
 import { driveTask, type Report } from "@/task-client";
 import { type CheckPaint } from "@/session-checkbox";
+import { selectionFromLibrary } from "@/session-colors";
 import { SessionContextMenu } from "@/session-menu";
 import {
   MAX_SELECTED,
@@ -103,10 +104,12 @@ function layerOpen(target: EventTarget | null): boolean {
   ) {
     return true;
   }
+  // No data-open qualifier: Base UI swaps it for data-closed during the
+  // exit animation, when the layer is still mounted and Escape/Ctrl+Q
+  // must still be swallowed.
   return (
-    document.querySelector(
-      "[role='dialog'][data-open], [role='menu'][data-open], [role='listbox'][data-open]",
-    ) != null
+    document.querySelector("[role='dialog'], [role='menu'], [role='listbox']") !=
+    null
   );
 }
 
@@ -294,6 +297,13 @@ export default function App() {
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
   const [analysis, setAnalysis] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
+  const [trashConfirm, setTrashConfirm] = useState<{
+    sessionId: string;
+    folderId?: string;
+    library: string;
+    remote: boolean;
+    paths: string[];
+  } | null>(null);
   const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
   useEffect(() => {
     selectionLive.current = selectionOrder;
@@ -318,10 +328,11 @@ export default function App() {
   const noteBusy = useRef(false);
   const trashing = useRef(false);
   const pendingLocations = useRef<string[]>([]);
+  const passwordSubmitted = useRef(false);
   const selectedIds = selectionOrder;
   // Sessions can live in any indexed location — anchor analysis to the
   // first selected row's own library, not locations[0].
-  const folder = rows.find((row) => selectedIds.includes(row.session_id))?.library ?? locations[0] ?? null;
+  const folder = rows.find((row) => row.session_id === selectedIds[0])?.library ?? locations[0] ?? null;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const noRows = catalog === "Sessions" ? rows.length === 0 : exams.length === 0;
   const catalogWaiting = noRows && (!locationsKnown || libraryLoading);
@@ -414,13 +425,25 @@ export default function App() {
       setRows(payload.rows.map((item) => ({ ...item, selected: live.has(item.session_id) })));
     } else {
       setRows(payload.rows);
-      setSelectionOrder(payload.selected);
+      // A stored selection id can outlive its row (files deleted outside
+      // the app) — a phantom id keeps the row "checked" invisibly and
+      // anchors `folder` to the wrong library.
+      setSelectionOrder(selectionFromLibrary(payload.rows, payload.selected));
     }
   }, []);
 
-  const pullCatalog = useCallback(async () => {
-    applyCatalog(await invoke<CatalogPayload>("scan_kit_read_catalog"));
-  }, [applyCatalog]);
+  const pullCatalog = useCallback(
+    async (epoch?: number) => {
+      const payload = await invoke<CatalogPayload>("scan_kit_read_catalog");
+      // A superseding open/indexMany that started during this pull — even
+      // one that later failed — must not lose to this stale snapshot.
+      if (epoch != null && catalogEpoch.current !== epoch) {
+        return;
+      }
+      applyCatalog(payload);
+    },
+    [applyCatalog],
+  );
 
   const indexLocation = useCallback(
     async (path: string): Promise<"ok" | "auth" | "error"> => {
@@ -454,7 +477,7 @@ export default function App() {
           return;
         }
         try {
-          await pullCatalog();
+          await pullCatalog(epoch);
           setUndo([]);
           setRedo([]);
           setLocationDraft("");
@@ -491,13 +514,17 @@ export default function App() {
         if (catalogEpoch.current === epoch) {
           pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
           try {
-            await pullCatalog();
+            await pullCatalog(epoch);
             dismissNotice();
             setUndo([]);
             setRedo([]);
           } catch (error: unknown) {
             notifyError(error);
           }
+        } else {
+          // A superseded run must not leave stale pending roots — the next
+          // password submit would re-index removed locations.
+          pendingLocations.current = [];
         }
       } finally {
         endCatalogLoad();
@@ -512,8 +539,24 @@ export default function App() {
 
   const removeLocation = useCallback(
     async (path: string) => {
+      // Bump first — a queued indexMany would re-register the forgotten
+      // root inside index_library's transaction and republish it.
+      const epoch = ++catalogEpoch.current;
+      pendingLocations.current = [];
+      // A running index of this root would finish after the forget and
+      // republish it — the next poll must see the superseded token.
+      libraryToken.current = {};
       try {
-        applyCatalog(await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path }));
+        const payload = await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path });
+        // A newer open/indexMany that landed during the invoke already
+        // pulled — its catalog is fresher than this pre-commit snapshot.
+        if (catalogEpoch.current === epoch) {
+          applyCatalog(payload);
+          setUndo([]);
+          setRedo([]);
+          setSessionMenu(null);
+          setTrashConfirm(null);
+        }
       } catch (error: unknown) {
         notifyError(error);
       }
@@ -647,7 +690,12 @@ export default function App() {
             event.preventDefault();
             window.clearTimeout(timer);
             try {
-              await persistGeometry();
+              // The store write can wait on a scan's lock for seconds — cap
+              // it or closing the window visibly stalls behind an index.
+              await Promise.race([
+                persistGeometry(),
+                new Promise<void>((resolve) => window.setTimeout(resolve, 1500)),
+              ]);
             } catch {
               // A failed geometry write still lets the window close.
             } finally {
@@ -777,14 +825,6 @@ export default function App() {
     [selectTab],
   );
 
-  const [trashConfirm, setTrashConfirm] = useState<{
-    sessionId: string;
-    folderId?: string;
-    library: string;
-    remote: boolean;
-    paths: string[];
-  } | null>(null);
-
   const requestTrash = useCallback(
     async (sessionId: string, library: string) => {
       const row = rows.find((item) => item.session_id === sessionId && item.library === library);
@@ -821,6 +861,9 @@ export default function App() {
       return;
     }
     trashing.current = true;
+    // A catalog pull in flight snapshots the row before the backend removes
+    // it — supersede it so the trashed session cannot resurrect.
+    ++catalogEpoch.current;
     setTrashConfirm(null);
     try {
       const result = await invoke<{ removed: number; errors: string[] }>(
@@ -834,12 +877,22 @@ export default function App() {
       } else if (result.removed === 0) {
         notify(`No files found for session ${pending.sessionId}`);
       } else {
-        setRows((items) =>
-          items.filter(
+        // session_id is not unique across locations — drop the id only
+        // when no remaining row still lists it.
+        setRows((current) =>
+          current.filter(
             (item) => item.session_id !== pending.sessionId || item.library !== pending.library,
           ),
         );
-        setSelectionOrder((ids) => ids.filter((id) => id !== pending.sessionId));
+        setSelectionOrder((ids) =>
+          ids.filter(
+            (id) =>
+              id !== pending.sessionId ||
+              rowsRef.current.some(
+                (item) => item.session_id === id && item.library !== pending.library,
+              ),
+          ),
+        );
         notify(
           pending.remote
             ? `Deleted session ${pending.sessionId}`
@@ -876,13 +929,15 @@ export default function App() {
     setSelectionOrder(next.ids);
     setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
     const write = ++selectionSeq.current;
+    const catalogAt = catalogEpoch.current;
     void (async () => {
       selectionWrites.current += 1;
       try {
         for (const root of locations) {
           // A newer selection supersedes this loop — stop before the next
-          // root so the last write to land is always the newest.
-          if (selectionSeq.current !== write) {
+          // root so the last write to land is always the newest. A location
+          // forgotten mid-write must not get a ghost selection persisted.
+          if (selectionSeq.current !== write || catalogEpoch.current !== catalogAt) {
             return;
           }
           const sessionIds = rowsRef.current.flatMap((row) => {
@@ -903,12 +958,11 @@ export default function App() {
         if (selectionWrites.current === 0) {
           selectionPending.current = null;
           // A pull that landed mid-write may have shrunk the catalog -
-          // drop optimistic ids that no longer list, unless a newer
-          // commit already superseded this one.
-          if (selectionSeq.current === write) {
-            const listed = new Set(rowsRef.current.map((row) => row.session_id));
-            setSelectionOrder((ids) => ids.filter((id) => listed.has(id)));
-          }
+          // drop optimistic ids that no longer list. Idempotent, so the
+          // last-settling write always runs it even when an older commit
+          // (not the newest token) is the one that drains the counter.
+          const listed = new Set(rowsRef.current.map((row) => row.session_id));
+          setSelectionOrder((ids) => ids.filter((id) => listed.has(id)));
         }
       }
     })().catch((error: unknown) => {
@@ -917,13 +971,19 @@ export default function App() {
       // failure even when it has already settled.
       const stillMine = selectionSeq.current === write;
       if (stillMine) {
-        const restore = new Set(before);
-        setSelectionOrder(before);
+        // A pull that landed mid-write may have shrunk the catalog — only
+        // restore ids that still list, like the drain filter does.
+        const listed = new Set(rowsRef.current.map((row) => row.session_id));
+        const kept = before.filter((id) => listed.has(id));
+        const restore = new Set(kept);
+        setSelectionOrder(kept);
         setRows((items) =>
           items.map((item) => ({ ...item, selected: restore.has(item.session_id) })),
         );
+        // Only this generation's failure is news — a superseded write's
+        // error would toast after the newer commit already won.
+        notifyError(error);
       }
-      notifyError(error);
     });
   }, [locations, selectionOrder]);
 
@@ -987,15 +1047,33 @@ export default function App() {
     );
   }, [rows]);
 
+  // Two rapid edits must push undo entries in user order — invoke
+    // completion order is not guaranteed.
+  const noteChain = useRef<Promise<unknown>>(Promise.resolve());
+  // Shared with LibraryTable — undo/redo writes are note writes too, and an
+  // untracked one leaves the undone text pending: the reopened editor then
+  // prefills it and a retype compares equal to the stale capture.
+  const pendingNotes = useRef(new Map<string, string>());
   const commitNote = useCallback(
-    (edit: NoteEdit) => {
-      void writeNote(edit.sessionId, edit.library, edit.after)
+    (edit: NoteEdit): Promise<boolean> => {
+      // Record the edit synchronously — an undo pressed while this write
+      // is still in flight must revert this edit, not the previous one.
+      setUndo((stack) => [...stack, edit]);
+      setRedo([]);
+      const run = noteChain.current.then(() =>
+        writeNote(edit.sessionId, edit.library, edit.after),
+      );
+      noteChain.current = run.catch(() => undefined);
+      return run
         .then(() => {
-          setUndo((stack) => [...stack, edit]);
-          setRedo([]);
           dismissNotice();
+          return true;
         })
-        .catch((error: unknown) => notifyError(error));
+        .catch((error: unknown) => {
+          setUndo((stack) => withoutEdit(stack, edit));
+          notifyError(error);
+          return false;
+        });
     },
     [writeNote],
   );
@@ -1008,7 +1086,12 @@ export default function App() {
     );
   }, []);
 
+  const folderDialog = useRef(false);
   async function chooseFolder() {
+    if (folderDialog.current) {
+      return;
+    }
+    folderDialog.current = true;
     try {
       const selected = await open({
         directory: true,
@@ -1020,11 +1103,29 @@ export default function App() {
       }
     } catch (error) {
       notifyError(error);
+    } finally {
+      folderDialog.current = false;
     }
   }
 
   async function applyNote(edit: NoteEdit, note: string) {
-    await writeNote(edit.sessionId, edit.library, note);
+    // Same chain commitNote uses — an undo must not race an in-flight
+    // commit or the persisted text and the stacks diverge.
+    const key = `${edit.library}\0${edit.sessionId}`;
+    pendingNotes.current.set(key, note);
+    const run = noteChain.current.then(() =>
+      writeNote(edit.sessionId, edit.library, note),
+    );
+    noteChain.current = run.catch(() => undefined);
+    try {
+      await run;
+    } catch (error) {
+      // A rejected write must not poison the entry — the rows never moved.
+      if (pendingNotes.current.get(key) === note) {
+        pendingNotes.current.delete(key);
+      }
+      throw error;
+    }
   }
 
   function undoNote() {
@@ -1275,6 +1376,7 @@ export default function App() {
                 onHeaderCheck={onHeaderCheck}
                 onCommitNote={commitNote}
                 onOpenMenu={setSessionMenu}
+                pendingNotes={pendingNotes}
               />
             ) : null}
             {!catalogWaiting && emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Exams" ? (
@@ -1298,17 +1400,13 @@ export default function App() {
                   sessionMenu.rowIds.length > 0 &&
                   sessionMenu.rowIds.every((id) => selectedIds.includes(id))
                 }
-                remote={isRemoteSpec(
-                  rows.find(
-                    (item) =>
-                      item.session_id === sessionMenu.sessionId &&
-                      item.library === sessionMenu.library,
-                  )?.library ??
-                    locations[0] ??
-                    "",
-                )}
+                remote={isRemoteSpec(sessionMenu.library)}
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
+                  if (navigator.clipboard == null) {
+                    notifyError("Could not copy the session id");
+                    return;
+                  }
                   void navigator.clipboard.writeText(id).then(
                     () => notify(`Copied session ${id}`),
                     () => notifyError("Could not copy the session id"),
@@ -1530,6 +1628,7 @@ export default function App() {
         onOpenChange={(open) => {
           if (!open) {
             pendingLocations.current = [];
+            passwordSubmitted.current = false;
             setPasswordFor(null);
             setPassword("");
           }
@@ -1540,19 +1639,31 @@ export default function App() {
             className="grid gap-4"
             onSubmit={(event) => {
               event.preventDefault();
-              if (passwordFor == null) {
+              if (passwordFor == null || passwordSubmitted.current) {
                 return;
               }
               const spec = passwordFor;
+              passwordSubmitted.current = true;
               void invoke("scan_kit_remember_password", { path: spec, password })
                 .then(() => {
+                  // Closing the dialog mid-invoke cleared the pending list —
+                  // indexing now would resurrect a location the user cancelled.
+                  if (!passwordSubmitted.current) {
+                    return;
+                  }
                   setPassword("");
                   setPasswordFor(null);
+                  // onOpenChange does not fire for this programmatic close —
+                  // re-arm here or the next prompt's submit is dead.
+                  passwordSubmitted.current = false;
                   const rest = pendingLocations.current;
                   pendingLocations.current = [];
                   return indexMany([spec, ...rest]);
                 })
-                .catch((error: unknown) => notifyError(error));
+                .catch((error: unknown) => {
+                  passwordSubmitted.current = false;
+                  notifyError(error);
+                });
             }}
           >
             <DialogHeader>

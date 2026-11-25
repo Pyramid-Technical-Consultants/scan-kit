@@ -154,6 +154,12 @@ pub fn gamma_index_norm(
     // A one-voxel axis is a plane. Stepping off it blends in the zeros outside,
     // which a hot evaluated plane would score as a match.
     offsets.retain(|o| (0..3).all(|axis| shape[axis] > 1 || o[axis] == 0.0));
+    // Degenerate spacing or DTA produced no search offsets — every masked
+    // voxel would score the cap. Report not-evaluated like the other
+    // can't-score paths, not a confident 0% fail.
+    if offsets.is_empty() {
+        return (gamma, 0, 0);
+    }
     let cap2 = cap * cap;
     // Most voxels of a smooth pair settle within a millimetre. Only a noisy
     // cube leaves enough behind to pay for the local dose range.
@@ -237,8 +243,10 @@ pub fn projected_gamma(
             spacing[plane],
             cutoff_pct,
         );
+        // Zero scored voxels is "not evaluated", not a 0% fail — NaN
+        // keeps the readout from asserting a verdict.
         let rate = if scored == 0 {
-            0.0
+            f32::NAN
         } else {
             100.0 * passed as f32 / scored as f32
         };
@@ -420,7 +428,14 @@ pub(super) fn gamma_offsets(
     let reach = cap * dta;
     let mut axes = Vec::new();
     for (axis, &v) in spacing.iter().enumerate() {
+        // The 64-step cap must bound the offset list, not the reach — a
+        // spacing finer than reach/64 would silently under-search the DTA.
         let step = v / (v / (dta / 4.0)).ceil().max(1.0);
+        let step = if (reach / 64.0).is_finite() {
+            step.max(reach / 64.0)
+        } else {
+            step
+        };
         // A shift past the grid's own extent in this axis can never land on
         // another voxel — and it keeps a silly dta from looping forever.
         // Extreme spacing can collapse step to 0, which makes limit inf -
@@ -432,8 +447,19 @@ pub(super) fn gamma_offsets(
             shape[axis] as f64
         };
         // The +1 must not wrap the clamp's upper bound below its lower bound.
+        // An unclamped dta at tiny spacing would balloon the offset list
+        // into a multi-GB allocation — 64 steps per axis bounds the worst
+        // case near 34 MB and the far offsets die first.
         let n = ((reach as f64 / step as f64).ceil() as i64)
-            .clamp(0, (limit.ceil() as i64).saturating_add(1));
+            .clamp(0, (limit.ceil() as i64).saturating_add(1))
+            .min(64);
+        // One step already overshoots the whole axis — only the zero
+        // shift can land on a voxel.
+        let n = if step as f64 > shape[axis] as f64 * v as f64 {
+            0
+        } else {
+            n
+        };
         let mut axis = Vec::new();
         for i in -n..=n {
             axis.push(i as f32 * step);
@@ -467,9 +493,9 @@ pub(super) fn sample_linear(vol: &[f32], shape: [usize; 3], x: f32, y: f32, z: f
     for dz in 0..2 {
         for dy in 0..2 {
             for dx in 0..2 {
-                let xx = x0 + dx;
-                let yy = y0 + dy;
-                let zz = z0 + dz;
+                let xx = x0.saturating_add(dx);
+                let yy = y0.saturating_add(dy);
+                let zz = z0.saturating_add(dz);
                 let value = if xx < 0
                     || yy < 0
                     || zz < 0
@@ -626,6 +652,14 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_dta_bounds_the_offset_list() {
+        // 512^3 at 1 mm with a 500 mm reach would enumerate ~10^9
+        // candidates without the per-axis step bound.
+        let offsets = gamma_offsets([1.0; 3], 500.0, 2.0, [512, 512, 512]);
+        assert!(offsets.len() <= (2usize * 64 + 1).pow(3));
+    }
+
+    #[test]
     fn a_plane_does_not_search_off_itself() {
         // 14% hot fails in the plane. Half a millimetre off a 4 mm plane blends
         // in 12.5% of the zeros outside, which would land on the reference.
@@ -670,7 +704,7 @@ mod tests {
         let n = shape.iter().product::<usize>();
         let evaluated = vec![1.0f32; n];
         let reference = vec![1.0f32; n - 1];
-        let (gamma, scored, _) =
+        let (gamma, _, scored) =
             gamma_index(&reference, &evaluated, shape, 3.0, 2.0, [1.0; 3], 10.0);
         assert_eq!(scored, 0);
         // Unscored voxels are NaN so a scored γ = 0 can be told apart.
@@ -679,8 +713,11 @@ mod tests {
 
     #[test]
     fn extreme_spacing_bounds_the_shift_count() {
-        // spacing huge enough to collapse the sub-voxel step to 0: limit is
-        // inf and reach/step saturates - the shift count must stay bounded.
+        // 1e38 makes v/(dta/4) overflow f32 -> step 0, limit inf: the shift
+        // count must stay bounded rather than allocating reach/step rows.
+        let rows = gamma_offsets([1e38; 3], 2.0, 2.0, [2, 2, 2]);
+        assert!(rows.len() <= (2 * 64 + 1_usize).pow(3), "{}", rows.len());
+        // The whole gamma run over the same fixture must not hang either.
         let _ = gamma_index(
             &[1.0f32; 8],
             &[1.0; 8],
