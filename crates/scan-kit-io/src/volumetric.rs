@@ -1433,11 +1433,13 @@ fn analytic_cached(
 }
 
 fn session_dose(volume: &Volume, blank: bool) -> scan_kit_core::SessionDose {
+    // Difference cubes are signed — an all-nonpositive field is still
+    // data (plan above measured everywhere), not a blank.
     let live = !blank
         && volume
             .values
             .iter()
-            .any(|value| value.is_finite() && *value > 1.0e-8);
+            .any(|value| value.is_finite() && value.abs() > 1.0e-8);
     scan_kit_core::SessionDose {
         values: if live {
             volume.values.clone()
@@ -1463,6 +1465,17 @@ fn load_cloud(
     plan_sigma: &str,
     sigma_ref: &str,
 ) -> Cloud {
+    // A timeslice session has no spot positions — but the merged Sample
+    // table can carry geometry columns unioned in by an earlier fill ask,
+    // which would fabricate one unit-weight pencil per millisecond row.
+    if grain == "timeslice" {
+        return Cloud {
+            pencils: Vec::new(),
+            companion: Vec::new(),
+            plan: Vec::new(),
+            commanded: true,
+        };
+    }
     let table = if grain == "timeslice" {
         super::tables::timeslice_signals(root, session)
     } else {
@@ -1500,9 +1513,11 @@ fn load_cloud(
         false,
     );
     let (cx, cy) = iso_positions(&table);
+    // iso_positions falls back to the real ic1 pair when any column is
+    // missing — the flag must reflect what it used, not all four columns.
     let combined_commanded = {
         let check = |key: &str| -> bool { col(&table, key).iter().any(|v| v.is_finite()) };
-        !(check("ic1_x") && check("ic1_y") && check("ic2_x") && check("ic2_y"))
+        !(check("ic1_x") && check("ic1_y"))
     };
     let combined = pencils_from(
         &energy,
@@ -1679,7 +1694,9 @@ fn sigma_at(
 ) -> f32 {
     if interlock {
         if let Some(mm) = interlock_sigma_mm(xml, device, f64::from(energy)) {
-            return mm as f32;
+            if mm.is_finite() && mm > 0.2 {
+                return mm as f32;
+            }
         }
     }
     values
@@ -1856,13 +1873,28 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
     let mut hcc = None;
     let mut any = None;
     for chunk in xml.split("<ion_chamber").skip(1) {
-        let head = chunk.split('>').next().unwrap_or("");
         // The chamber name sits on a <device name="..."> child in devices.xml,
-        // not on the <ion_chamber> tag itself — search the whole block.
-        let name = attr(head, "name")
-            .or_else(|| attr(chunk, "name"))
+        // not on the <ion_chamber> tag itself.
+        let name = chunk
+            .split("<device")
+            .skip(1)
+            .filter_map(|tail| tail.split('>').next())
+            .find_map(|tag| attr(tag, "name"))
             .unwrap_or_default();
-        let k = attr(chunk, "K_MU").or_else(|| attr(chunk, "k_mu"));
+        // K_MU lives on the gain_conversion with in_units="MU"
+        // (core::tune::mu_gain) — prefer that tag so a stray K_MU
+        // attribute elsewhere in the block cannot win; older files carry
+        // k_mu on the device tag itself, so keep the block-wide search as
+        // the fallback.
+        let k = chunk
+            .split("<gain_conversion")
+            .skip(1)
+            .filter_map(|tail| tail.split('>').next())
+            .filter(|tag| {
+                attr(tag, "in_units").is_some_and(|units| units.eq_ignore_ascii_case("MU"))
+            })
+            .find_map(|tag| attr(tag, "K_MU").or_else(|| attr(tag, "k_mu")))
+            .or_else(|| attr(chunk, "K_MU").or_else(|| attr(chunk, "k_mu")));
         if let Some(Ok(value)) = k.map(|raw| raw.parse::<f32>()) {
             if value.is_finite() && value > 0.0 {
                 if name.eq_ignore_ascii_case("IC_1_HCC") {
@@ -1876,19 +1908,22 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
 }
 
 fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!("{name}=\"");
+    let key = format!("{name}=");
     let mut offset = 0;
     while let Some(pos) = tag[offset..].find(&key) {
         let at = offset + pos;
         // A whole attribute boundary — `name=` must not match the tail of
         // `long_name=` or `machine-name=`.
         if at == 0 || tag.as_bytes()[at - 1].is_ascii_whitespace() {
-            let start = at + key.len();
-            let rest = &tag[start..];
-            // An unclosed value keeps looking — a later attribute may
-            // still match cleanly.
-            if let Some(end) = rest.find('"') {
-                return Some(&rest[..end]);
+            let rest = tag[at + key.len()..].trim_start();
+            // Single-quoted values parse too (tables::xml_attr).
+            if let Some(&quote) = rest.as_bytes().first() {
+                if quote == b'"' || quote == b'\'' {
+                    let body = &rest[1..];
+                    if let Some(end) = body.find(quote as char) {
+                        return Some(&body[..end]);
+                    }
+                }
             }
         }
         offset = at + 1;

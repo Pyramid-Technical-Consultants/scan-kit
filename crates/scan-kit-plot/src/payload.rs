@@ -156,13 +156,13 @@ pub fn encode_plot_reusing(
     // The decoder bounds session cubes at 64 total sharing a 1<<30 voxel
     // budget — a scene past the ceiling would emit a payload its own
     // decoder refuses, so keep the cubes that fit (volume_shape treatment).
-    fn keep_cubes<'a>(
-        cubes: &'a [scan_kit_core::SessionDose],
+    fn keep_cubes(
+        cubes: &[scan_kit_core::SessionDose],
         count: &mut usize,
         voxels: &mut usize,
-    ) -> Vec<&'a scan_kit_core::SessionDose> {
+    ) -> Vec<usize> {
         let mut kept = Vec::new();
-        for dose in cubes {
+        for (index, dose) in cubes.iter().enumerate() {
             // The wire count is values.len() and read_cube refuses a cube
             // past 1<<28 — charge the shared budget in the same units and
             // keep only what the per-cube cap also admits.
@@ -170,7 +170,7 @@ pub fn encode_plot_reusing(
             if *count > 0 && wire <= (1usize << 28).min(*voxels) {
                 *count -= 1;
                 *voxels -= wire;
-                kept.push(dose);
+                kept.push(index);
             }
         }
         kept
@@ -229,8 +229,17 @@ pub fn encode_plot_reusing(
         volume_sessions: kept_sessions.len() as u32,
         volume_plans: kept_plans.len() as u32,
         volume_companions: kept_companions.len() as u32,
-        volume_session_focus: scene.volume.session_focus,
-        volume_colors: scene.volume.session_colors.clone(),
+        // focus and colors index the full sessions list — a dropped
+        // mid-list cube shifts every later index, so renumber both or the
+        // decoder focuses/colors the wrong session.
+        volume_session_focus: kept_sessions
+            .iter()
+            .position(|&index| index as u32 == scene.volume.session_focus)
+            .unwrap_or(0) as u32,
+        volume_colors: kept_sessions
+            .iter()
+            .filter_map(|&index| scene.volume.session_colors.get(index).copied())
+            .collect(),
     };
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;
     let mut out = Vec::with_capacity(
@@ -309,9 +318,13 @@ pub fn encode_plot_reusing(
     }
     for session in kept_sessions
         .iter()
-        .copied()
-        .chain(kept_plans.iter().copied())
-        .chain(kept_companions.iter().copied())
+        .map(|&index| &scene.volume.sessions[index])
+        .chain(kept_plans.iter().map(|&index| &scene.volume.plans[index]))
+        .chain(
+            kept_companions
+                .iter()
+                .map(|&index| &scene.volume.companions[index]),
+        )
     {
         write_session(&mut out, session);
     }
@@ -1119,14 +1132,22 @@ mod tests {
         scene.volume.gain = 1.0;
         scene.volume.ct = vec![12.0];
         scene.volume.labels = vec![3];
-        scene.volume.session_colors = vec![[0.2, 0.3, 0.8, 1.0]];
+        scene.volume.session_colors = vec![[0.2, 0.3, 0.8, 1.0], [0.9, 0.4, 0.1, 1.0]];
         scene.volume.session_focus = 1;
-        scene.volume.sessions = vec![scan_kit_core::SessionDose {
-            values: vec![4.0, 5.0],
-            shape: [1, 1, 2],
-            origin: [1.0, 2.0, 3.0],
-            voxel: 2.0,
-        }];
+        scene.volume.sessions = vec![
+            scan_kit_core::SessionDose {
+                values: vec![4.0, 5.0],
+                shape: [1, 1, 2],
+                origin: [1.0, 2.0, 3.0],
+                voxel: 2.0,
+            },
+            scan_kit_core::SessionDose {
+                values: vec![6.0],
+                shape: [1, 1, 1],
+                origin: [0.0; 3],
+                voxel: 1.0,
+            },
+        ];
         scene.volume.plans = vec![scan_kit_core::SessionDose {
             values: vec![7.0],
             shape: [1, 1, 1],
@@ -1148,7 +1169,10 @@ mod tests {
         assert_eq!(scan.integrals, fresh.integrals);
         assert!((volume.gantry - 90.0).abs() < 1e-4);
         assert_eq!(volume.session_focus, 1);
-        assert_eq!(volume.session_colors, vec![[0.2, 0.3, 0.8, 1.0]]);
+        assert_eq!(
+            volume.session_colors,
+            vec![[0.2, 0.3, 0.8, 1.0], [0.9, 0.4, 0.1, 1.0]]
+        );
         assert_eq!(volume.sessions[0].values, vec![4.0, 5.0]);
         assert_eq!(volume.plans[0].values, vec![7.0]);
         assert_eq!(volume.companions[0].values, vec![8.0]);

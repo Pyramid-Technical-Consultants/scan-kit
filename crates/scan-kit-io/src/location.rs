@@ -430,10 +430,16 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     // Only plain relative segments may join the cache — a `..` escapes it, and
     // on Windows `join("C:/evil")` discards the base entirely. A name that can
     // never exist locally (illegal char, DOS stem) fails the copy every time.
-    if !Path::new(&relative).components().all(|part| {
-        matches!(part, std::path::Component::Normal(name)
-            if !crate::remote::unsafe_local_name(&name.to_string_lossy()))
-    }) {
+    // A backslash in the remote path is one character there but a
+    // separator locally on Windows — a name like a-backslash-b
+    // materializes as a/b and collides with a real a/b session
+    // dir and stamp.
+    if relative.contains('\\')
+        || !Path::new(&relative).components().all(|part| {
+            matches!(part, std::path::Component::Normal(name)
+                if !crate::remote::unsafe_local_name(&name.to_string_lossy()))
+        })
+    {
         return Err("remote session path escapes the cache directory".into());
     }
     let dest = cache_directory(library_canonical).join(&relative);

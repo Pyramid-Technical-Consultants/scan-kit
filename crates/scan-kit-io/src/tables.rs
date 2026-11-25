@@ -641,6 +641,7 @@ struct FrameKey {
 struct TableKey {
     frames: FrameKey,
     spot_stamp: u128,
+    device_stamp: u128,
     kind: String,
 }
 
@@ -675,12 +676,20 @@ fn cached_timeslice(
     let frames = frame_key(root, session, family);
     let map_stamp = frames.map_stamp;
     let slice_stamp = frames.slice_stamp;
+    // device_axes reads devices.xml + scan_dose_system.xml for the iso
+    // metrics — the same stamp SpotCacheKey carries, or an edit serves a
+    // stale strip fit.
+    let device_stamp = discover::meta_stamp(&frames.dir.join("config/map2map/devices.xml"))
+        .wrapping_add(discover::meta_stamp(
+            &frames.dir.join("config/map2map/scan_dose_system.xml"),
+        ));
     let key = TableKey {
         spot_stamp: if spot {
             discover::meta_stamp(&frames.dir.join("spot_data.csv"))
         } else {
             0
         },
+        device_stamp,
         kind: kind.to_string(),
         frames,
     };
@@ -712,6 +721,7 @@ fn cached_timeslice(
             spot_stamp,
             map_stamp,
             slice_stamp,
+            device_stamp,
         ) {
             GrownHit::Same(table) => return table,
             GrownHit::More(previous) => {
@@ -742,6 +752,7 @@ fn cached_timeslice(
                     spot_stamp,
                     map_stamp,
                     slice_stamp,
+                    device_stamp,
                     Arc::clone(&table),
                 );
                 return table;
@@ -765,6 +776,7 @@ fn cached_timeslice(
             spot_stamp,
             map_stamp,
             slice_stamp,
+            device_stamp,
             Arc::clone(&table),
         );
         return table;
@@ -784,6 +796,7 @@ struct Grown {
     spot_stamp: u128,
     map_stamp: u128,
     slice_stamp: u128,
+    device_stamp: u128,
     table: Table,
 }
 
@@ -818,6 +831,7 @@ fn take_grown(
     spot_stamp: u128,
     map_stamp: u128,
     slice_stamp: u128,
+    device_stamp: u128,
 ) -> GrownHit {
     let key = (dir.to_path_buf(), kind.to_string());
     let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -827,6 +841,7 @@ fn take_grown(
     if have.spot_stamp != spot_stamp
         || have.map_stamp != map_stamp
         || have.slice_stamp != slice_stamp
+        || have.device_stamp != device_stamp
     {
         cache.remove(&key);
         return GrownHit::Miss;
@@ -852,6 +867,7 @@ fn store_growth(
     spot_stamp: u128,
     map_stamp: u128,
     slice_stamp: u128,
+    device_stamp: u128,
     table: Table,
 ) {
     let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -866,6 +882,7 @@ fn store_growth(
             spot_stamp,
             map_stamp,
             slice_stamp,
+            device_stamp,
             table,
         },
     );
@@ -1027,19 +1044,33 @@ fn map_sheet(root: &Path, session: &str) -> Arc<Sheet> {
 pub(crate) fn merged_timeslice(root: &Path, session: &str) -> Table {
     cached_timeslice(root, session, "merged", false, Family::All, |frames| {
         let mut merged: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+        let mut rows = 0usize;
         for (index, sheet) in frames.sheets.iter().enumerate() {
             let Some(start) = row_origin(index, frames.prior) else {
                 continue;
             };
+            let mut sheet_rows = 0usize;
             for (name, values) in &sheet.num {
                 let slice = values.get(start..).unwrap_or(&[]);
                 if slice.is_empty() {
                     continue;
                 }
-                merged
-                    .entry(name.clone())
-                    .or_default()
-                    .extend_from_slice(slice);
+                sheet_rows = sheet_rows.max(slice.len());
+                // A column first seen in a later file needs NaN padding
+                // for the earlier rows or it index-shifts against every
+                // sibling column.
+                let column = merged.entry(name.clone()).or_default();
+                if column.len() < rows {
+                    column.resize(rows, f32::NAN);
+                }
+                column.extend_from_slice(slice);
+            }
+            rows += sheet_rows;
+            // Columns this sheet lacks must pad too — same alignment rule.
+            for column in merged.values_mut() {
+                if column.len() < rows {
+                    column.resize(rows, f32::NAN);
+                }
             }
         }
         merged
@@ -2295,8 +2326,11 @@ fn wall_time(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
         return Some(
             (0..n)
                 .map(|index| {
+                    // scale converts to ns — bring it to seconds like
+                    // spot_time_ms's / 1e6, or the fraction dwarfs the
+                    // whole-second part by 1e9.
                     let frac = nanos
-                        .and_then(|(values, scale)| values.get(index).map(|v| v * scale))
+                        .and_then(|(values, scale)| values.get(index).map(|v| v * scale / 1e9))
                         .unwrap_or(0.0);
                     seconds[index] * s_scale + frac
                 })
@@ -4300,7 +4334,15 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
 }
 
 fn header_base(name: &str) -> &str {
-    name.split('.').next().unwrap_or(name)
+    let base = name.split('.').next().unwrap_or(name);
+    // "time_s(min)" must resolve like "time_s" — the keep predicates and
+    // Kind classification match base names; the unit belongs to
+    // header_unit's own parse. Same rule as normalize_column_name: only a
+    // trailing (…) is a suffix.
+    match base.strip_suffix(')') {
+        Some(text) => text.rsplit_once('(').map(|(head, _)| head).unwrap_or(base),
+        None => base,
+    }
 }
 
 fn timeslice_keep(name: &str) -> bool {

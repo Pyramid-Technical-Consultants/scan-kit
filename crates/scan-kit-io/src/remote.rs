@@ -479,6 +479,13 @@ mod net {
         max: Option<usize>,
     ) -> Result<Option<Vec<u8>>, String> {
         let sftp = fs.sftp()?;
+        // stat/list treat symlinks as absent, but open() follows them
+        // server-side — a symlinked marker file must not be served.
+        match sftp.lstat(Path::new(path)) {
+            Ok(stat) if stat.file_type().is_symlink() => return Ok(None),
+            Err(err) if missing_sftp(&err) => return Ok(None),
+            _ => {}
+        }
         match sftp.open(Path::new(path)) {
             Ok(mut file) => {
                 let deadline = Instant::now() + TRANSFER_BUDGET;
@@ -791,8 +798,12 @@ mod net {
         ftp.login(user, password).map_err(map_ftp_auth)
     }
 
-    impl Fs for FtpFs {
-        fn list(&mut self, path: &str) -> Result<Vec<Item>, String> {
+    impl FtpFs {
+        fn list_strict(&mut self, path: &str) -> Result<Vec<Item>, String> {
+            self.list_inner(path, true)
+        }
+
+        fn list_inner(&mut self, path: &str, strict: bool) -> Result<Vec<Item>, String> {
             // ftp.list() streams the data channel uncapped — a peer feeding
             // an endless LIST exhausts memory like an uncapped body.
             let lines = match &mut self.client {
@@ -852,7 +863,26 @@ mod net {
             if !lines.is_empty() && failed == lines.len() {
                 return Err(format!("unparseable LIST reply for {path}"));
             }
+            // A copy stamps its result as complete — a single dropped line
+            // there is data loss, where discovery can tolerate it.
+            if strict && failed > 0 {
+                return Err(format!(
+                    "{failed} unparseable LIST line(s) for {path} - refusing to copy an incomplete listing"
+                ));
+            }
+            if items.len() > MAX_LIST_ENTRIES {
+                return Err(format!(
+                    "{path} lists {} entries - more than {MAX_LIST_ENTRIES}",
+                    items.len()
+                ));
+            }
             Ok(items)
+        }
+    }
+
+    impl Fs for FtpFs {
+        fn list(&mut self, path: &str) -> Result<Vec<Item>, String> {
+            self.list_inner(path, false)
         }
 
         fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
@@ -873,13 +903,17 @@ mod net {
                 FtpClient::Plain(ftp) => ftp.retr(path, &mut read_all),
                 FtpClient::Tls(ftp) => ftp.retr(path, &mut read_all),
             };
-            match result {
-                Ok(_) => {}
-                Err(err) if missing_ftp(&err) => return Ok(None),
-                Err(err) => return Err(map_ftp(err)),
-            }
+            // A 550 after the data channel opened (abort, quota) is a
+            // failed transfer of an existing file — only a 550 with zero
+            // bytes delivered is "missing". The oversize check runs before
+            // the match or finish()'s abort reply shadows it.
             if bytes.len() as u64 > MAX_OBJECT_BYTES {
                 return Err(format!("{path} is bigger than {MAX_OBJECT_BYTES} bytes"));
+            }
+            match result {
+                Ok(_) => {}
+                Err(err) if missing_ftp(&err) && bytes.is_empty() => return Ok(None),
+                Err(err) => return Err(map_ftp(err)),
             }
             Ok(Some(bytes))
         }
@@ -1001,7 +1035,7 @@ mod net {
                 "remote tree deeper than {COPY_DEPTH} levels: {path}"
             ));
         }
-        let items = fs.list(path)?;
+        let items = fs.list_strict(path)?;
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in items {
             // Skipping a member silently would stamp an incomplete
@@ -1061,13 +1095,15 @@ mod net {
             .read_to_end(&mut bytes);
         let finish = stream.finish();
         read.map_err(suppaftp::FtpError::ConnectionError)?;
-        finish?;
         if bytes.len() as u64 > MAX_LIST_BYTES {
             return Err(suppaftp::FtpError::ConnectionError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("listing for {path} exceeds {MAX_LIST_BYTES} bytes"),
             )));
         }
+        // finish already ran above — its 426 abort reply must not shadow
+        // the clearer cap error checked before this propagation.
+        finish?;
         Ok(bytes
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
@@ -1200,6 +1236,57 @@ mod net {
             .saturating_add(frac_ns)
     }
 
+    /// RFC 9110 IMF-fixdate: "Wed, 21 Oct 2015 07:28:00 GMT" → ns since
+    /// the epoch. Anything else answers 0 (no stamp), the pre-existing
+    /// behavior for a missing Last-Modified.
+    fn http_date_ns(text: &str) -> i64 {
+        let Some(rest) = text.trim().split_once(',').map(|(_, tail)| tail.trim()) else {
+            return 0;
+        };
+        let mut parts = rest.split_whitespace();
+        let (Some(day), Some(month), Some(year), Some(clock)) = (
+            parts.next().and_then(|v| v.parse::<i64>().ok()),
+            parts.next(),
+            parts.next().and_then(|v| v.parse::<i64>().ok()),
+            parts.next(),
+        ) else {
+            return 0;
+        };
+        let month = match month {
+            "Jan" => 1,
+            "Feb" => 2,
+            "Mar" => 3,
+            "Apr" => 4,
+            "May" => 5,
+            "Jun" => 6,
+            "Jul" => 7,
+            "Aug" => 8,
+            "Sep" => 9,
+            "Oct" => 10,
+            "Nov" => 11,
+            "Dec" => 12,
+            _ => return 0,
+        };
+        let mut hms = clock.split(':');
+        let (Some(hour), Some(minute), Some(second)) = (
+            hms.next().and_then(|v| v.parse::<i64>().ok()),
+            hms.next().and_then(|v| v.parse::<i64>().ok()),
+            hms.next().and_then(|v| v.parse::<i64>().ok()),
+        ) else {
+            return 0;
+        };
+        if !(1..=31).contains(&day)
+            || !(1900..=9999).contains(&year)
+            || hour > 23
+            || minute > 59
+            || second > 60
+        {
+            return 0;
+        }
+        (days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+            .saturating_mul(1_000_000_000)
+    }
+
     fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
         let year = if month <= 2 { year - 1 } else { year };
         let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -1323,6 +1410,17 @@ mod net {
                 return Err("an http location can only copy its own archive".into());
             }
             let bytes = http_get(&self.url, &self.username, &self.password)?;
+            // A close-delimited or truncated body has no Content-Length
+            // contract — compare against HEAD like sftp/ftp do.
+            if let Ok(Some(stat)) = self.stat(path) {
+                if stat.size > 0 && (bytes.len() as u64) < stat.size {
+                    return Err(format!(
+                        "{path} truncated: {} of {} bytes",
+                        bytes.len(),
+                        stat.size
+                    ));
+                }
+            }
             copy_file_to(dest, &bytes)
         }
 
@@ -1332,6 +1430,12 @@ mod net {
     }
 
     fn http_agent() -> Result<ureq::Agent, String> {
+        // The agent owns the connection pool — materialize pays stamp HEAD +
+        // copy GET, and a per-call agent pays a fresh handshake each time.
+        static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+        if let Some(agent) = AGENT.get() {
+            return Ok(agent.clone());
+        }
         let timeout = Some(location::connect_timeout());
         let config = ureq::Agent::config_builder()
             .timeout_connect(timeout)
@@ -1349,7 +1453,8 @@ mod net {
                     .build(),
             )
             .build();
-        Ok(config.into())
+        let agent: ureq::Agent = config.into();
+        Ok(AGENT.get_or_init(|| agent.clone()).clone())
     }
 
     fn http_get(url: &str, username: &str, password: &str) -> Result<Vec<u8>, String> {
@@ -1372,9 +1477,8 @@ mod net {
     }
 
     fn http_stat(url: &str, username: &str, password: &str) -> Result<Stat, String> {
-        // ponytail: a server that rejects HEAD keeps a zero stamp, so the cached
-        // archive is reused until the process forgets it. A Content-Length change
-        // still downloads again.
+        // ponytail: a server that rejects HEAD keeps a zero stamp and the
+        // archive re-downloads on every materialize — safe, just slow.
         let response = authed(http_agent()?.head(url), username, password)?.call();
         let response = match response {
             Ok(response) => response,
@@ -1393,10 +1497,18 @@ mod net {
             .and_then(|value| value.to_str().ok())
             .and_then(|text| text.parse().ok())
             .unwrap_or(0);
+        // Last-Modified gives the stamp cache a real mtime — without it
+        // every materialize re-downloads the archive under the COPY lock.
+        let mtime_ns = response
+            .headers()
+            .get("last-modified")
+            .and_then(|value| value.to_str().ok())
+            .map(http_date_ns)
+            .unwrap_or(0);
         Ok(Stat {
             dir: false,
             size,
-            mtime_ns: 0,
+            mtime_ns,
         })
     }
 
@@ -1454,7 +1566,7 @@ mod net {
 
     fn map_http(err: ureq::Error) -> String {
         match err {
-            ureq::Error::StatusCode(code) if code == 401 || code == 403 => {
+            ureq::Error::StatusCode(401) => {
                 location::auth_error("the archive URL refused the password")
             }
             other => other.to_string(),

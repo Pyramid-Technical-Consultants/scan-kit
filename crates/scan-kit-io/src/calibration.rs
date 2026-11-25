@@ -169,6 +169,11 @@ impl CtCalibration {
     /// Mass density in g/cm³ — linear in the density breakpoints, clamped to
     /// the first/last segment, floored at 1e-6.
     pub fn density(&self, hu: f64) -> f64 {
+        // The fields are pub — a caller that desyncs or truncates them
+        // gets the floor, not a clamp panic.
+        if self.hu_points.len() < 2 || self.densities.len() < self.hu_points.len() {
+            return MIN_DENSITY;
+        }
         let i = below(&self.hu_points, hu).clamp(0, self.hu_points.len() as i64 - 2) as usize;
         let (x0, x1) = (self.hu_points[i], self.hu_points[i + 1]);
         let (y0, y1) = (self.densities[i], self.densities[i + 1]);
@@ -239,7 +244,8 @@ impl CtCalibration {
     pub fn from_density(&self, density: f64) -> (u8, f64) {
         let (scan, curve) = self.density_curve();
         let hu = interp(density, &curve, &scan);
-        (self.material(hu), density)
+        // f64::max returns the non-NaN operand — NaN floors too.
+        (self.material(hu), density.max(MIN_DENSITY))
     }
 
     /// Media index + mass density for an SPR value, on the monotone SPR curve.
@@ -247,7 +253,17 @@ impl CtCalibration {
         let (scan, curve) = self.spr_curve();
         let hu = interp(spr, &curve, &scan);
         let material = self.material(hu);
-        (material, spr / self.relative_stop_of(material))
+        let density = spr / self.relative_stop_of(material);
+        // A non-finite or sub-floor density would reach the caller as a
+        // plausible mass density.
+        (
+            material,
+            if density.is_finite() {
+                density.max(MIN_DENSITY)
+            } else {
+                MIN_DENSITY
+            },
+        )
     }
 
     fn relative_stop_of(&self, material: u8) -> f64 {

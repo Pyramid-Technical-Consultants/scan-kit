@@ -58,6 +58,18 @@ impl BeamModel {
         if !model.rows.iter().flatten().all(|value| value.is_finite()) {
             return Err(format!("{path:?} energy rows must be finite"));
         }
+        // The weight pair divides w1/(w1+w2) and ProtonsMU scales every
+        // transport — a 0/0 or non-positive value must fail here, not as a
+        // NaN record downstream.
+        if model
+            .rows
+            .iter()
+            .any(|row| row[3] <= 0.0 || row[4] < 0.0 || row[11] < 0.0 || row[4] + row[11] <= 0.0)
+        {
+            return Err(format!(
+                "{path:?} has a non-positive ProtonsMU or weight pair"
+            ));
+        }
         // `<= 0.0` alone misses NaN — a literal "NaN" distance must fail too.
         if [model.nozzle, model.smx, model.smy]
             .iter()
@@ -109,10 +121,32 @@ impl BeamModel {
                     }
                 }
             } else if head == "Beam parameters" {
-                let declared = lines
-                    .next()
-                    .and_then(|line| line.split_whitespace().next()?.parse::<usize>().ok());
-                for line in lines.by_ref() {
+                // The count line is optional — bundled files write it as
+                // "26 energies". Consume it when the first token is a bare
+                // usize and no later token is numeric; a data row's second
+                // column always parses as f32.
+                let mut held = "";
+                let declared = lines.next().and_then(|line| {
+                    let text = line.split('#').next().unwrap_or("").trim();
+                    let mut words = text.split_whitespace();
+                    let count = match (words.next(), words.next()) {
+                        (Some(token), rest)
+                            if token.parse::<usize>().is_ok()
+                                && rest.is_none_or(|word| word.parse::<f32>().is_err()) =>
+                        {
+                            token.parse::<usize>().ok()
+                        }
+                        _ => None,
+                    };
+                    if count.is_none() {
+                        held = text;
+                    }
+                    count
+                });
+                for line in std::iter::once(held)
+                    .filter(|line| !line.is_empty())
+                    .chain(lines.by_ref())
+                {
                     let text = line.split('#').next().unwrap_or("").trim();
                     let parsed: Option<Vec<f32>> =
                         text.split_whitespace().map(|v| v.parse().ok()).collect();
@@ -294,6 +328,9 @@ fn fill_spot(
                 model.shifter_density
             ));
         }
+        if distance_mm < 0.0 {
+            return Err(format!("negative range shifter distance {distance_mm}"));
+        }
         let distance = if distance_mm.is_finite() && distance_mm > 0.0 {
             distance_mm
         } else {
@@ -466,7 +503,9 @@ mod tests {
 
     #[test]
     fn unsorted_rows_or_missing_geometry_error() {
-        let row = |first: &str| format!("{first} {}", "0 ".repeat(17));
+        // Columns 3/4 must be positive — the parser validates ProtonsMU
+        // and the weight pair now.
+        let row = |first: &str| format!("{first} 1 1 1 1 {}", "0 ".repeat(13));
         let geometry = "Nozzle exit to Isocenter distance
 100
  SMX to Isocenter distance
@@ -611,7 +650,9 @@ hdr
 
     #[test]
     fn a_non_finite_energy_row_is_rejected() {
-        let row = |first: &str| format!("{first} {}", "0 ".repeat(17));
+        // Columns 3/4 must be positive — the parser validates ProtonsMU
+        // and the weight pair now.
+        let row = |first: &str| format!("{first} 1 1 1 1 {}", "0 ".repeat(13));
         let text = format!(
             "Nozzle exit to Isocenter distance
 100
