@@ -225,7 +225,8 @@ pub(crate) fn read_remote_session_file(
     {
         candidates.push(format!("{base}/{session_id}/{filename}"));
     } else {
-        // With the nested marker, the nested tree is authoritative — a
+        // No nested marker — the flat file is what the reader serves. When
+        // the marker does hold the nested tree is authoritative instead: a
         // stale flat file must not hydrate what the nested layout lacks,
         // matching session_directory locally.
         candidates.push(format!("{base}/{filename}"));
@@ -2399,6 +2400,103 @@ mod tests {
         assert_eq!((mtime, size), (1_000_000_000, 14)); // "nested-marker\n"
         let remote = require_remote(&canonical).unwrap();
         assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n14");
+    }
+
+    #[test]
+    fn the_nested_marker_makes_the_nested_tree_the_read_authority() {
+        // Both layouts present: the read must serve the nested file, and a
+        // file missing from the nested tree must not fall through to the
+        // stale flat copy — session_directory resolves it away locally too.
+        let url = format!(
+            "sftp://u@host.invalid/readnest/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = install_fixture(
+            &format!("{url}/sess"),
+            &[
+                (
+                    "input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "termination_summary.txt",
+                    b"flat
+",
+                ),
+                (
+                    "spot_data.csv",
+                    b"flat-only
+",
+                ),
+                (
+                    "sess/input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "sess/termination_summary.txt",
+                    b"nested
+",
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            read_remote_session_file(&canonical, "sess", "termination_summary.txt")
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            Some(
+                "nested
+"
+                .to_owned()
+            )
+        );
+        // Present only in the flat tree — the nested marker wins, so None.
+        assert!(read_remote_session_file(&canonical, "sess", "spot_data.csv").is_none());
+
+        // No nested marker: the flat file is what the reader serves.
+        let url = format!(
+            "sftp://u@host.invalid/readflat/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = install_fixture(
+            &format!("{url}/sess"),
+            &[
+                (
+                    "input_map.csv",
+                    b"energy
+70
+",
+                ),
+                (
+                    "termination_summary.txt",
+                    b"flat
+",
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            read_remote_session_file(&canonical, "sess", "termination_summary.txt")
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            Some(
+                "flat
+"
+                .to_owned()
+            )
+        );
     }
 
     #[test]
