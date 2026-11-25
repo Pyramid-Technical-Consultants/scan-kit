@@ -158,7 +158,7 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
     }
     let data = base_hi.abs().max(base_lo.abs()).max(1.0);
     let limit = data * 2.0;
-    let hi = level.unwrap_or(base_hi).clamp(1e-6, limit);
+    let hi = level.unwrap_or(base_hi).max(1e-6).clamp(1e-6, limit);
     Wash {
         lo: 0.0,
         hi,

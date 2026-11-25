@@ -868,10 +868,10 @@ mod tests {
             };
             let (panels, mark) = assemble(space);
             assert_eq!(panels.len(), 6, "{kind:?}");
-            assert!(
-                !panels[4].series.is_empty() || kind == PlotKind::Gamma,
-                "{kind:?}"
-            );
+            // The fixture supplies gamma data, so the panel must carry
+            // series for every kind — no carve-out for the one case that
+            // could actually regress.
+            assert!(!panels[4].series.is_empty(), "{kind:?}");
             assert_eq!(mark.values.len(), 8);
             assert!(panels.iter().any(|panel| panel.title.starts_with("3D")));
             assert_eq!(panels[0].x_label, "X (mm)");

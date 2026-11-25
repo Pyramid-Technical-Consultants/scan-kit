@@ -1439,7 +1439,7 @@ mod tests {
             return;
         };
 
-        let frames = read_timeslice_frames(&session, "session");
+        let frames = read_timeslice_frames(&root, "sess");
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].0, 0);
         let _ = fs::remove_dir_all(&root);

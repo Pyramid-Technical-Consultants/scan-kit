@@ -1300,7 +1300,8 @@ mod tests {
         layer.sort_by(|left, right| left.partial_cmp(right).unwrap());
         assert!((layer[0] - 0.01).abs() < 1e-9);
         assert!((layer[1] - 0.04).abs() < 1e-9);
-        assert!((shuffled[2] - 0.01).abs() < 1e-9);
+        // A one-spot layer lands at the range midpoint, not the edge.
+        assert!((shuffled[2] - 0.025).abs() < 1e-9);
         let random = random_total(5, 1.0, 10.0).unwrap();
         let sum: f64 = random.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);

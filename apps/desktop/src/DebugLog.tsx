@@ -7,14 +7,17 @@ import { clearLog, logLines, subscribeLog } from "@/debug-log";
 export function DebugLog() {
   const [lines, setLines] = useState<readonly string[]>(() => logLines());
   const view = useRef<HTMLPreElement>(null);
+  // Whether the user is at the tail has to be measured before the append
+  // commits — after commit, scrollHeight already includes the new lines, so
+  // a multi-line burst (any error stack) would measure its own height, fail
+  // the at-tail check, and never stick again. Track it in onScroll instead.
+  const atTail = useRef(true);
 
   useEffect(() => subscribeLog(() => setLines(logLines().slice())), []);
 
   useEffect(() => {
     const node = view.current;
-    // Stick to the tail only while the user is already at it - yanking a
-    // mid-scroll read on every line makes a chatty task log unreadable.
-    if (node != null && node.scrollHeight - node.scrollTop - node.clientHeight < 24) {
+    if (node != null && atTail.current) {
       node.scrollTop = node.scrollHeight;
     }
   }, [lines]);
@@ -44,6 +47,10 @@ export function DebugLog() {
       </div>
       <pre
         ref={view}
+        onScroll={(event) => {
+          const node = event.currentTarget;
+          atTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+        }}
         className="border-border min-h-0 flex-1 overflow-auto rounded-lg border p-2 font-mono text-xs"
       >
         {lines.join("\n")}

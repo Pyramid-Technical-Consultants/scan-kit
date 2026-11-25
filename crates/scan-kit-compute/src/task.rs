@@ -1250,9 +1250,11 @@ impl McPlotStage {
     fn shutdown(&mut self) {
         self.worker_cancel.cancel();
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // No join — the worker can be inside McRun::open's adapter/device
+        // timeouts where neither cancel flag is observed, so joining here
+        // stalls the caller ~60s+ on exactly the wedged-driver path. The
+        // worker drops its own runs on exit; GPU buffers defer-destroy.
+        self.worker.take();
     }
 
     fn sync_report(&mut self, phase: Phase) {
@@ -1377,10 +1379,11 @@ impl McPlotStage {
             self.report = report_at(Phase::Done, 1, 1);
             return self.publish(&results, 1, true);
         }
-        let histories = job_histories(&jobs[0]);
-        // `satisfied` is min(delivered) across jobs, so a mixed-histories
-        // scene would never reach this target.
-        debug_assert!(jobs.iter().all(|job| job_histories(job) == histories));
+        // `satisfied` is min(delivered) across jobs, so the target must be
+        // the smallest request — jobs[0] is not necessarily it, and a
+        // larger target would never be reached (debug asserts are off in
+        // release: the task would poll Pending forever).
+        let histories = jobs.iter().map(job_histories).min().unwrap_or(0);
         self.shared
             .total
             .store(all_histories(&jobs), Ordering::Relaxed);
@@ -3147,6 +3150,8 @@ mod tests {
         )
         .expect_err("a missing study cannot export");
         assert!(message.contains("missing"), "{message}");
+        // A dir walk that swallowed the failure would reach "no CT" instead.
+        assert!(!message.contains("no CT"), "{message}");
     }
 
     #[test]

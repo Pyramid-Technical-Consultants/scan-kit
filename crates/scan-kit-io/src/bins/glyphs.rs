@@ -997,9 +997,15 @@ mod tests {
             1,
             [1.0, 1.0, 1.0, 1.0],
         );
-        let json = serde_json::to_value(&series).unwrap();
-        let text = json.to_string();
-        assert!(!text.contains("inf") && !text.contains("NaN"), "{text}");
+        // serde_json writes non-finite floats as null — a text scan can't
+        // see them. The values themselves have to be checked.
+        for item in &series {
+            let (xs, ys) = match item {
+                Series::Polyline { xs, ys, .. } | Series::Points { xs, ys, .. } => (xs, ys),
+                _ => continue,
+            };
+            assert!(xs.iter().chain(ys.iter()).all(|v| v.is_finite()));
+        }
     }
 
     #[test]

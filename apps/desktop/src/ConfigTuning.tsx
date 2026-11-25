@@ -921,7 +921,11 @@ function PreviewGrid({ columns, rows }: { columns: string[]; rows: PreviewCell[]
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
-    return () => observer.disconnect();
+    node.addEventListener("wheel", forwardWheel, { passive: false });
+    return () => {
+      observer.disconnect();
+      node.removeEventListener("wheel", forwardWheel);
+    };
   }, []);
   function getCell([column, row]: Item): GridCell {
     const cell = rows[row]?.[column];
@@ -945,7 +949,6 @@ function PreviewGrid({ columns, rows }: { columns: string[]; rows: PreviewCell[]
       ref={host}
       className="h-full w-full min-w-0 overflow-hidden"
       style={{ overflowAnchor: "none" }}
-      onWheel={forwardWheel}
     >
       {size.width > 0 && height > 0 ? (
         <DataEditor

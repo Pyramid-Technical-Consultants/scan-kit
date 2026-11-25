@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type WheelEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import {
   DataEditor,
@@ -77,12 +77,16 @@ function gridHeight(rows: number): number {
   return Math.min(360, 36 + Math.max(rows, 1) * 28);
 }
 
-export function forwardWheel(event: WheelEvent<HTMLDivElement>) {
+// Attached via addEventListener(..., { passive: false }) — React's delegated
+// onWheel is registered passive, so preventDefault() in a JSX prop is a no-op
+// and the browser scroll-chains on top of the manual scroll (a 2x scroll).
+export function forwardWheel(event: globalThis.WheelEvent) {
   if (event.deltaY === 0) {
     return;
   }
-  const scroller = event.currentTarget.querySelector(".dvn-scroller");
-  const pane = event.currentTarget.closest("[data-form-scroll]");
+  const host = event.currentTarget as HTMLElement | null;
+  const scroller = host?.querySelector(".dvn-scroller");
+  const pane = host?.closest("[data-form-scroll]");
   if (!(pane instanceof HTMLElement) || !(scroller instanceof HTMLElement)) {
     return;
   }
@@ -312,7 +316,11 @@ function XmlGrid({
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
-    return () => observer.disconnect();
+    node.addEventListener("wheel", forwardWheel, { passive: false });
+    return () => {
+      observer.disconnect();
+      node.removeEventListener("wheel", forwardWheel);
+    };
   }, []);
   function getCell([column, row]: Item): GridCell {
     const source = shown[column]?.index ?? column;
@@ -332,7 +340,6 @@ function XmlGrid({
         ref={host}
         className="w-full min-w-0 overflow-hidden"
         style={{ height, overflowAnchor: "none" }}
-        onWheel={forwardWheel}
       >
         {width > 0 ? (
           <DataEditor

@@ -256,7 +256,7 @@ pub(super) fn linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
         return Vec::new();
     }
     if n == 1 {
-        return vec![start];
+        return vec![(start + stop) / 2.0];
     }
     (0..n)
         .map(|index| start + (stop - start) * index as f64 / (n - 1) as f64)

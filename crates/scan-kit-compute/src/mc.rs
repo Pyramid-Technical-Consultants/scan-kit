@@ -149,21 +149,12 @@ struct Launch {
     origin_mm: [f32; 3],
 }
 
-/// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`.
+/// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`. Read
+/// from the shared device: a fresh adapter request here could name a
+/// different GPU than the one the dose ran on, and it parks the poll thread
+/// for the full adapter timeout on a wedged driver.
 pub fn adapter_info() -> String {
-    block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = tokio::time::timeout(
-            Duration::from_secs(30),
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        let info = adapter.get_info();
-        Some(format!("{} / {:?}", info.name, info.backend))
-    })
-    .unwrap_or_default()
+    block_on(async { shared_gpu().await.ok().map(|gpu| gpu.info.clone()) }).unwrap_or_default()
 }
 
 pub fn run_mc(job: &McJob) -> Result<McResult, ComputeError> {
@@ -633,10 +624,60 @@ struct McGpu {
     fold_pipe: wgpu::ComputePipeline,
     stats_peak_pipe: wgpu::ComputePipeline,
     stats_rel_pipe: wgpu::ComputePipeline,
-    /// Consecutive 30 s poll timeouts across runs sharing this device.
-    /// Sibling backlog explains one or two; a device whose submissions never
-    /// retire is wedged and must be evicted like a lost one.
+    /// Consecutive stuck-queue checks across runs sharing this device.
+    /// Sibling backlog explains one or two; a device whose queue head never
+    /// retires is wedged and must be evicted like a lost one.
     timeouts: std::sync::atomic::AtomicUsize,
+    /// Adapter identity for `scan_kit.gpu.adapter_info` provenance —
+    /// captured at open so a later probe can't name a different GPU.
+    info: String,
+    /// (index, submitted-at) for every submission on the shared queue,
+    /// oldest first. The flat wait bound can't tell a wedged device from
+    /// sibling backlog — every earlier submission must retire before ours
+    /// can — so the wait loops probe the oldest recorded submission: if it
+    /// retired, the queue drains; if it's older than the bound and still
+    /// pending, the device is wedged.
+    submissions: Mutex<VecDeque<(wgpu::SubmissionIndex, Instant)>>,
+}
+
+/// Is the shared queue's oldest recorded submission stuck? Returns true
+/// when nothing is pending ahead (our own index is then the head, already
+/// bounded by the caller) or when the oldest pending submission is itself
+/// past the bound — every chunk is designed well under it. A head that
+/// retires proves the queue drains, so the caller waits another window.
+fn head_stuck(device: &wgpu::Device, gpu: &McGpu) -> bool {
+    let mut subs = gpu
+        .submissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    while let Some((index, at)) = subs.front() {
+        if device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index.clone()),
+                timeout: Some(Duration::ZERO),
+            })
+            .is_ok()
+        {
+            subs.pop_front();
+            continue;
+        }
+        return at.elapsed() > Duration::from_secs(30);
+    }
+    true
+}
+
+/// Record a submission for `head_stuck`. Bounded — a wedge stops pops,
+/// not pushes, so cap the deque and drop the oldest (losing an entry only
+/// makes the probe see a younger head, which errs toward waiting).
+fn record_submit(gpu: &McGpu, index: &wgpu::SubmissionIndex) {
+    let mut subs = gpu
+        .submissions
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if subs.len() >= 128 {
+        subs.pop_front();
+    }
+    subs.push_back((index.clone(), Instant::now()));
 }
 
 /// One device and one compiled transport for the process. Opening a device and
@@ -680,7 +721,7 @@ async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
 }
 
 async fn open_gpu() -> Result<McGpu, ComputeError> {
-    let (device, queue) = mc_device().await?;
+    let (device, queue, info) = mc_device().await?;
     let transport = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mc transport"),
         source: wgpu::ShaderSource::Wgsl(TRANSPORT.into()),
@@ -721,6 +762,8 @@ async fn open_gpu() -> Result<McGpu, ComputeError> {
         stats_peak_pipe: pipeline(&device, &fold_layout, &fold, "stats_peak"),
         stats_rel_pipe: pipeline(&device, &fold_layout, &fold, "stats_rel"),
         timeouts: std::sync::atomic::AtomicUsize::new(0),
+        info,
+        submissions: Mutex::new(VecDeque::new()),
         device,
         queue,
         transport_layout,
@@ -943,14 +986,15 @@ impl Live {
                     published = Some(result);
                 }
                 Ok(Err(err)) => {
+                    // A failed map is not proof of device loss — the queue
+                    // waits diagnose that; evicting here drops a healthy
+                    // device for a recoverable error class.
                     self.pending_read = None;
-                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(err) => {
                     self.pending_read = None;
-                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
@@ -1060,8 +1104,9 @@ impl Live {
                     pass.dispatch_workgroups(x, y, 1);
                 }
             }
-            self.inflight
-                .push_back(self.queue.submit(Some(encoder.finish())));
+            let index = self.queue.submit(Some(encoder.finish()));
+            record_submit(&self.gpu, &index);
+            self.inflight.push_back(index);
             self.next += count;
         }
     }
@@ -1072,16 +1117,17 @@ impl Live {
         let Some(index) = self.inflight.pop_front() else {
             return Ok(Duration::ZERO);
         };
-        let started = Instant::now();
+        let mut started = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Ok(started.elapsed());
             }
-            if started.elapsed() > Duration::from_secs(30) {
+            if started.elapsed() > Duration::from_secs(30) && head_stuck(&self.device, &self.gpu) {
                 // This run's submission retires only after every earlier
-                // submission on the shared queue - sibling backlog explains a
-                // strike or two, but a device that never retires anything is
-                // wedged and would poison every future run.
+                // submission on the shared queue — the flat bound alone
+                // can't tell sibling backlog (cancelled runs leave their
+                // chunks queued) from a wedged device, so probe the queue's
+                // oldest submission before striking.
                 if self
                     .gpu
                     .timeouts
@@ -1093,6 +1139,10 @@ impl Live {
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                // Queue alive, just backlogged — restart the window.
+                started = Instant::now();
             }
             // A short wait so a new voxel size can abandon this chunk instead of
             // sitting behind the rest of the histories already queued. Only
@@ -1169,6 +1219,7 @@ impl Live {
             );
         }
         let index = self.queue.submit(Some(encoder.finish()));
+        record_submit(&self.gpu, &index);
         let (sender, receiver) = std::sync::mpsc::channel();
         staging
             .slice(..)
@@ -1186,16 +1237,16 @@ impl Live {
     fn collect_read(&self, ticket: &ReadTicket, cancel: &Cancel) -> Result<McResult, ComputeError> {
         // Only the copy submission is awaited: a transport chunk submitted
         // after it keeps the GPU busy while the dose is on its way back.
-        let started = Instant::now();
+        let mut started = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Err(ComputeError::Message("cancelled".into()));
             }
-            if started.elapsed() > Duration::from_secs(30) {
+            if started.elapsed() > Duration::from_secs(30) && head_stuck(&self.device, &self.gpu) {
                 // This run's submission retires only after every earlier
-                // submission on the shared queue - sibling backlog explains a
-                // strike or two, but a device that never retires anything is
-                // wedged and would poison every future run.
+                // submission on the shared queue — the flat bound alone
+                // can't tell sibling backlog from a wedged device, so probe
+                // the queue's oldest submission before striking.
                 if self
                     .gpu
                     .timeouts
@@ -1207,6 +1258,9 @@ impl Live {
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                started = Instant::now();
             }
             match self.device.poll(wgpu::PollType::Wait {
                 submission_index: Some(ticket.index.clone()),
@@ -1551,7 +1605,7 @@ fn pack_i64(lo: u32, hi: u32) -> i64 {
     i64::from_le_bytes(bytes)
 }
 
-async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
+async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue, String), ComputeError> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     // The only GPU waits with no deadline — a wedged driver would park the
     // worker thread forever, past cancel and join.
@@ -1571,7 +1625,7 @@ async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
             "this GPU allows fewer than 9 storage buffers".into(),
         ));
     }
-    tokio::time::timeout(
+    let (device, queue) = tokio::time::timeout(
         Duration::from_secs(30),
         adapter.request_device(&wgpu::DeviceDescriptor {
             required_limits: limits,
@@ -1580,7 +1634,9 @@ async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
     )
     .await
     .map_err(|_| ComputeError::Message("the GPU device request timed out".into()))?
-    .map_err(|err| ComputeError::Message(err.to_string()))
+    .map_err(|err| ComputeError::Message(err.to_string()))?;
+    let info = adapter.get_info();
+    Ok((device, queue, format!("{} / {:?}", info.name, info.backend)))
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {

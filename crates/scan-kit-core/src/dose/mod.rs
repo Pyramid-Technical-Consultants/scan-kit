@@ -284,7 +284,7 @@ impl Volume {
         if nx == 0 || ny == 0 || nz == 0 {
             return (0, 0, 0);
         }
-        let mut best = 0.0f32;
+        let mut best = f32::NEG_INFINITY;
         let mut at = 0usize;
         for (index, value) in self
             .values
@@ -434,7 +434,12 @@ impl Volume {
         let [nx, ny, nz] = self.shape;
         match plane {
             1 => {
-                let mut image = vec![0.0; nx.checked_mul(nz).unwrap_or(0)];
+                let mut image = vec![
+                    0.0;
+                    nx.checked_mul(nz)
+                        .filter(|&len| len <= self.values.len())
+                        .unwrap_or(0)
+                ];
                 if image.len() < nx.saturating_mul(nz) {
                     return (image, nx, nz);
                 }
@@ -450,7 +455,12 @@ impl Volume {
                 (image, nx, nz)
             }
             2 => {
-                let mut image = vec![0.0; ny.checked_mul(nz).unwrap_or(0)];
+                let mut image = vec![
+                    0.0;
+                    ny.checked_mul(nz)
+                        .filter(|&len| len <= self.values.len())
+                        .unwrap_or(0)
+                ];
                 if image.len() < ny.saturating_mul(nz) {
                     return (image, ny, nz);
                 }
@@ -466,7 +476,12 @@ impl Volume {
                 (image, ny, nz)
             }
             _ => {
-                let mut image = vec![0.0; nx.checked_mul(ny).unwrap_or(0)];
+                let mut image = vec![
+                    0.0;
+                    nx.checked_mul(ny)
+                        .filter(|&len| len <= self.values.len())
+                        .unwrap_or(0)
+                ];
                 if image.len() < nx.saturating_mul(ny) {
                     return (image, nx, ny);
                 }
