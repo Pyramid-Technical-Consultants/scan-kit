@@ -77,7 +77,7 @@ fn glyph(atlas: &Atlas, ch: char) -> Option<&Glyph> {
 
 /// Non-ASCII glyphs the renderers emit: minus sign, multiplication, middle
 /// dot, superscript digits and minus for x10^n axis offsets.
-const EXTRA: &str = "\u{2212}\u{d7}\u{b7}\u{2070}\u{b9}\u{b2}\u{b3}\u{2074}\u{2075}\u{2076}\u{2077}\u{2078}\u{2079}\u{207b}";
+const EXTRA: &str = "\u{2212}\u{d7}\u{b7}\u{2070}\u{b9}\u{b2}\u{b3}\u{2074}\u{2075}\u{2076}\u{2077}\u{2078}\u{2079}\u{207b}\u{3b3}";
 
 fn build() -> Atlas {
     let font =

@@ -211,7 +211,7 @@ pub fn config_form(xml: &str) -> Result<Value, String> {
     let root = parse_xml(xml)?;
     Ok(json!({
         "root": root.name,
-        "nodes": build_element(&root, &[], &root.name, true),
+        "nodes": build_element(None, &root, &[], &root.name, true),
     }))
 }
 
@@ -348,6 +348,9 @@ fn write_table(root: &mut Elem, node: &Value) -> Result<(), String> {
             ));
         }
         for (column, cell) in columns.iter().zip(cells) {
+            if cell.is_null() {
+                continue;
+            }
             child.set_attr(column, &cell_text(cell));
         }
     }
@@ -384,9 +387,15 @@ fn path_id(path: &[usize]) -> String {
         .join(".")
 }
 
-fn build_element(elem: &Elem, path: &[usize], title: &str, is_root: bool) -> Vec<Value> {
+fn build_element(
+    parent: Option<&Elem>,
+    elem: &Elem,
+    path: &[usize],
+    title: &str,
+    is_root: bool,
+) -> Vec<Value> {
     if elem.children.is_empty() {
-        return vec![scalar_node(elem, path, title)];
+        return vec![scalar_node(parent, elem, path, title)];
     }
     let groups = child_groups(elem);
     let sole = sole_group(elem, &groups);
@@ -437,7 +446,7 @@ fn place_sole(
     if should_flatten(child) {
         return add_groups(child, &child_path, &child_groups(child));
     }
-    build_element(child, &child_path, title, false)
+    build_element(Some(elem), child, &child_path, title, false)
 }
 
 fn add_groups(elem: &Elem, path: &[usize], groups: &[(String, Vec<usize>)]) -> Vec<Value> {
@@ -487,6 +496,7 @@ fn add_groups(elem: &Elem, path: &[usize], groups: &[(String, Vec<usize>)]) -> V
         }
         if indexes.len() == 1 && elem.children[indexes[0]].children.is_empty() {
             nodes.push(scalar_node(
+                Some(elem),
                 &elem.children[indexes[0]],
                 &child_path(path, indexes[0]),
                 tag,
@@ -502,7 +512,7 @@ fn add_groups(elem: &Elem, path: &[usize], groups: &[(String, Vec<usize>)]) -> V
             if groups.len() == 1 && should_flatten(child) {
                 nodes.extend(add_groups(child, &child_path, &child_groups(child)));
             } else {
-                nodes.extend(build_element(child, &child_path, &title, false));
+                nodes.extend(build_element(Some(elem), child, &child_path, &title, false));
             }
             index += 1;
             continue;
@@ -511,6 +521,7 @@ fn add_groups(elem: &Elem, path: &[usize], groups: &[(String, Vec<usize>)]) -> V
             let child = &elem.children[*child_index];
             let title = sibling_title(child, tag, offset, indexes.len());
             nodes.extend(build_element(
+                Some(elem),
                 child,
                 &child_path(path, *child_index),
                 &title,
@@ -537,14 +548,14 @@ fn section(title: &str, nodes: &[Value]) -> Value {
     })
 }
 
-fn scalar_node(elem: &Elem, path: &[usize], title: &str) -> Value {
+fn scalar_node(parent: Option<&Elem>, elem: &Elem, path: &[usize], title: &str) -> Value {
     let fields = scalar_field(elem, path, title);
     if fields.len() > 1 || elem.attrs.len() >= INLINE_ATTRS {
         json!({
             "kind": "section",
             "title": humanize_xml_label(&inline_label(elem, &elem.name, 0)),
             "collapsible": false,
-            "dead": child_dead_flag(elem),
+            "dead": child_dead_flag(parent, elem),
             "nodes": [{ "kind": "fields", "fields": fields }],
         })
     } else {
@@ -556,7 +567,13 @@ fn scalar_field(elem: &Elem, path: &[usize], title: &str) -> Vec<Value> {
     if elem.attrs.is_empty() {
         return vec![text_field(elem, path, title)];
     }
-    attribute_list(elem, path)
+    // The text is still a value - emit it like attribute_fields does or a
+    // <zero_offset_mm units="mm">0.5</zero_offset_mm> leaf is invisible.
+    let mut fields = attribute_list(elem, path);
+    if !elem.text.trim().is_empty() {
+        fields.push(text_field(elem, path, "value"));
+    }
+    fields
 }
 
 fn text_field(elem: &Elem, path: &[usize], title: &str) -> Value {
@@ -609,12 +626,17 @@ fn table_node(elem: &Elem, path: &[usize], tag: &str, indexes: &[usize], title: 
             })
         })
         .collect();
-    let rows: Vec<Vec<String>> = indexes
+    let rows: Vec<Vec<Value>> = indexes
         .iter()
         .map(|index| {
             columns
                 .iter()
-                .map(|name| elem.children[*index].attr(name).unwrap_or("").to_owned())
+                .map(|name| match elem.children[*index].attr(name) {
+                    Some(value) => json!(value),
+                    // null = the row lacks the column; write_table must not
+                    // mint an empty attribute onto it.
+                    None => Value::Null,
+                })
                 .collect()
         })
         .collect();
@@ -741,8 +763,8 @@ fn child_path(path: &[usize], index: usize) -> Vec<usize> {
     next
 }
 
-fn child_dead_flag(elem: &Elem) -> bool {
-    child_is_dead(elem, &elem.name)
+fn child_dead_flag(parent: Option<&Elem>, elem: &Elem) -> bool {
+    parent.is_some_and(|parent| child_is_dead(parent, &elem.name))
 }
 
 fn value_kind(raw: &str) -> &'static str {

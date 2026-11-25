@@ -109,6 +109,7 @@ fn meta_id(meta: &str) -> String {
         .unwrap_or("")
         .chars()
         .filter(|ch| !ch.is_control())
+        .take(64)
         .collect::<String>()
         .trim()
         .to_owned()
@@ -197,9 +198,25 @@ fn devices(
             .rsplit_once(':')
             .map(|(head, _)| head)
             .unwrap_or_else(|| host.trim());
-        if host_ip.parse::<std::net::IpAddr>().is_err()
+        // A literal still permits steering reads at hosts that can never
+        // be a device file server: link-local (the 169.254.169.254-style
+        // metadata endpoint), unspecified, or multicast. Loopback is left
+        // alone — co-located device software serves from it legitimately.
+        let steering = host_ip
+            .parse::<std::net::IpAddr>()
+            .map(|ip| {
+                ip.is_unspecified()
+                    || ip.is_multicast()
+                    || match ip {
+                        std::net::IpAddr::V4(ip) => ip.is_link_local(),
+                        std::net::IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
+                    }
+            })
+            .unwrap_or(true);
+        if steering
             || io_root.split('/').any(|seg| seg == "..")
             || io_root.contains(['?', '#'])
+            || io_root.contains('%')
         {
             warnings.push(format!(
                 "{client} has an untrusted device address — skipped"
@@ -227,6 +244,7 @@ fn devices(
         let config_target = field("configuration_upload/target");
         let config_target = if config_target.split('/').any(|seg| seg == "..")
             || config_target.contains(['?', '#'])
+            || config_target.contains('%')
         {
             String::new()
         } else {

@@ -220,7 +220,9 @@ pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
         if live.poll_errors < 2 {
             return Err(err);
         }
-        if let Some(mut dead) = guard.take() {
+        let dead = guard.take();
+        drop(guard);
+        if let Some(mut dead) = dead {
             let _ = dead.socket.close(None);
         }
         return Err(format!("Lost contact with {host}: {err}"));

@@ -812,8 +812,11 @@ fn tune_kmu(
             known
         }
         "percent" => {
-            if percent <= -100.0 {
-                warnings.push("Percent adjustment must be greater than -100.".into());
+            if percent < -99.0 {
+                warnings.push(
+                    "Percent adjustment must be at least -99 - past that the MU target collapses."
+                        .into(),
+                );
                 return empty_kmu(warnings);
             }
             if percent > 100.0 {
@@ -1145,8 +1148,8 @@ fn is_sigma_band(elem: &Elem) -> bool {
 }
 
 fn band_coeffs(elem: &Elem) -> Option<(f64, f64, f64, f64, f64, f64)> {
-    let min_e = elem.attr("min_energy")?.parse::<f64>().ok()?;
-    let max_e = elem.attr("max_energy")?.parse::<f64>().ok()?;
+    let min_e = elem.attr("min_energy")?.trim().parse::<f64>().ok()?;
+    let max_e = elem.attr("max_energy")?.trim().parse::<f64>().ok()?;
     if !min_e.is_finite() || !max_e.is_finite() {
         return None;
     }
@@ -1154,6 +1157,7 @@ fn band_coeffs(elem: &Elem) -> Option<(f64, f64, f64, f64, f64, f64)> {
     // min/max skip guard and poison the fit.
     let coeff = |name: &str| {
         elem.attr(name)?
+            .trim()
             .parse::<f64>()
             .ok()
             .filter(|v| v.is_finite())
@@ -1552,7 +1556,8 @@ fn text_f64(text: &str) -> f64 {
 
 fn format_k0(value: f64) -> String {
     if !value.is_finite() {
-        return "0".into();
+        // Fail loudly on re-parse - a written 0 would read as a real gain.
+        return "NaN".into();
     }
     if value.abs() >= 1000.0 || (value.abs() > 0.0 && value.abs() < 1e-4) {
         return format!("{value:.6E}");
@@ -1567,7 +1572,7 @@ fn format_k0(value: f64) -> String {
 
 fn format_distance(value: f64) -> String {
     if !value.is_finite() {
-        return "0".into();
+        return "NaN".into();
     }
     let text = format!("{value:.4}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
