@@ -1467,7 +1467,16 @@ fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
     // starts at 0.0; filtering it NaNs the first delivered spot.
     let epoch_scale = stamps.iter().copied().fold(f64::NEG_INFINITY, f64::max) > 1e9;
     let ok = |value: f64| value.is_finite() && (!epoch_scale || value > 0.0);
-    let origin = stamps.iter().copied().find(|value| ok(*value))?;
+    // A stray small stamp (a mislabeled counter in an epoch column) must
+    // not become the origin — a session lasts hours, so an epoch clock's
+    // real stamps sit within days of the max.
+    let max = stamps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let plausible = |value: f64| !epoch_scale || value >= max - 30.0 * 86_400.0;
+    let origin = stamps
+        .iter()
+        .copied()
+        .find(|value| ok(*value) && plausible(*value))
+        .or_else(|| stamps.iter().copied().find(|value| ok(*value)))?;
     Some(
         stamps
             .iter()
@@ -6123,7 +6132,7 @@ b,2
         // Groups order by first stamp; an overlapping group's handoff
         // gap used to go negative — a delivery time can't.
         let got = spot_delivery_ms(&[1000.0, 1500.0, 2000.0], &[1.0, 2.0, 1.0]);
-        assert!(got.iter().all(|v| *v >= 0.0), "{got:?}");
+        assert_eq!(got, vec![1000.0, 0.0, 1000.0]);
     }
 
     #[test]

@@ -114,6 +114,31 @@ export function useScrub(
   const pending = useRef(false);
 
   useEffect(() => {
+    // A control value this hook didn't commit (option restore, foreign
+    // writer) must re-seed local state — on/speed/window would otherwise
+    // stay at the mount-time values forever.
+    const last = lastSent.current;
+    if (
+      last.on !== reported.on ||
+      last.speed !== reported.speed ||
+      last.window !== reported.window
+    ) {
+      lastSent.current = {
+        ...last,
+        on: reported.on,
+        speed: reported.speed,
+        window: reported.window,
+      };
+      setPlay((current) => ({
+        ...current,
+        on: reported.on,
+        speed: reported.speed,
+        window: reported.window,
+      }));
+    }
+  }, [reported.on, reported.speed, reported.window]);
+
+  useEffect(() => {
     commitRef.current = commit;
   }, [commit]);
 

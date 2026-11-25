@@ -1837,9 +1837,19 @@ mod tests {
             .find(|line| line.starts_with("Total dose target"))
             .unwrap_or("");
         // Both in nC: the raw 2.0e8 total and 0.3 C of targets x 1e9.
-        assert!(dose_line.contains("200000000"), "dose line: {dose_line}");
+        let parsed = |line: &str, label: &str| -> f64 {
+            line.strip_prefix(label)
+                .and_then(|tail| tail.parse::<f64>().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let dose = parsed(dose_line, "Secondary total charge (nC): ");
         assert!(
-            target_line.contains("3000000"),
+            (dose - 2.0e8).abs() <= dose.abs() * 0.001,
+            "dose line: {dose_line}"
+        );
+        let target = parsed(target_line, "Total dose target: ");
+        assert!(
+            (target - 3.0e8).abs() <= target.abs() * 0.001,
             "target line: {target_line}"
         );
         std::fs::remove_dir_all(&dir).ok();

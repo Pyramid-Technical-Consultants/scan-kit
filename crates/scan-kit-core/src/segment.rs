@@ -408,6 +408,9 @@ fn beam_keep(gate: Option<&[f32]>, state: BeamGate, keep: &mut [bool]) {
     let Some(gate) = gate else {
         return;
     };
+    for slot in keep.iter_mut().skip(gate.len()) {
+        *slot = false;
+    }
     for (slot, value) in keep.iter_mut().zip(gate) {
         // Same gate as beam_on_mask / plateau_mean: unknown (non-finite) is off.
         let on = value.is_finite() && *value > 0.5;
@@ -480,6 +483,9 @@ fn range_keep(column: Option<&[f32]>, lo: f32, hi: f32, keep: &mut [bool]) {
     };
     // The form does not force the lower box to stay below the upper one.
     let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    for slot in keep.iter_mut().skip(column.len()) {
+        *slot = false;
+    }
     for (slot, value) in keep.iter_mut().zip(column) {
         *slot = *slot && value.is_finite() && *value >= lo && *value <= hi;
     }
@@ -489,6 +495,9 @@ fn compare_keep(column: Option<&[f32]>, op: CompareOp, threshold: f32, keep: &mu
     let Some(column) = column else {
         return;
     };
+    for slot in keep.iter_mut().skip(column.len()) {
+        *slot = false;
+    }
     for (slot, value) in keep.iter_mut().zip(column) {
         let pass = value.is_finite()
             && match op {

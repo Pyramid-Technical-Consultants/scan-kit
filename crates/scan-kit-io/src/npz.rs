@@ -482,7 +482,7 @@ mod tests {
         for v in [0.0f32, 1.0, -1.0, 0.5, 65_504.0, 6e-5, 1e-8, f32::INFINITY] {
             let h = f32_to_f16(v);
             let back = f16_to_f32(h);
-            if v.is_finite() && v.abs() >= 6e-5 && v.abs() < 65_504.0 {
+            if v.is_finite() && v.abs() >= 6e-5 && v.abs() <= 65_504.0 {
                 assert!((back - v).abs() <= v.abs() * 0.001 + 1e-7, "{v} -> {back}");
             } else {
                 assert_eq!(back.is_infinite(), v.is_infinite(), "{v}");

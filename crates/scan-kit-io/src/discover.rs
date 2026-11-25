@@ -1462,6 +1462,7 @@ mod tests {
         #[cfg(not(any(unix, windows)))]
         let linked: std::io::Result<()> = Ok(());
         let Ok(()) = linked else {
+            eprintln!("skipping: symlink_dir needs a privileged context");
             let _ = fs::remove_dir_all(&root);
             return;
         };
@@ -1514,7 +1515,13 @@ mod tests {
 ",
         )
         .unwrap();
-        let err = discover(&root, &mut |_, _| false).err().unwrap();
+        let mut calls = 0u32;
+        let err = discover(&root, &mut |_, _| {
+            calls += 1;
+            calls == 1
+        })
+        .err()
+        .unwrap();
         assert!(err.contains("cancelled"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }

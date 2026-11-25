@@ -797,6 +797,11 @@ fn confidence_scene(
             for (slot, pass) in keep.iter_mut().zip(&other) {
                 *slot = *slot && *pass;
             }
+            // A shorter confidence table must not leave its tail
+            // peaks-only — masked_pairs reads a missing slot as pass.
+            for slot in keep.iter_mut().skip(other.len()) {
+                *slot = false;
+            }
             let (xs, ys) = masked_pairs(
                 peaks.get(peak_key).map(Vec::as_slice).unwrap_or(&[]),
                 confidence.get(conf_key).map(Vec::as_slice).unwrap_or(&[]),

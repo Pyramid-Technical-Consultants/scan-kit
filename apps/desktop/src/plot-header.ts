@@ -278,8 +278,11 @@ export function watchDpr(refit: () => void): () => void {
   let media: MediaQueryList | null = null;
   const onChange = () => {
     media?.removeEventListener("change", onChange);
-    refit();
-    arm();
+    try {
+      refit();
+    } finally {
+      arm();
+    }
   };
   const arm = () => {
     media = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);

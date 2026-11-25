@@ -378,11 +378,16 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        // Root has no parent — `.` would open the app's cwd instead.
-        let folder = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("/"));
+        // xdg-open can't select inside a folder — for a file open its
+        // parent, for a directory open the directory itself like the
+        // Windows arm. Root has no parent — `.` would open the app's cwd.
+        let folder = if path.is_dir() {
+            path
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("/"))
+        };
         vec![folder.as_os_str().to_os_string()]
     }
 }

@@ -95,13 +95,21 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
     // span pads around its midpoint too).
     let (xmin, xmax) = if xmax <= xmin || xmin.is_nan() || xmax.is_nan() {
         let mid = (xmin + xmax) / 2.0;
-        (mid - 0.5, mid + 0.5)
+        if mid.is_finite() {
+            (mid - 0.5, mid + 0.5)
+        } else {
+            (0.0, 1.0)
+        }
     } else {
         (xmin, xmax)
     };
     let (ymin, ymax) = if ymax <= ymin || ymin.is_nan() || ymax.is_nan() {
         let mid = (ymin + ymax) / 2.0;
-        (mid - 0.5, mid + 0.5)
+        if mid.is_finite() {
+            (mid - 0.5, mid + 0.5)
+        } else {
+            (0.0, 1.0)
+        }
     } else {
         (ymin, ymax)
     };

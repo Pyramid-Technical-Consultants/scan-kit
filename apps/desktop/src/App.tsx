@@ -330,7 +330,7 @@ export default function App() {
   const selectedIds = selectionOrder;
   // Sessions can live in any indexed location — anchor analysis to the
   // first selected row's own library, not locations[0].
-  const folder = rows.find((row) => selectedIds.includes(row.session_id))?.library ?? locations[0] ?? null;
+  const folder = rows.find((row) => row.session_id === selectedIds[0])?.library ?? locations[0] ?? null;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const noRows = catalog === "Sessions" ? rows.length === 0 : exams.length === 0;
   const catalogWaiting = noRows && (!locationsKnown || libraryLoading);
@@ -541,6 +541,9 @@ export default function App() {
       // root inside index_library's transaction and republish it.
       const epoch = ++catalogEpoch.current;
       pendingLocations.current = [];
+      // A running index of this root would finish after the forget and
+      // republish it — the next poll must see the superseded token.
+      libraryToken.current = {};
       try {
         const payload = await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path });
         // A newer open/indexMany that landed during the invoke already
@@ -1072,7 +1075,12 @@ export default function App() {
     );
   }, []);
 
+  const folderDialog = useRef(false);
   async function chooseFolder() {
+    if (folderDialog.current) {
+      return;
+    }
+    folderDialog.current = true;
     try {
       const selected = await open({
         directory: true,
@@ -1084,6 +1092,8 @@ export default function App() {
       }
     } catch (error) {
       notifyError(error);
+    } finally {
+      folderDialog.current = false;
     }
   }
 
@@ -1379,7 +1389,11 @@ export default function App() {
                 )}
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
-                  void navigator.clipboard?.writeText(id).then(
+                  if (navigator.clipboard == null) {
+                    notifyError("Could not copy the session id");
+                    return;
+                  }
+                  void navigator.clipboard.writeText(id).then(
                     () => notify(`Copied session ${id}`),
                     () => notifyError("Could not copy the session id"),
                   );
@@ -1611,7 +1625,7 @@ export default function App() {
             className="grid gap-4"
             onSubmit={(event) => {
               event.preventDefault();
-              if (passwordFor == null) {
+              if (passwordFor == null || passwordSubmitted.current) {
                 return;
               }
               const spec = passwordFor;

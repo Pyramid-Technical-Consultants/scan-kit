@@ -1691,7 +1691,7 @@ mod tests {
         let path = dir.join("store.db");
         let conn = open_connection(&path).unwrap();
         prefs_set(&conn, PREF_APP_SETTINGS, &json!({"window": "live"})).unwrap();
-        std::fs::write(dir.join("app_settings.json"), r#"{"window": "stale"}"#).unwrap();
+        // (The file body is what import prefetches — passed directly.)
         // A DB that predates the import marker must not have its live
         // settings reverted by the stale legacy file.
         import_app_settings_body(&conn, true, Some(json!({"window": "stale"}))).unwrap();

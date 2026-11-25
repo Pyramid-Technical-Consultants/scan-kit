@@ -541,6 +541,11 @@ export function ConfigTuning({
         editSeq.current += 1;
       }
     } catch (caught) {
+      // The Toggle snaps back to `hideUnused` — the ref must too, or
+      // save() persists a flag the UI shows as off.
+      if (seq === hideSeq.current) {
+        hideUnusedRef.current = hideUnused;
+      }
       notifyError(caught);
     }
   }

@@ -552,6 +552,9 @@ fn span(series: &[Series]) -> (f32, f32, f32, f32) {
     if !xmin.is_finite() {
         return (0.0, 1.0, 0.0, 1.0);
     }
+    if !(xmin <= xmax && ymin <= ymax) {
+        return (0.0, 1.0, 0.0, 1.0);
+    }
     if (xmax - xmin).abs() < 1e-4 {
         xmin -= 0.5;
         xmax += 0.5;

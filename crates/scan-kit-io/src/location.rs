@@ -2315,7 +2315,7 @@ mod tests {
     #[test]
     fn flat_and_nested_markers_stamp_the_same_one_they_fingerprint() {
         // Both markers present: fingerprint and stamp must pick the same one
-        // (flat first, like storage_fingerprint) or every scan re-copies.
+        // (nested first, like the remote probe order) or every scan re-copies.
         let url = format!(
             "sftp://u@host.invalid/both/{}/{}",
             std::process::id(),
