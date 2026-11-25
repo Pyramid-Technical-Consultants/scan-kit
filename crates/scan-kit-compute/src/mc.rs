@@ -358,6 +358,13 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         .ok_or_else(|| ComputeError::Message(format!("no material {}", request.medium)))?
         as i32;
     let n = request.energy.len();
+    // The shader bounds voxel_index against f32(dims) — an odd axis past
+    // 2^24 rounds up and admits the boundary index into the next row.
+    if request.shape.iter().any(|dim| *dim > (1 << 23)) {
+        return Err(ComputeError::Message(
+            "a grid axis cannot exceed 8M voxels".into(),
+        ));
+    }
     // A ragged spot array silently truncates or zero-fills a spot —
     // same contract patient_launch already enforces.
     if [

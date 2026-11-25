@@ -130,12 +130,14 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
         patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
         id_dates(&mut bytes)?;
         patient::cs(&mut bytes, 0x0008, 0x0060, "CT")?;
+        patient::empty(&mut bytes, 0x0008, 0x0070, b"LO")?;
         patient::empty(&mut bytes, 0x0008, 0x0090, b"PN")?;
         patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
         patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
         patient::empty(&mut bytes, 0x0010, 0x0030, b"DA")?;
         patient::empty(&mut bytes, 0x0010, 0x0040, b"CS")?;
         patient::ds(&mut bytes, 0x0018, 0x0050, &[dz as f32])?;
+        patient::empty(&mut bytes, 0x0018, 0x0060, b"DS")?;
         patient::cs(&mut bytes, 0x0018, 0x5100, &request.position)?;
         patient::ui(&mut bytes, 0x0020, 0x000D, &study)?;
         patient::ui(&mut bytes, 0x0020, 0x000E, &ct_series)?;
@@ -155,6 +157,7 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
             &[column_sign as f32, 0.0, 0.0, 0.0, row_sign as f32, 0.0],
         )?;
         patient::ui(&mut bytes, 0x0020, 0x0052, &frame)?;
+        patient::empty(&mut bytes, 0x0020, 0x1040, b"LO")?;
         patient::us(&mut bytes, 0x0028, 0x0002, 1)?;
         patient::cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
         patient::us(&mut bytes, 0x0028, 0x0010, request.ny as u16)?;
@@ -280,6 +283,7 @@ fn write_struct(
     patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
     id_dates(&mut bytes)?;
     patient::cs(&mut bytes, 0x0008, 0x0060, "RTSTRUCT")?;
+    patient::empty(&mut bytes, 0x0008, 0x0070, b"LO")?;
     patient::empty(&mut bytes, 0x0008, 0x0090, b"PN")?;
     patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
     patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
@@ -290,6 +294,7 @@ fn write_struct(
     patient::empty(&mut bytes, 0x0020, 0x0010, b"SH")?;
     patient::empty(&mut bytes, 0x0020, 0x0011, b"IS")?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
+    patient::empty(&mut bytes, 0x0020, 0x1040, b"LO")?;
     patient::sh(&mut bytes, 0x3006, 0x0002, "Synthetic")?;
     patient::empty(&mut bytes, 0x3006, 0x0008, b"DA")?;
     patient::empty(&mut bytes, 0x3006, 0x0009, b"TM")?;
@@ -376,6 +381,7 @@ fn write_plan(
     patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
     id_dates(&mut bytes)?;
     patient::cs(&mut bytes, 0x0008, 0x0060, "RTPLAN")?;
+    patient::empty(&mut bytes, 0x0008, 0x0070, b"LO")?;
     patient::empty(&mut bytes, 0x0008, 0x0090, b"PN")?;
     patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
     patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
@@ -386,6 +392,7 @@ fn write_plan(
     patient::empty(&mut bytes, 0x0020, 0x0010, b"SH")?;
     patient::empty(&mut bytes, 0x0020, 0x0011, b"IS")?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
+    patient::empty(&mut bytes, 0x0020, 0x1040, b"LO")?;
     patient::sh(&mut bytes, 0x300A, 0x0002, "SYNTH")?;
     patient::empty(&mut bytes, 0x300A, 0x0006, b"DA")?;
     patient::empty(&mut bytes, 0x300A, 0x0007, b"TM")?;
@@ -485,6 +492,12 @@ fn write_plan(
         patient::cs(&mut item, 0x300A, 0x00C4, "STATIC")?;
         patient::cs(&mut item, 0x300A, 0x00C6, "PROTON")?;
         patient::cs(&mut item, 0x300A, 0x00CE, "TREATMENT")?;
+        // The wedge/compensator/bolus/block counts are Type 1 — a beam
+        // without them still writes the zero.
+        patient::is(&mut item, 0x300A, 0x00D0, 0)?;
+        patient::is(&mut item, 0x300A, 0x00E0, 0)?;
+        patient::is(&mut item, 0x300A, 0x00ED, 0)?;
+        patient::is(&mut item, 0x300A, 0x00F0, 0)?;
         patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
         patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
@@ -499,6 +512,9 @@ fn write_plan(
             patient::cs(&mut shifter, 0x300A, 0x0320, "BINARY")?;
             patient::sq(&mut item, 0x300A, 0x0314, &[shifter])?;
         }
+        // Lateral spreading devices and range modulators are Type 1 counts.
+        patient::is(&mut item, 0x300A, 0x0330, 0)?;
+        patient::is(&mut item, 0x300A, 0x0340, 0)?;
         patient::sq(&mut item, 0x300A, 0x03A8, &cps)?;
         patient::is(&mut item, 0x300C, 0x006A, 1)?;
         item

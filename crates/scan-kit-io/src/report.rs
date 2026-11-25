@@ -240,7 +240,7 @@ enum Op {
 impl Op {
     fn bottom(&self) -> f32 {
         match *self {
-            Op::Text { y, .. } => y + 3.0,
+            Op::Text { y, size, .. } => y + size * 0.3,
             Op::Rule { y } => y + 1.0,
             Op::Image { y, h, .. } => y + h,
         }
@@ -479,7 +479,7 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
                     } => {
                         surface.set_fill(Some(fill(ink)));
                         surface.draw_text(
-                            Point::from_xy(x, PAGE_H - y),
+                            Point::from_xy(x, y),
                             font.clone(),
                             size,
                             &text,
@@ -495,9 +495,10 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
                             ..Default::default()
                         }));
                         let mut path = PathBuilder::new();
-                        path.move_to(MARGIN, PAGE_H - y);
-                        path.line_to(PAGE_W - MARGIN, PAGE_H - y);
+                        path.move_to(MARGIN, y);
+                        path.line_to(PAGE_W - MARGIN, y);
                         surface.draw_path(&path.finish().unwrap());
+                        surface.set_stroke(None);
                     }
                     Op::Image {
                         y,
@@ -507,8 +508,7 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
                         height,
                     } => {
                         let image = Image::from_rgba8(rgba, width, height);
-                        surface
-                            .push_transform(&Transform::from_translate(MARGIN, PAGE_H - (y + h)));
+                        surface.push_transform(&Transform::from_translate(MARGIN, y));
                         surface.draw_image(image, Size::from_wh(TEXT_W, h).unwrap());
                         surface.pop();
                     }

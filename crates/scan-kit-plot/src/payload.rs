@@ -706,6 +706,13 @@ pub(crate) fn decode_plot(
                 .point_runs
                 .iter()
                 .any(|run| !fits(run.start, run.count, marks.points.len()))
+            || batch.point_runs.iter().any(|run| {
+                run.timed && {
+                    let run = &marks.points[run.start as usize..(run.start + run.count) as usize];
+                    run.iter().any(|point| !point.time.is_finite())
+                        || run.windows(2).any(|pair| pair[0].time > pair[1].time)
+                }
+            })
             || batch.clouds.iter().any(|cloud| {
                 !fits(cloud.start, cloud.count, marks.points.len())
                     || cloud.heatmap.is_some_and(|index| {
@@ -716,11 +723,22 @@ pub(crate) fn decode_plot(
             return Err("plot payload index out of range".into());
         }
     }
+    let heated: std::collections::HashSet<u32> = marks
+        .panels
+        .iter()
+        .flat_map(|batch| batch.heats.iter().map(|(quad, _)| *quad))
+        .collect();
     if marks.quads.iter().any(|quad| {
         quad.heatmap
             .is_some_and(|index| index >= marks.heatmaps.len())
+    }) || marks.quads.iter().enumerate().any(|(index, quad)| {
+        // Solid is heat (-0.5,0.5]; a textured or dose heat (0.5,2.5) is
+        // only coherent on a heats-referenced quad — anything else reads
+        // screen-space on the GPU but fills data-space on the CPU.
+        !(-0.5..=0.5).contains(&quad.heat)
+            && !(heated.contains(&(index as u32)) && (0.5..2.5).contains(&quad.heat))
     }) {
-        return Err("plot payload heatmap index out of range".into());
+        return Err("plot payload quad value out of range".into());
     }
     let voxels = header
         .volume_shape

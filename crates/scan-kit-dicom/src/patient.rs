@@ -2374,10 +2374,14 @@ pub fn write_rtdose(
     push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time))?;
     ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS)?;
     ui(&mut bytes, 0x0008, 0x0018, &sop_uid)?;
+    push_elem(&mut bytes, 0x0008, 0x0020, b"DA", &[])?;
     push_elem(&mut bytes, 0x0008, 0x0023, b"DA", &even(&date))?;
+    push_elem(&mut bytes, 0x0008, 0x0030, b"TM", &[])?;
     push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time))?;
+    push_elem(&mut bytes, 0x0008, 0x0050, b"SH", &[])?;
     cs(&mut bytes, 0x0008, 0x0060, "RTDOSE")?;
     lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants")?;
+    push_elem(&mut bytes, 0x0008, 0x0090, b"PN", &[])?;
     // LO/PN hold 64 bytes in the declared charset — take whole chars that fit.
     let cap64 = |text: &str| -> String {
         text.chars()
@@ -2394,6 +2398,8 @@ pub fn write_rtdose(
     let patient_id = cap64(&ct.patient_id);
     pn(&mut bytes, 0x0010, 0x0010, &patient_name)?;
     lo(&mut bytes, 0x0010, 0x0020, &patient_id)?;
+    push_elem(&mut bytes, 0x0010, 0x0030, b"DA", &[])?;
+    push_elem(&mut bytes, 0x0010, 0x0040, b"CS", &[])?;
     ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]])?;
     lo(
         &mut bytes,
@@ -2403,9 +2409,13 @@ pub fn write_rtdose(
     )?;
     ui(&mut bytes, 0x0020, 0x000D, &ct.study_uid)?;
     ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    push_elem(&mut bytes, 0x0020, 0x0010, b"SH", &[])?;
+    push_elem(&mut bytes, 0x0020, 0x0011, b"IS", &[])?;
+    push_elem(&mut bytes, 0x0020, 0x0013, b"IS", &[])?;
     ds(&mut bytes, 0x0020, 0x0032, &ct.origin)?;
     ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
     ui(&mut bytes, 0x0020, 0x0052, &ct.frame)?;
+    push_elem(&mut bytes, 0x0020, 0x1040, b"LO", &[])?;
     // LT holds 10240 characters and forbids backslashes; the provenance
     // JSON carries UIDs and paths that can exceed both.
     // LT forbids backslashes — swap rather than strip or JSON escapes and
@@ -2420,7 +2430,12 @@ pub fn write_rtdose(
     lt(&mut bytes, 0x0020, 0x4000, &comment)?;
     us(&mut bytes, 0x0028, 0x0002, 1)?;
     cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
-    is(&mut bytes, 0x0028, 0x0008, nz as i32)?;
+    is(
+        &mut bytes,
+        0x0028,
+        0x0008,
+        i32::try_from(nz).map_err(|_| "too many frames")?,
+    )?;
     at(&mut bytes, 0x0028, 0x0009, 0x3004, 0x000C)?;
     us(&mut bytes, 0x0028, 0x0010, ny as u16)?;
     us(&mut bytes, 0x0028, 0x0011, nx as u16)?;
@@ -2469,8 +2484,8 @@ pub fn write_rtdose(
         let mut item = Vec::new();
         ui(&mut item, 0x0008, 0x1150, RT_ION_PLAN_CLASS)?;
         ui(&mut item, 0x0008, 0x1155, plan_uid)?;
-        // Referenced RT Plan Sequence — (300C,0060) is the brachy
-        // application setup sequence, a different attribute entirely.
+        // Referenced RT Plan Sequence — not (300C,0060), which is
+        // Referenced Brachy Application Setup Sequence.
         sq(&mut bytes, 0x300C, 0x0002, &[item])?;
     }
     ow32(&mut bytes, 0x7FE0, 0x0010, &pixels)?;

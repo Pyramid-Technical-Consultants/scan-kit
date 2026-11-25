@@ -194,7 +194,7 @@ fn flog(x: f32) -> f32 {
 fn quanta(e_ev: f32) -> i32 {
     // |e_ev| past ~2.1e11 eV makes the i32 conversion indeterminate — clamp
     // so a runaway deposit saturates instead of adding arbitrary tallies.
-    return i32(clamp(floor(e_ev / QUANTUM + urand() - 1e-7), -2.0e9, 2.0e9));
+    return i32(clamp(floor(e_ev / QUANTUM + urand()), -2.0e9, 2.0e9));
 }
 
 fn add_tally(slot: u32, v: i32) {

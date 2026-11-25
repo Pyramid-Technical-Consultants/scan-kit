@@ -1333,8 +1333,8 @@ pub(crate) struct PointRec {
     pub radius: f32,
     pub color: [f32; 4],
     pub id: u32,
-    /// Sample time. Non-finite times are dropped at encode, so every record
-    /// that reaches the payload has a finite time.
+    /// Sample time. Timed series drop non-finite samples at build; untimed
+    /// points ship `NaN` and are only read when a run flags `timed`.
     pub time: f32,
 }
 
@@ -5273,11 +5273,18 @@ pub(crate) struct LineStamp {
 pub(crate) fn line_stamp(panels: &[Panel]) -> LineStamp {
     let mut state = 0x9E37_79B1_85EB_CA87u64;
     let mut prefix = 0u32;
+    // Series ordinals are baked into the reused bytes — every series in
+    // every panel consumes one, so hidden panels and non-polylines still
+    // advance the counter and a scene edit can't donate stale ids.
+    let mut next_id = 1u32;
     for panel in panels {
-        if hides_polylines(panel) {
-            continue;
-        }
+        let hidden = hides_polylines(panel);
         for series in &panel.series {
+            let id = next_id;
+            next_id = next_id.saturating_add(1);
+            if hidden {
+                continue;
+            }
             let Series::Polyline {
                 xs,
                 ys,
@@ -5287,6 +5294,7 @@ pub(crate) fn line_stamp(panels: &[Panel]) -> LineStamp {
             else {
                 continue;
             };
+            state = mix(state, u64::from(id));
             state = mix(state, xs.len() as u64);
             state = mix(state, ys.len() as u64);
             for value in xs.iter().chain(ys) {

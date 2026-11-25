@@ -175,6 +175,7 @@ fn walk_local(
     }
     for child in &children {
         let Ok(kind) = child.file_type() else {
+            *walk_failed = true;
             continue;
         };
         if kind.is_symlink() || !kind.is_file() {
@@ -195,6 +196,7 @@ fn walk_local(
     }
     for child in &children {
         let Ok(kind) = child.file_type() else {
+            *walk_failed = true;
             continue;
         };
         // A leftover download staging dir holds a bare "session/" tree that
@@ -406,12 +408,19 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
             extras.push(base.join("input_map.csv"));
             extras.push(base.join("spot_data.csv"));
         }
+        // Flat layout has root == storage — each probe pushed twice would
+        // xor itself out of the fingerprint.
+        extras.sort();
+        extras.dedup();
         let served = root.join("termination_summary.txt");
         let outer = storage.join("termination_summary.txt");
         // The inner dir's mtime freezes once the layer/run dirs exist —
         // input_map.csv moves on every row write, so probe it too.
         let served_rows = root.join("input_map.csv");
         let outer_rows = storage.join("input_map.csv");
+        // Stat every marker candidate, not only the probed target — an
+        // mtime-preserving swap between slots would alias the tuple.
+        extras.extend([served.clone(), outer.clone()]);
         if served.is_file() {
             served
         } else if outer.is_file() {
@@ -434,6 +443,8 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
         .ok()?
         .as_nanos();
     let mut size = meta.len();
+    extras.sort();
+    extras.dedup();
     for probe in extras {
         // Xor rather than max: a rewrite that does not take the newest mtime
         // still moves the fingerprint.
@@ -506,7 +517,12 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     }
     members
         .into_iter()
-        .find(|(name, _)| normalize_member(name).ends_with(&suffix))
+        .find(|(name, _)| {
+            let name = normalize_member(name);
+            // The fallback exists for the nested `sess/sess/` layout —
+            // deeper paths are per-run files, not the session marker.
+            name.ends_with(&suffix) && name.split('/').count() <= 3
+        })
         .map(|(_, bytes)| bytes)
 }
 
@@ -654,16 +670,19 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if let Some(catalog) = crate::location::catalog_directory(library, session_id) {
         return catalog;
     }
-    if let Some(recorded) = crate::location::recorded_anywhere(session_id) {
-        return recorded;
-    }
     // The root resolves only for the session it actually is — a data dir
     // that is itself a session must not answer every session id with its
     // files (a foreign id reaching here reads the wrong session's map).
+    // It runs before recorded_anywhere: that helper parses the "a · b"
+    // display-key form, and a real folder literally named "a · b" must not
+    // be split onto a different session's directory.
     if library.file_name().is_some_and(|name| name == session_id)
         && marker_file(&library.join("input_map.csv"))
     {
         return library.to_path_buf();
+    }
+    if let Some(recorded) = crate::location::recorded_anywhere(session_id) {
+        return recorded;
     }
     flat
 }
@@ -748,6 +767,8 @@ fn file_name(path: &Path) -> Option<String> {
 pub(crate) use scan_kit_core::valid_session_id;
 
 fn is_timeslice(name: &str) -> bool {
+    // Run-index prefixes ("000_timeslice_...") are real frame names —
+    // match the leaf's suffix.
     normalize_member(name).ends_with("timeslice_data_device_units.csv")
 }
 
