@@ -432,8 +432,19 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
             else {
                 continue;
             };
-            let time = col(&columns, "time")
+            // The capacitance integrates real milliseconds — the device
+            // file's "time" column is ms, time_s is seconds, timestamp is
+            // epoch ms. When no clock resolves the index axis draws the
+            // trace but the measured pF must not be fabricated.
+            let clock = col(&columns, "time")
                 .map(|values| values.to_vec())
+                .or_else(|| {
+                    col(&columns, "time_s")
+                        .map(|values| values.iter().map(|v| v * 1000.0).collect::<Vec<f32>>())
+                })
+                .or_else(|| col(&columns, "timestamp").map(|values| values.to_vec()));
+            let time = clock
+                .clone()
                 .unwrap_or_else(|| (0..current.len()).map(|i| i as f32).collect());
             let (t0, t1) = hv_step_window(&time, current).unwrap_or((
                 time.first().copied().unwrap_or(0.0),
@@ -442,10 +453,14 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
             let config = hv_config_text(root, session, device);
             // Without the nozzle config's step voltages there is no measured
             // capacitance — don't fabricate one from an assumed 80 V step.
-            let measured = config
-                .as_deref()
-                .and_then(hv_delta_v)
-                .and_then(|delta_v| hv_capacitance_pf(&time, current, t0, t1, delta_v));
+            let measured = if clock.is_none() {
+                None
+            } else {
+                config
+                    .as_deref()
+                    .and_then(hv_delta_v)
+                    .and_then(|delta_v| hv_capacitance_pf(&time, current, t0, t1, delta_v))
+            };
             let expected = config.as_deref().and_then(hv_expected_pf);
             let result = session_text(root, session, &format!("ic_hv_toggle/{device}_result.json"));
             let (overall, flags) = hv_firmware_flags(&result);

@@ -68,7 +68,9 @@ pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
         "columns": listed,
         // The energy column has one row per spot - layers are the distinct
         // energies, not the row count.
-        "energy_layers": energy.iter().map(|e| e.to_bits()).collect::<std::collections::BTreeSet<_>>().len(),
+        // NaN to_bits is a distinct pattern — a corrupt cell must not
+        // count as an energy layer.
+        "energy_layers": energy.iter().filter(|e| e.is_finite()).map(|e| e.to_bits()).collect::<std::collections::BTreeSet<_>>().len(),
     })
 }
 

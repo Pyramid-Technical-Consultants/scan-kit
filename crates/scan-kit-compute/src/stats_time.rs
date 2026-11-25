@@ -65,6 +65,11 @@ fn reduce_input(
     var count = 0u;
     for (var i = gid.x * 256u + lid.x; i < n; i = i + stride) {
         let v = input[i];
+        // reduce_finite drops non-finite samples — the GPU must match or
+        // NaN folds into sum/count and min/max is driver-indeterminate.
+        if (!(abs(v) <= 3.4028235e38)) {
+            continue;
+        }
         if (count == 0u) {
             lo = v;
             hi = v;

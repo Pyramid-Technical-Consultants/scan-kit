@@ -334,10 +334,11 @@ fn fetch_sheet(host: &str, io_root: &str, table: &str) -> Result<Option<Sheet>, 
 }
 
 fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
+    // Banner lines strip manually — a `#`-first data row or header is real
+    // content, not a comment (see columns::strip_csv_banner).
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
-        .comment(Some(b'#'))
-        .from_reader(bytes);
+        .from_reader(crate::columns::strip_csv_banner(bytes));
     let header: Vec<String> = reader
         .headers()
         .ok()?

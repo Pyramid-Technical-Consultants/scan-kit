@@ -114,7 +114,13 @@ pub fn dvh_csv(curves: &[DvhCurve], effective: bool) -> Result<String, String> {
         out.push(',');
         // A stray quote would open a quoted field on re-parse and swallow the
         // rest of the header line.
-        out.push_str(&curve.name.replace([',', '\n', '\r', '"'], " "));
+        let mut name = curve.name.replace([',', '\n', '\r', '"'], " ");
+        // A leading formula char would evaluate when the CSV lands in a
+        // spreadsheet — the ' prefix keeps the name legible and inert.
+        if name.starts_with(['=', '+', '-', '@']) {
+            name.insert(0, '\'');
+        }
+        out.push_str(&name);
         out.push_str(" volume %");
     }
     out.push('\n');

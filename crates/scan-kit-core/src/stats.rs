@@ -237,6 +237,13 @@ mod tests {
         assert!(quantiles_at(&mut [], &qs)
             .iter()
             .all(|value| value.is_nan()));
+        // The sort oracle shares the function's convention — only literal
+        // values pin the interpolation rule itself.
+        let mut four = vec![0.0, 10.0, 20.0, 30.0];
+        assert_eq!(
+            quantiles_at(&mut four, &[0.25, 0.5, 0.75]),
+            [7.5, 15.0, 22.5]
+        );
     }
 
     #[test]

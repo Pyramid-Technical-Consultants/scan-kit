@@ -183,6 +183,10 @@ export function ConfigTuning({
   const dirtyRef = useRef(false);
   const editSeq = useRef(0);
   const hideSeq = useRef(0);
+  // Two rapid clicks must write in click order — spawn_blocking completion
+  // order is not guaranteed and last-write-wins would leave the persisted
+  // flag disagreeing with the checkbox.
+  const hideChain = useRef<Promise<unknown>>(Promise.resolve());
   const busyRef = useRef(false);
   const leftPane = useRef<HTMLDivElement>(null);
   const previewDrag = useRef(PREVIEW_RATIO);
@@ -522,8 +526,12 @@ export function ConfigTuning({
 
   async function toggleHide(next: boolean) {
     const seq = ++hideSeq.current;
+    const run = hideChain.current.then(() =>
+      invoke("scan_kit_config_hide", { hideUnused: next }),
+    );
+    hideChain.current = run.catch(() => undefined);
     try {
-      await invoke("scan_kit_config_hide", { hideUnused: next });
+      await run;
       // A slower earlier call must not overwrite the newest click.
       if (seq === hideSeq.current) {
         setHideUnused(next);

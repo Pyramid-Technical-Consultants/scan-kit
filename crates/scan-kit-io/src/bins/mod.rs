@@ -505,9 +505,13 @@ enum Trend {
 }
 
 fn trend_mode(options: &Value) -> Trend {
-    match text(options, "trend", "Off") {
-        "Linear" | "linear" | "On" | "on" | "true" | "1" => Trend::Linear,
-        "Polynomial" | "polynomial" => Trend::Polynomial,
+    match text(options, "trend", "Off")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "linear" | "on" | "true" | "1" => Trend::Linear,
+        "polynomial" => Trend::Polynomial,
         _ => Trend::Off,
     }
 }

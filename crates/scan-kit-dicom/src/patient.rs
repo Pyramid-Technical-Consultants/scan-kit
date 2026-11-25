@@ -3863,7 +3863,7 @@ mod tests {
         ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
         is(&mut cp, 0x300A, 0x0392, 1).unwrap();
         ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
-        for mode in ["", "MODULATED"] {
+        for (mode, reason) in [("", "scan mode"), ("MODULATED", "weights")] {
             let mut beam = Vec::new();
             is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
             if !mode.is_empty() {
@@ -3878,10 +3878,7 @@ mod tests {
             let message = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS")
                 .err()
                 .unwrap_or_default();
-            assert!(
-                message.contains("scan mode") || message.contains("weights"),
-                "{message}"
-            );
+            assert!(message.contains(reason), "{message}");
         }
     }
 

@@ -1146,14 +1146,19 @@ fn channel_geometry(id: &str) -> bool {
 
 fn length_mm(lower: &str) -> bool {
     matches!(lower, "ic1_x" | "ic1_y" | "ic2_x" | "ic2_y")
-        || lower.contains("sig")
-        || lower.contains("err")
-        || lower.contains("pos")
-        || lower.contains("diff")
+        || lower
+            .split('_')
+            .any(|part| matches!(part, "sig" | "err" | "pos" | "diff"))
 }
 
 fn command_volt(lower: &str) -> bool {
-    lower.contains("amp") || matches!(lower, "c_x" | "c_y" | "r_xv" | "r_yv")
+    // "sample_rate" contains "amp" — the amplifier name has to be a whole
+    // token, not a substring.
+    lower.contains("amplifier")
+        || lower == "amp"
+        || lower.contains("amp_")
+        || lower.ends_with("_amp")
+        || matches!(lower, "c_x" | "c_y" | "r_xv" | "r_yv")
 }
 
 fn channel_unit(id: &str) -> Option<&'static str> {

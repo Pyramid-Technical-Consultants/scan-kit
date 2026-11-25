@@ -114,7 +114,10 @@ fn acquire(flag: &'static AtomicBool, busy: &str) -> Result<BusyFlag, String> {
 pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     let _connect = acquire(&CONNECT_BUSY, "a connect is already in progress")?;
     let host = parse_host(host)?;
-    disconnect();
+    // Open and handshake before touching LIVE — a failed attempt must not
+    // take down the working session. The generation still snapshots before
+    // the open phase, so a disconnect landing mid-open aborts this connect
+    // without the old session being torn down by us twice.
     let generation = DISCONNECTS.load(Ordering::Acquire);
     let mut socket =
         open_socket(&host).map_err(|err| format!("Could not connect to {host}: {err}"))?;
@@ -149,6 +152,11 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
             let gone = connection_gone(guard.is_some());
             drop(guard);
             return Err(gone);
+        }
+        // Swap: the old session is only retired now that the new one
+        // survived the open phase.
+        if let Some(mut old) = guard.take() {
+            let _ = old.socket.close(None);
         }
         *guard = Some(Live {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,

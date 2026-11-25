@@ -1329,7 +1329,10 @@ mod tests {
         assert!(integrate > 0.0);
         assert!(maximum <= 4.0 + 1e-3);
         assert!(transparent > 0.0);
-        assert!(integrate != maximum || transparent != maximum);
+        // The axis chord runs length-1 through the hot voxel, so integrate
+        // coincides with maximum on this fixture — pin the fog composite
+        // strictly below the peak it attenuates.
+        assert!(transparent < maximum, "fog {transparent} vs max {maximum}");
     }
 
     #[test]

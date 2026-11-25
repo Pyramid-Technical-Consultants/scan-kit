@@ -191,8 +191,9 @@ pub fn load_npz(path: &Path) -> Result<BTreeMap<String, Npy>, String> {
 /// Write a deflated `.npz` (`np.savez_compressed` compatible); each pair's
 /// string becomes the entry name without its `.npy` suffix.
 pub fn write_npz(path: &Path, entries: &[(String, Npy)]) -> Result<(), String> {
-    let file = fs::File::create(path).map_err(|err| format!("{path:?}: {err}"))?;
-    let mut writer = zip::ZipWriter::new(file);
+    // Build the archive in memory and land it atomically — a mid-write
+    // error must not leave a truncated zip at the destination.
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     for (name, entry) in entries {
@@ -203,8 +204,8 @@ pub fn write_npz(path: &Path, entries: &[(String, Npy)]) -> Result<(), String> {
             .write_all(&serialize_npy(entry)?)
             .map_err(|err| err.to_string())?;
     }
-    writer.finish().map_err(|err| err.to_string())?;
-    Ok(())
+    let done = writer.finish().map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(path, &done.into_inner())
 }
 
 pub fn npy_f64(shape: &[usize], data: &[f64]) -> Npy {
@@ -325,9 +326,19 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
     if let Some((_, rest)) = header.split_once("fortran_order") {
         // Fail closed — NumPy treats any truthy literal as Fortran order,
         // so anything not an explicit False is rejected, not pattern-matched.
-        let value = rest
-            .trim_start_matches(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ':');
-        if !(value.starts_with("False") || value.starts_with("false")) {
+        // The value follows the key's ':'. A quoted 'False' is a truthy
+        // string to NumPy — still Fortran order — and 'Falsehood' must not
+        // pass on its prefix either.
+        let after = rest.split_once(':').map(|(_, tail)| tail).unwrap_or("");
+        let value = after.trim_start();
+        if value.starts_with('\'') || value.starts_with('"') {
+            return Err("fortran npy".into());
+        }
+        let tail = value
+            .strip_prefix("False")
+            .or_else(|| value.strip_prefix("false"))
+            .ok_or("fortran npy")?;
+        if tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             return Err("fortran npy".into());
         }
     }

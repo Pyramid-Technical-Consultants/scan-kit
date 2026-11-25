@@ -432,7 +432,10 @@ fn source_for(headers: &[String], requested: &str) -> Source {
             // The r_ prefix marks raw coulombs needing derived.scale; a
             // resolved source without it (G3 names are already nA) must
             // not inherit the 1e12 factor.
-            let scale = if raws.iter().all(|raw| raw.starts_with("r_")) {
+            let scale = if raws
+                .iter()
+                .all(|raw| normalize_column_name(raw).starts_with("r_"))
+            {
                 derived.scale
             } else {
                 1.0
@@ -454,11 +457,24 @@ fn header_index(headers: &[String], raw: &str) -> Option<usize> {
     headers.iter().position(|header| header == raw)
 }
 
+/// Instrument exports sometimes banner a file with leading `#` lines —
+/// those are comments before the header. The csv comment option can't be
+/// used: it would also drop a `#`-prefixed header line and any data row
+/// whose first field starts with `#`.
+pub(crate) fn strip_csv_banner(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first() == Some(&b'#') {
+        bytes = match bytes.iter().position(|&b| b == b'\n') {
+            Some(end) => &bytes[end + 1..],
+            None => &bytes[bytes.len()..],
+        };
+    }
+    bytes
+}
+
 fn header_of(bytes: &[u8]) -> Result<Vec<String>, String> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
-        .comment(Some(b'#'))
-        .from_reader(bytes);
+        .from_reader(strip_csv_banner(bytes));
     let headers = reader.headers().map_err(|err| err.to_string())?;
     Ok(headers.iter().map(clean_header).collect())
 }
@@ -470,8 +486,7 @@ struct IndexedCsv {
 fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
-        .comment(Some(b'#'))
-        .from_reader(bytes);
+        .from_reader(strip_csv_banner(bytes));
     // The header row is consumed so the records below are data.
     reader.headers().map_err(|err| err.to_string())?;
     let mut columns = vec![Vec::new(); indexes.len()];
@@ -496,8 +511,7 @@ fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
 fn count_rows(bytes: &[u8]) -> Result<usize, String> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
-        .comment(Some(b'#'))
-        .from_reader(bytes);
+        .from_reader(strip_csv_banner(bytes));
     let mut rows = 0;
     for record in reader.records() {
         record.map_err(|err| err.to_string())?;

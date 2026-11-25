@@ -88,7 +88,9 @@ fn stats_rel(
     if (i < P.n && n > 0.0) {
         let dose = dose_sum[i];
         if (dose > 0.5 * bitcast<f32>(atomicLoad(&stats[0u]))) {
-            acc = sqrt(max(n * (dose_sq[i] * n / (dose * dose) - 1.0), 0.0)) / n;
+            // (n·Σb² − (Σb)²)/((n−1)·(Σb)²) — the unbiased form; the n
+            // divisor under-reports by √((n−1)/n).
+            acc = sqrt(max((n * dose_sq[i] - dose * dose) / max(n - 1.0, 1.0), 0.0)) / dose;
             cnt = 1u;
         }
     }
@@ -180,7 +182,7 @@ impl McRun {
             McJob::Slab(request) => slab_launch(request)?,
             McJob::Patient(request) => patient_launch(request)?,
         };
-        if launch.protons <= 0.0 || launch.spots.is_empty() {
+        if launch.protons <= 0.0 || launch.spots.is_empty() || launch.histories == 0 {
             // The empty path skips prepare's binding-cap check — bound the
             // placeholder allocation itself.
             let nvox = launch.shape[0]
@@ -257,6 +259,10 @@ impl McRun {
         if target != live.histories {
             live.histories = target;
             live.finished = false;
+            // A preview parked when the target moved is stale the moment
+            // the run resumes — it would publish a pre-extend snapshot as
+            // the resumed run's first result.
+            live.pending_read = None;
             self.done = None;
         }
         true
@@ -611,7 +617,13 @@ fn empty_result(launch: &Launch) -> McResult {
         uncertainty: 0.0,
         histories: 0,
         ledger: [0.0; 6],
-        let_d: Vec::new(),
+        // values pairs voxel-for-voxel with let_d when the job asked for
+        // LET — the empty path follows the same shape contract.
+        let_d: if launch.flags & 2 != 0 {
+            vec![0.0; nvox]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -823,6 +835,12 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         * f64::from(launch.spacing_cm[1])
         * f64::from(launch.spacing_cm[2]);
     let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
+    if !scale.is_finite() {
+        // A non-finite scale poisons every tally — the fold's u32 casts and
+        // peak stats are indeterminate on NaN, and the readback reports
+        // uncertainty 0.0 on a garbage cube.
+        return Err(ComputeError::Message("dose scale is not finite".into()));
+    }
 
     let spots = storage_init(&device, &f32_bytes(&launch.spots))?;
     let floats = storage_init(&device, &f32_bytes(&tables.floats))?;

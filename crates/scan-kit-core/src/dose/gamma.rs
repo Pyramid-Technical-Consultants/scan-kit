@@ -684,7 +684,7 @@ mod tests {
         let n = shape.iter().product::<usize>();
         let evaluated = vec![1.0f32; n];
         let reference = vec![1.0f32; n - 1];
-        let (gamma, scored, _) =
+        let (gamma, _, scored) =
             gamma_index(&reference, &evaluated, shape, 3.0, 2.0, [1.0; 3], 10.0);
         assert_eq!(scored, 0);
         // Unscored voxels are NaN so a scored γ = 0 can be told apart.

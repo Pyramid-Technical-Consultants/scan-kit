@@ -32,6 +32,13 @@ pub(super) fn session_log(root: &Path, session_ids: &[String]) -> PlotScene {
         for issue in log.issues.iter().take(40) {
             rows.push(vec![session.clone(), "Errors".into(), issue.clone()]);
         }
+        if log.issues.len() > 40 {
+            rows.push(vec![
+                session.clone(),
+                "Errors".into(),
+                format!("{} more errors", log.issues.len() - 40),
+            ]);
+        }
         for (device, count) in &log.wdt {
             rows.push(vec![
                 session.clone(),

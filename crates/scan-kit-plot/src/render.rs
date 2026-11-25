@@ -10658,6 +10658,7 @@ mod tests {
         scene.volume.gantry = 90.0;
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let (width, height) = (960u32, 640u32);
@@ -11038,6 +11039,7 @@ mod tests {
     #[test]
     fn the_shader_dash_opens_gaps_on_the_stroke() {
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut scene = line_scene();
@@ -12421,6 +12423,7 @@ mod tests {
     #[test]
     fn gpu_and_cpu_pictures_agree() {
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut scene = line_scene();
@@ -13305,6 +13308,7 @@ mod tests {
             ..scan_kit_core::VolumeMark::default()
         };
         let Ok(gpu) = crate::native_gpu() else {
+            eprintln!("skipping: no usable GPU adapter");
             return;
         };
         let mut plot = Plot::new(&scene, [0.1, 0.1, 0.1, 1.0], [1.0, 1.0, 1.0, 1.0]);
