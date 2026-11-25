@@ -123,27 +123,30 @@ export function useScrub(
       last.speed !== reported.speed ||
       last.window !== reported.window
     ) {
+      const at = Math.min(Math.max(0, reported.at), reported.end);
       lastSent.current = {
         ...last,
         on: reported.on,
         speed: reported.speed,
         window: reported.window,
+        at,
       };
       setPlay((current) => ({
         ...current,
         on: reported.on,
         speed: reported.speed,
         window: reported.window,
+        at,
       }));
       // The re-seeded state must reach onMove too — the consumer serializes
       // its own playhead into the next task, and a stale mirror would send
       // the pre-reseed value back and clobber the restore. Disarming also
       // stops the rAF loop, which update() alone can't reach.
-      const next = { ...scrubRef.current, on: reported.on, speed: reported.speed, window: reported.window };
+      const next = { ...scrubRef.current, on: reported.on, speed: reported.speed, window: reported.window, at };
       scrubRef.current = next;
       onMoveRef.current(next);
     }
-  }, [reported.on, reported.speed, reported.window]);
+  }, [reported.on, reported.speed, reported.window, reported.at, reported.end]);
 
   useEffect(() => {
     commitRef.current = commit;

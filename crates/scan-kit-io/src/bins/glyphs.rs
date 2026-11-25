@@ -299,26 +299,67 @@ pub(super) fn scatter_series(
     scatter_cloud(xs, ys, Vec::new(), color, 2.5)
 }
 
+/// One empty consuming series — palette slots are positional per session,
+/// so a session that draws nothing must still hold its slot or the next
+/// session paints in its color.
+pub(super) fn empty_mark() -> Series {
+    Series::Polyline {
+        xs: Vec::new(),
+        ys: Vec::new(),
+        color: [0.0, 0.0, 0.0, 1.0],
+        thickness: 1.0,
+    }
+}
+
+/// The marks a missing column emits — contour holds its slots in
+/// `contour_series`; every other glyph needs a placeholder here.
+pub(super) fn empty_slot_marks(glyph: &str) -> Vec<Series> {
+    if glyph == "contour" {
+        Vec::new()
+    } else {
+        vec![empty_mark()]
+    }
+}
+
+/// Whether the series takes the next palette slot (alpha>0 marks and
+/// session-ramp heatmaps do; alpha-0 linked marks and guides do not) —
+/// apply_palette's rule.
+pub(super) fn consumes_slot(series: &Series) -> bool {
+    match series {
+        Series::Polyline { color, .. }
+        | Series::Points { color, .. }
+        | Series::Bars { color, .. }
+        | Series::Rects { color, .. }
+        | Series::Triangles { color, .. } => color[3] > 0.0,
+        Series::Heatmap { ramp, .. } => scan_kit_core::is_session(*ramp),
+        Series::Guide { .. } | Series::Cloud { .. } => false,
+    }
+}
+
+/// Per-session contour marks, one entry per table — a session whose marks
+/// consume no slot gets a placeholder so the palette stays aligned.
 pub(super) fn contour_series(
     tables: &[BTreeMap<String, Vec<f32>>],
     key: &str,
     x_column: &str,
     cutoff_pct: f32,
-) -> Vec<Series> {
-    let mut drawn = Vec::new();
-    for table in tables {
-        let Some(xs) = table.get(x_column) else {
-            continue;
-        };
-        let Some(ys) = table.get(key) else { continue };
-        drawn.extend(cloud_series(
-            xs,
-            ys,
-            &[],
-            CloudDraw::Contour { cutoff: cutoff_pct },
-        ));
-    }
-    drawn
+) -> Vec<Vec<Series>> {
+    tables
+        .iter()
+        .map(|table| {
+            let marks = match (table.get(x_column), table.get(key)) {
+                (Some(xs), Some(ys)) => {
+                    cloud_series(xs, ys, &[], CloudDraw::Contour { cutoff: cutoff_pct })
+                }
+                _ => Vec::new(),
+            };
+            if marks.iter().any(consumes_slot) {
+                marks
+            } else {
+                vec![empty_mark()]
+            }
+        })
+        .collect()
 }
 
 pub(super) fn binned_trend(
@@ -544,10 +585,18 @@ pub(super) fn hist_panel(
     range: Option<(f32, f32)>,
     position_guides: bool,
 ) -> Panel {
+    // Missing and all-non-finite columns stay as empty slices — dropping
+    // them would shift every later session off its palette slot.
     let columns: Vec<&[f32]> = tables
         .iter()
-        .filter_map(|table| table.get(series.key).map(Vec::as_slice))
-        .filter(|column| column.iter().any(|value| value.is_finite()))
+        .map(|table| {
+            let column = table.get(series.key).map(Vec::as_slice).unwrap_or(&[]);
+            if column.iter().any(|value| value.is_finite()) {
+                column
+            } else {
+                &[]
+            }
+        })
         .collect();
     let guides: Vec<f32> = if !position_guides {
         Vec::new()
@@ -585,6 +634,7 @@ pub(super) fn corr_panel(
     let mut all_y = Vec::new();
     for table in tables {
         let (Some(left), Some(right)) = (table.get(a.key), table.get(b.key)) else {
+            series.push(empty_mark());
             continue;
         };
         let mut xs = Vec::new();
@@ -596,6 +646,7 @@ pub(super) fn corr_panel(
             }
         }
         if xs.is_empty() {
+            series.push(empty_mark());
             continue;
         }
         all_x.extend(xs.iter().copied());
@@ -1040,10 +1091,12 @@ mod tests {
         let mut table = std::collections::BTreeMap::new();
         table.insert("ic1_x_err".to_string(), vec![1.0, 2.0]);
         let panel = corr_panel(&a, &b, &[table], "Position").unwrap();
-        assert!(panel
-            .series
-            .iter()
-            .all(|item| matches!(item, Series::Guide { .. })));
+        // The missing session still holds its palette slot — an empty
+        // mark alongside the diagonal guide.
+        assert!(panel.series.iter().all(|item| {
+            matches!(item, Series::Guide { .. })
+                || matches!(item, Series::Polyline { xs, .. } if xs.is_empty())
+        }));
     }
     #[test]
     fn sigma_bands_only_draw_for_a_single_session() {

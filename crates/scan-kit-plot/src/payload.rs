@@ -244,6 +244,13 @@ pub fn encode_plot_reusing(
         volume_session_focus: kept_sessions
             .iter()
             .position(|&index| index as u32 == scene.volume.session_focus)
+            // The focused cube was dropped — snap to the nearest kept
+            // session before it, not the unrelated first cube.
+            .or_else(|| {
+                kept_sessions
+                    .partition_point(|&index| (index as u32) < scene.volume.session_focus)
+                    .checked_sub(1)
+            })
             .unwrap_or(0) as u32,
         volume_colors: kept_sessions
             .iter()

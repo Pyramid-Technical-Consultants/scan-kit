@@ -154,6 +154,12 @@ pub fn gamma_index_norm(
     // A one-voxel axis is a plane. Stepping off it blends in the zeros outside,
     // which a hot evaluated plane would score as a match.
     offsets.retain(|o| (0..3).all(|axis| shape[axis] > 1 || o[axis] == 0.0));
+    // Degenerate spacing or DTA produced no search offsets — every masked
+    // voxel would score the cap. Report not-evaluated like the other
+    // can't-score paths, not a confident 0% fail.
+    if offsets.is_empty() {
+        return (gamma, 0, 0);
+    }
     let cap2 = cap * cap;
     // Most voxels of a smooth pair settle within a millimetre. Only a noisy
     // cube leaves enough behind to pay for the local dose range.
@@ -422,7 +428,14 @@ pub(super) fn gamma_offsets(
     let reach = cap * dta;
     let mut axes = Vec::new();
     for (axis, &v) in spacing.iter().enumerate() {
+        // The 64-step cap must bound the offset list, not the reach — a
+        // spacing finer than reach/64 would silently under-search the DTA.
         let step = v / (v / (dta / 4.0)).ceil().max(1.0);
+        let step = if (reach / 64.0).is_finite() {
+            step.max(reach / 64.0)
+        } else {
+            step
+        };
         // A shift past the grid's own extent in this axis can never land on
         // another voxel — and it keeps a silly dta from looping forever.
         // Extreme spacing can collapse step to 0, which makes limit inf -
@@ -440,6 +453,13 @@ pub(super) fn gamma_offsets(
         let n = ((reach as f64 / step as f64).ceil() as i64)
             .clamp(0, (limit.ceil() as i64).saturating_add(1))
             .min(64);
+        // One step already overshoots the whole axis — only the zero
+        // shift can land on a voxel.
+        let n = if step as f64 > shape[axis] as f64 * v as f64 {
+            0
+        } else {
+            n
+        };
         let mut axis = Vec::new();
         for i in -n..=n {
             axis.push(i as f32 * step);

@@ -135,8 +135,12 @@ pub(crate) fn histogram_panel(
         } else {
             histogram(column, bins)
         };
-        lo = lo.min(edges.first().copied().unwrap_or(0.0));
-        hi = hi.max(edges.last().copied().unwrap_or(1.0));
+        // A placeholder column is all-zero counts — its edges must not
+        // stretch the axis to the 0..1 default.
+        if !column.is_empty() {
+            lo = lo.min(edges.first().copied().unwrap_or(0.0));
+            hi = hi.max(edges.last().copied().unwrap_or(1.0));
+        }
         let total = counts.iter().sum::<f32>().max(1.0);
         let percent: Vec<f32> = counts.iter().map(|count| count / total * 100.0).collect();
         peak = peak.max(percent.iter().copied().fold(0.0, f32::max));

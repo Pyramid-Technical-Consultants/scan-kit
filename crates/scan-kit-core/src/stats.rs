@@ -153,6 +153,11 @@ pub fn quantiles_at(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
     let last = values.len() - 1;
     qs.iter()
         .map(|q| {
+            // NaN as usize saturates to 0 — a NaN q would return the
+            // minimum instead of propagating like percentile_nearest.
+            if !q.is_finite() {
+                return f32::NAN;
+            }
             let pos = f64::from(q.clamp(0.0, 1.0)) * last as f64;
             let lo = (pos.floor() as usize).min(last);
             let hi = (pos.ceil() as usize).min(last);

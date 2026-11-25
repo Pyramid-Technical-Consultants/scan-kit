@@ -224,8 +224,12 @@ pub(crate) fn read_remote_session_file(
         )
     {
         candidates.push(format!("{base}/{session_id}/{filename}"));
+    } else {
+        // With the nested marker, the nested tree is authoritative — a
+        // stale flat file must not hydrate what the nested layout lacks,
+        // matching session_directory locally.
+        candidates.push(format!("{base}/{filename}"));
     }
-    candidates.push(format!("{base}/{filename}"));
     for path in candidates {
         if let Ok(Some(bytes)) = fs.read(&path) {
             return Some(bytes);
@@ -245,20 +249,28 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
         // probe in the order the reader resolves so the fingerprint
         // certifies the file that is actually read.
         let inner_first = matches!(fs.stat(&format!("{nested}/input_map.csv")), Ok(Some(_)));
-        let mut files = [
-            format!("{nested}/termination_summary.txt"),
-            format!("{base}/termination_summary.txt"),
-            format!("{nested}/input_map.csv"),
-            format!("{base}/input_map.csv"),
-        ];
-        if !inner_first {
-            files.swap(0, 1);
-            files.swap(2, 3);
+        // With the nested marker the nested tree is authoritative — probing
+        // the flat files would fingerprint bytes the reader never serves.
+        if inner_first {
+            candidates.splice(
+                0..0,
+                [
+                    format!("{nested}/termination_summary.txt"),
+                    format!("{nested}/input_map.csv"),
+                ],
+            );
+            // Before `base`, mirroring remote_stamp — the container's frozen
+            // mtime would freeze the fingerprint on a growing session.
+            candidates.insert(2, nested);
+        } else {
+            candidates.splice(
+                0..0,
+                [
+                    format!("{base}/termination_summary.txt"),
+                    format!("{base}/input_map.csv"),
+                ],
+            );
         }
-        candidates.splice(0..0, files);
-        // Before `base`, mirroring remote_stamp — the container's frozen
-        // mtime would freeze the fingerprint on a growing session.
-        candidates.insert(4, nested);
     } else if !archive_name(&remote.path) {
         candidates.insert(0, format!("{base}/termination_summary.txt"));
     }
@@ -545,18 +557,22 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
         fs.stat(&format!("{base}/{leaf}/input_map.csv")),
         Ok(Some(_))
     );
-    let mut markers = [
-        format!("{base}/{leaf}/termination_summary.txt"),
-        format!("{base}/termination_summary.txt"),
-        format!("{base}/{leaf}/input_map.csv"),
-        format!("{base}/input_map.csv"),
-        format!("{base}/{leaf}"),
-        base.to_owned(),
-    ];
-    if !inner_first {
-        markers.swap(0, 1);
-        markers.swap(2, 3);
-    }
+    // With the nested marker the nested tree is authoritative — probing
+    // the flat markers would stamp bytes the reader never serves.
+    let markers: Vec<String> = if inner_first {
+        vec![
+            format!("{base}/{leaf}/termination_summary.txt"),
+            format!("{base}/{leaf}/input_map.csv"),
+            format!("{base}/{leaf}"),
+            base.to_owned(),
+        ]
+    } else {
+        vec![
+            format!("{base}/termination_summary.txt"),
+            format!("{base}/input_map.csv"),
+            base.to_owned(),
+        ]
+    };
     for marker in markers {
         let Some(stat) = fs.stat(&marker)? else {
             continue;
@@ -700,7 +716,7 @@ fn walk_remote(
         if item.name.is_empty()
             || item.name == "."
             || item.name == ".."
-            || item.name.contains(['/', '\\'])
+            || crate::remote::unsafe_remote_name(&item.name)
         {
             continue;
         }
@@ -819,7 +835,7 @@ fn remote_exam(
         if item.name.is_empty()
             || item.name == "."
             || item.name == ".."
-            || item.name.contains(['/', '\\'])
+            || crate::remote::unsafe_remote_name(&item.name)
         {
             continue;
         }
@@ -913,7 +929,7 @@ fn remote_holds_session(
             && !item.name.is_empty()
             && item.name != "."
             && item.name != ".."
-            && !item.name.contains(['/', '\\'])
+            && !crate::remote::unsafe_remote_name(&item.name)
         {
             let child = join_path(path, &item.name);
             if remote_holds_session(fs, &child, depth + 1, keep)? {

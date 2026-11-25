@@ -18,8 +18,9 @@ use super::tables::{
     median, point_time_stamp, same, session_columns, span, timeslice_energy_only, Grain,
 };
 use glyphs::{
-    begin_grown, binned_trend, box_series, contour_series, corr_panel, grown_violin, hist_panel,
-    hline, interlock_guides, mean_series, note_panel, scatter_series, scatter_trend, violin_series,
+    begin_grown, binned_trend, box_series, contour_series, corr_panel, empty_slot_marks,
+    grown_violin, hist_panel, hline, interlock_guides, mean_series, note_panel, scatter_series,
+    scatter_trend, violin_series,
 };
 
 const OFFSET: f32 = 0.35;
@@ -551,7 +552,7 @@ struct PreparedSeries {
     label: String,
     y_label: String,
     glyphs: Vec<Vec<Series>>,
-    contour: Vec<Series>,
+    contour: Vec<Vec<Series>>,
     ymin: f32,
     ymax: f32,
 }
@@ -899,10 +900,10 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
                     .enumerate()
                     .map(|(index, table)| {
                         let Some(y) = table.get(series.key) else {
-                            return Vec::new();
+                            return empty_slot_marks(glyph);
                         };
                         if !has_finite(Some(y)) {
-                            return Vec::new();
+                            return empty_slot_marks(glyph);
                         }
                         for value in y {
                             if value.is_finite() {
@@ -1176,6 +1177,26 @@ fn assemble_panel(
     let mut drawn = Vec::new();
     for (session, table) in prepared.tables.iter().enumerate() {
         drawn.extend(item.glyphs[session].clone());
+        if glyph == "contour" {
+            // Contour marks live outside glyphs (they need every session's
+            // frame first). Each entry holds that session's palette slot,
+            // and the trend appended here links to this session's marks —
+            // a post-loop append would leave every trend in the last
+            // session's color.
+            drawn.extend(item.contour[session].clone());
+            if trend != Trend::Off {
+                if let Some(guide) = scatter_trend(
+                    table,
+                    &item.key,
+                    x_column,
+                    prepared.xmin,
+                    prepared.xmax,
+                    trend,
+                ) {
+                    drawn.push(guide);
+                }
+            }
+        }
         let Some(y) = table.get(&item.key) else {
             continue;
         };
@@ -1212,21 +1233,6 @@ fn assemble_panel(
             }
         }
         if trend != Trend::Off && glyph == "scatter" {
-            if let Some(guide) = scatter_trend(
-                table,
-                &item.key,
-                x_column,
-                prepared.xmin,
-                prepared.xmax,
-                trend,
-            ) {
-                drawn.push(guide);
-            }
-        }
-    }
-    drawn.extend(item.contour.clone());
-    if trend != Trend::Off && glyph == "contour" {
-        for table in &prepared.tables {
             if let Some(guide) = scatter_trend(
                 table,
                 &item.key,

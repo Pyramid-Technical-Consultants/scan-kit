@@ -111,6 +111,13 @@ pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, 
                 [0.92, 0.92, 0.93, 1.0],
             )?;
             let palette = palette_of(input.get("palette"))?;
+            // An absent palette would paint every mark black on the dark
+            // default — the desktop always supplies one, the tool need not.
+            let palette = if palette.is_empty() {
+                vec![foreground]
+            } else {
+                palette
+            };
             run_view(
                 view,
                 Path::new(path),
@@ -294,7 +301,13 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
         }
     }
     if !palette.is_empty() && !scene.volume.values.is_empty() {
-        scene.volume.session_colors = palette.to_vec();
+        // session_colors indexes volume.sessions — a palette short of the
+        // session list leaves later cubes on the decoder's fallback tint
+        // while their panel marks wrap. Wrap here too.
+        let count = scene.volume.sessions.len().max(palette.len());
+        scene.volume.session_colors = (0..count)
+            .map(|index| palette[index % palette.len()])
+            .collect();
     }
 }
 

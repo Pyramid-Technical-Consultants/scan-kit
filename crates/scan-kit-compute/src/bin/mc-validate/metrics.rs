@@ -154,16 +154,21 @@ pub fn compare(ref_: &Summary, gpu: &Summary) -> Diff {
     let upto = ref_.r90 as usize;
     let n = upto.min(gpu.idd.len()).min(ref_.idd.len());
     // f64::max drops NaN operands — an all-NaN dose plane would report
-    // idd = 0.0 ("perfect"). Propagate NaN so it fails the tolerance check.
-    let idd = (0..n)
-        .map(|i| (gpu.idd[i] / ref_.idd[i] - 1.0).abs())
-        .fold(0.0f64, |a, b| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        });
+    // idd = 0.0 ("perfect"), and n = 0 from an NaN r90 folds empty to the
+    // same answer. Propagate NaN so it fails the tolerance check.
+    let idd = if n == 0 {
+        f64::NAN
+    } else {
+        (0..n)
+            .map(|i| (gpu.idd[i] / ref_.idd[i] - 1.0).abs())
+            .fold(0.0f64, |a, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            })
+    };
     let sig: Vec<f64> = gpu
         .sigmas
         .iter()
@@ -180,12 +185,20 @@ pub fn compare(ref_: &Summary, gpu: &Summary) -> Diff {
         },
         sigma_each: sig,
         energy: gpu.energy / ref_.energy - 1.0,
-        centroid: gpu
+        centroid: if gpu
             .centroid
             .iter()
-            .zip(&ref_.centroid)
-            .map(|(g, r)| (g - r).abs())
-            .fold(0.0, f64::max),
+            .chain(&ref_.centroid)
+            .all(|v| v.is_finite())
+        {
+            gpu.centroid
+                .iter()
+                .zip(&ref_.centroid)
+                .map(|(g, r)| (g - r).abs())
+                .fold(0.0, f64::max)
+        } else {
+            f64::NAN
+        },
     }
 }
 

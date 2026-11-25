@@ -438,6 +438,14 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
             "slab scalars and origin must be finite".into(),
         ));
     }
+    // spread = pct * energy / 100 and energy <= 400 — a pct past MAX/4 makes
+    // at least one spot's spread unrepresentable, and the per-spot gate
+    // would drop it silently into an empty launch.
+    if f64::from(request.spread_pct) * 4.0 > f64::from(f32::MAX) {
+        return Err(ComputeError::Message(
+            "slab spread_pct is unrepresentable".into(),
+        ));
+    }
     let voxel = request.voxel_mm.max(0.25);
     let cm = voxel / 10.0;
     Ok(Launch {

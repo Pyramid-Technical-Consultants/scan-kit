@@ -422,6 +422,7 @@ pub(crate) fn drain_plot(
             stage.poll(Duration::MAX, cancel)
         }));
         match result {
+            Ok(Poll::Ready(_)) if cancel.is_cancelled() => return Err("cancelled".into()),
             Ok(Poll::Ready(bytes)) => return Ok(bytes),
             Ok(Poll::Failed(message)) => return Err(message),
             Ok(Poll::Cancelled) => return Err("cancelled".into()),
@@ -826,7 +827,12 @@ impl Stage for SessionStage {
             };
         }
         if self.cached && self.view == "volumetric" && !unlimited && self.lattice == 0 {
-            return self.publish_volume_preview();
+            let poll = self.publish_volume_preview();
+            if cancel.is_cancelled() {
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
+            }
+            return poll;
         }
         // Dose is one picture. A window per poll deposited the cube again, so
         // the bar looked like a queue that never cleared.
@@ -835,6 +841,12 @@ impl Stage for SessionStage {
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.report = report_at(Phase::Done, total, total);
                     Poll::Ready(bytes)
@@ -888,6 +900,12 @@ impl Stage for SessionStage {
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.loaded = total;
                     self.report = report_at(Phase::Done, units, units);
@@ -904,6 +922,12 @@ impl Stage for SessionStage {
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.report = report_at(Phase::Done, self.units(), self.units());
                     Poll::Ready(bytes)
@@ -982,6 +1006,12 @@ impl Stage for SessionStage {
             scan_kit_io::clear_slice();
             return match self.encode(&self.sessions.clone(), false) {
                 Ok(bytes) => {
+                    // The encode ran the whole scene — a cancel that landed
+                    // inside it must not report Ready.
+                    if cancel.is_cancelled() {
+                        self.report.phase = Phase::Cancelled;
+                        return Poll::Cancelled;
+                    }
                     remember_stamps(&self.stamps);
                     self.loaded = total;
                     self.report = report_at(Phase::Done, self.units(), self.units());
@@ -1232,6 +1262,10 @@ impl McPlotStage {
     /// The scene asks for its jobs in the same order `capture_job` saw them.
     fn paint(&self, results: &[McResult], quality: &str) -> Result<Vec<u8>, String> {
         let next = std::cell::Cell::new(0usize);
+        // volumetric maps a runner Err onto the analytic fallback — a
+        // missing job would paint a plausible analytic cube labelled MC.
+        // Record the first error and fail after, as the closure documents.
+        let missing = std::cell::RefCell::new(None::<String>);
         let mut scene = scan_kit_io::volumetric::volumetric(
             &self.root,
             &self.sessions,
@@ -1241,9 +1275,18 @@ impl McPlotStage {
                 next.set(at + 1);
                 // A missing job must fail, not paint a zero-dose cube that
                 // reads as a real result.
-                job_result(results, at)
+                match job_result(results, at) {
+                    Ok(job) => Ok(job),
+                    Err(err) => {
+                        missing.borrow_mut().get_or_insert(err.clone());
+                        Err(err)
+                    }
+                }
             }),
         );
+        if let Some(err) = missing.into_inner() {
+            return Err(err);
+        }
         self.pack(&mut scene, quality)
     }
 
@@ -1427,6 +1470,10 @@ impl McPlotStage {
         }
         let mut results = Vec::with_capacity(jobs.len());
         for job in &jobs {
+            if cancel.is_cancelled() {
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
+            }
             let mut run = match McRun::open(job) {
                 Ok(run) => run,
                 Err(ComputeError::NoAdapter) => return self.fail("no GPU adapter".into()),
@@ -1891,12 +1938,25 @@ impl Stage for CopyStage {
             let dest = self.dest.clone();
             let shared = Arc::clone(&self.shared);
             self.worker = Some(std::thread::spawn(move || {
-                let value = scan_kit_io::copy_runner(&dest, &mut |done, total| {
-                    // total first — see LibraryStage's callback.
-                    shared.total.store(total, Ordering::Relaxed);
-                    shared.done.store(done, Ordering::Relaxed);
-                    !shared.stop.load(Ordering::SeqCst)
-                })?;
+                // download_with fails fast while another download holds the
+                // busy flag — a task should wait its turn, not report a copy
+                // failure the caller has to retry by hand.
+                let value = loop {
+                    match scan_kit_io::copy_runner(&dest, &mut |done, total| {
+                        // total first — see LibraryStage's callback.
+                        shared.total.store(total, Ordering::Relaxed);
+                        shared.done.store(done, Ordering::Relaxed);
+                        !shared.stop.load(Ordering::SeqCst)
+                    }) {
+                        Err(err) if err == scan_kit_io::DOWNLOAD_BUSY_ERR => {
+                            if shared.stop.load(Ordering::SeqCst) {
+                                break Err("cancelled".into());
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        other => break other,
+                    }
+                }?;
                 serde_json::to_vec(&value).map_err(|err| err.to_string())
             }));
         }
@@ -2053,18 +2113,27 @@ impl ExportStage {
         };
         match outcome {
             Ok(value) => {
-                // A cancel landing inside the destination write would
-                // leave a finished artifact for a task reported cancelled
-                // — and could overwrite a replacement export's dest.
+                // Fingerprint what this task just wrote — the cancel delete
+                // below must not remove a replacement export's artifact or
+                // a file that merely shares the path (runner.rs's dest_was
+                // hazard).
+                let sidecar = crate::present::dvh_sidecar(Path::new(&self.dest));
+                let stamp = |path: &Path| {
+                    std::fs::metadata(path)
+                        .ok()
+                        .map(|meta| (meta.len(), meta.modified().ok()))
+                };
+                let wrote_dest = stamp(Path::new(&self.dest));
+                let wrote_side = stamp(&sidecar);
                 if cancel.is_cancelled() {
-                    let _ = std::fs::remove_file(&self.dest);
-                    if !self.dose {
+                    if wrote_dest.is_some() && stamp(Path::new(&self.dest)) == wrote_dest {
+                        let _ = std::fs::remove_file(&self.dest);
+                    }
+                    if !self.dose && wrote_side.is_some() && stamp(&sidecar) == wrote_side {
                         // finish_patient_report also commits a *_dvh.csv
                         // sidecar — a cancelled report can't leave it
                         // orphaned to pair with a different later PDF.
-                        let _ = std::fs::remove_file(crate::present::dvh_sidecar(Path::new(
-                            &self.dest,
-                        )));
+                        let _ = std::fs::remove_file(&sidecar);
                     }
                     self.report.phase = Phase::Cancelled;
                     return Poll::Cancelled;

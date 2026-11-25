@@ -1169,6 +1169,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             .iter()
             .map(|cp| float_tag(cp, tag(0x300A, 0x0134)).unwrap_or(f32::NAN))
             .collect();
+        // The tagless UNIFORM fallback divides the beam over the spots that
+        // actually deliver — setup and marker CPs take no share.
+        let uniform_spots: usize = control_points
+            .iter()
+            .map(|cp| {
+                (int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize)
+                    .min(floats_tag(cp, tag(0x300A, 0x0394)).len() / 2)
+            })
+            .sum();
         for (k, cp) in control_points.iter().enumerate() {
             // DS fields can carry "nan" — a non-finite value must not
             // replace the last good reading.
@@ -1314,13 +1323,25 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                     // UNIFORM — the forward cumulative-weight segment
                     // (this CP to the next) divided evenly over its spots;
                     // the whole beam meterset went to every spot-bearing
-                    // CP otherwise. Missing tags: split evenly.
-                    let segment = cums.get(k + 1).copied().unwrap_or(f32::NAN)
-                        - cums.get(k).copied().unwrap_or(f32::NAN);
-                    if segment.is_finite() && segment > 0.0 {
-                        meterset * segment / final_weight / limit as f32
-                    } else {
-                        meterset / (limit * control_points.len()).max(1) as f32
+                    // CP otherwise. Missing tags: split evenly over the
+                    // spots that deliver.
+                    match (cums.get(k), cums.get(k + 1)) {
+                        (Some(&from), Some(&to)) if (to - from).is_finite() => {
+                            let segment = to - from;
+                            if segment > 0.0 {
+                                meterset * segment / final_weight / limit as f32
+                            } else {
+                                // A zero segment marks a non-delivering CP —
+                                // it takes no share, like a zero-weight
+                                // marker.
+                                0.0
+                            }
+                        }
+                        // The last CP has no forward segment — it delivers
+                        // nothing. A NaN entry means the tags were absent
+                        // entirely; take the even split instead.
+                        (Some(&from), None) if from.is_finite() => 0.0,
+                        _ => meterset / uniform_spots.max(1) as f32,
                     }
                 };
                 let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);

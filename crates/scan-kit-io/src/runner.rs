@@ -104,6 +104,10 @@ impl Drop for BusyFlag {
     }
 }
 
+/// The error `download_with` returns while another download holds the flag —
+/// exported so a caller can tell "wait your turn" from a real failure.
+pub const DOWNLOAD_BUSY_ERR: &str = "a download is already in progress";
+
 fn acquire(flag: &'static AtomicBool, busy: &str) -> Result<BusyFlag, String> {
     if flag.swap(true, Ordering::Acquire) {
         return Err(busy.into());
@@ -444,7 +448,7 @@ pub fn download_with(
 ) -> Result<Value, String> {
     // Two concurrent downloads to the same dest can each publish a zip —
     // the loser's post-cancel remove would delete the winner's artifact.
-    let _download = acquire(&DOWNLOAD_BUSY, "a download is already in progress")?;
+    let _download = acquire(&DOWNLOAD_BUSY, DOWNLOAD_BUSY_ERR)?;
     let (host, status, plan_path) = {
         let guard = lock();
         let live = guard

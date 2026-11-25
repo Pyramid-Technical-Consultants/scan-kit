@@ -21,6 +21,7 @@ mod phantom;
 mod remote;
 pub mod report;
 mod runner;
+pub use runner::DOWNLOAD_BUSY_ERR;
 mod session_capture;
 mod source;
 mod store;

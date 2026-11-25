@@ -719,7 +719,7 @@ pub fn capture(
     count += 1;
     count += write_termination(dir, &session_id, status, &spots, &slices)?;
     count += write_session_meta(dir, &session_id, status, &devices)?;
-    count += fetch_aux(rci_host, &devices, dir, keep)?;
+    count += fetch_aux(rci_host, &devices, dir, &mut warnings, keep)?;
     // The aux phase runs ~13 GETs per device after the last recheck - the
     // logs it lands are the worst mixed-session artifact.
     let mut scratch = Vec::new();
@@ -844,6 +844,21 @@ fn join_timeslices(
             rows: HashMap::new(),
             order: Vec::new(),
         };
+        // Two source headers can emit the same name (a stripped "(unit)"
+        // suffix or the r_ rewrite) — name readers bind the first, so
+        // suffix the collision like spot_columns does.
+        let mut taken = std::collections::HashSet::new();
+        for name in &mut part.header {
+            if taken.insert(name.clone()) {
+                continue;
+            }
+            let base = name.clone();
+            let mut suffix = 2;
+            while !taken.insert(format!("{base}_{suffix}")) {
+                suffix += 1;
+            }
+            *name = format!("{base}_{suffix}");
+        }
         // Ragged meta cells inherit the running value like blocks() and
         // join_spot_data() — an empty layer or spot cell must not file the
         // row under "" and split it from its siblings.
@@ -1668,11 +1683,25 @@ fn write_termination(
     Ok(2)
 }
 
+/// One aux-file GET — a failed fetch must surface in the report's
+/// warnings, not silently drop the file from the capture.
+fn get_file(url: &str, what: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
+    match runner::http(url, "GET", None) {
+        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+        Ok(_) => None,
+        Err(err) => {
+            warnings.push(format!("{what}: {err}"));
+            None
+        }
+    }
+}
+
 /// Auxiliary per-device files — each is one HTTP GET; misses are skipped.
 fn fetch_aux(
     rci_host: &str,
     devices: &[CaptureDevice],
     dir: &Path,
+    warnings: &mut Vec<String>,
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<usize, String> {
     let mut count = 0;
@@ -1685,90 +1714,92 @@ fn fetch_aux(
             tick(count, keep)?;
             let remote = format!("/root/config/{file}");
             if let Ok(url) = device_file_url(&device.host, &remote) {
-                if let Ok(bytes) = runner::http(&url, "GET", None) {
-                    if !bytes.is_empty() {
-                        write_bytes(&nozzle.join(file), &bytes)?;
-                        count += 1;
-                    }
+                if let Some(bytes) = get_file(&url, &format!("{}: {file}", device.name), warnings) {
+                    write_bytes(&nozzle.join(file), &bytes)?;
+                    count += 1;
                 }
             }
         }
         tick(count, keep)?;
         if let Ok(url) = device_file_url(&device.host, "/root/config/calibration.json") {
-            if let Ok(bytes) = runner::http(&url, "GET", None) {
-                if !bytes.is_empty() {
-                    write_bytes(
-                        &dir.join("calibration")
-                            .join("devices_calibration")
-                            .join(format!("{}_calibration.json", device.name)),
-                        &bytes,
-                    )?;
-                    count += 1;
-                }
+            if let Some(bytes) = get_file(
+                &url,
+                &format!("{}: calibration.json", device.name),
+                warnings,
+            ) {
+                write_bytes(
+                    &dir.join("calibration")
+                        .join("devices_calibration")
+                        .join(format!("{}_calibration.json", device.name)),
+                    &bytes,
+                )?;
+                count += 1;
             }
         }
         tick(count, keep)?;
         if let Ok(url) = io_url(&device.host, "log", "data.txt") {
-            if let Ok(bytes) = runner::http(&url, "GET", None) {
-                if !bytes.is_empty() {
-                    if device.name == "RCI" {
-                        write_bytes(&dir.join("SessionLogFile.log"), &bytes)?;
-                        count += 1;
-                    }
-                    write_bytes(
-                        &dir.join("log").join(format!("{}.log", device.name)),
-                        &bytes,
-                    )?;
+            if let Some(bytes) = get_file(&url, &format!("{}: data.txt", device.name), warnings) {
+                if device.name == "RCI" {
+                    write_bytes(&dir.join("SessionLogFile.log"), &bytes)?;
                     count += 1;
                 }
+                write_bytes(
+                    &dir.join("log").join(format!("{}.log", device.name)),
+                    &bytes,
+                )?;
+                count += 1;
             }
         }
         // Channel-map XMLs live on the RCI under /root/config/control/.
         if !device.config_target.is_empty() {
             tick(count, keep)?;
             if let Ok(url) = device_file_url(rci_host, &device.config_target) {
-                if let Ok(bytes) = runner::http(&url, "GET", None) {
-                    if !bytes.is_empty() {
-                        let base = PathBuf::from(&device.config_target)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .filter(|name| *name != "." && *name != "..")
-                            .unwrap_or(&device.name)
-                            .to_owned();
-                        // Remote-supplied text becomes a filename — same
-                        // whitelist as client_name or characters Windows
-                        // rejects (and a trailing "."/" ") sink the whole
-                        // capture at write_bytes.
-                        let base: String = base
-                            .chars()
-                            .filter(|ch| {
-                                ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == '.'
-                            })
-                            .take(64)
-                            .collect();
-                        let base = if base.is_empty() || base.ends_with('.') || dos_reserved(&base)
-                        {
-                            format!("_{base}")
-                        } else {
-                            base
-                        };
-                        // The target filesystem is case-insensitive - key the
-                        // dedup on the lowercase form or MAP.XML replaces
-                        // map.xml while count still credits both writes.
-                        let name = if dcs_names.insert(base.to_lowercase()) {
-                            base
-                        } else {
-                            let mut name = format!("{}_{base}", device.name);
-                            let mut n = 2;
-                            while !dcs_names.insert(name.to_lowercase()) {
-                                name = format!("{}_{n}_{base}", device.name);
-                                n += 1;
-                            }
-                            name
-                        };
-                        write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
-                        count += 1;
-                    }
+                if let Some(bytes) = get_file(
+                    &url,
+                    &format!("{}: {}", device.name, device.config_target),
+                    warnings,
+                ) {
+                    let base = PathBuf::from(&device.config_target)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|name| *name != "." && *name != "..")
+                        .unwrap_or(&device.name)
+                        .to_owned();
+                    // Remote-supplied text becomes a filename — same
+                    // whitelist as client_name or characters Windows
+                    // rejects (and a trailing "."/" ") sink the whole
+                    // capture at write_bytes.
+                    let base: String = base
+                        .chars()
+                        .filter(|ch| {
+                            ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == '.'
+                        })
+                        .take(64)
+                        .collect();
+                    // Windows strips a trailing dot on create — the file
+                    // would land as _foo while the dedup tracked _foo.
+                    let base = base.trim_end_matches('.');
+                    let base = if base.is_empty() || dos_reserved(base) {
+                        format!("_{base}")
+                    } else {
+                        base.to_owned()
+                    };
+                    // The target filesystem is case-insensitive - key the
+                    // dedup on the lowercase form or MAP.XML replaces
+                    // map.xml while count still credits both writes.
+                    let name = if dcs_names.insert(base.to_lowercase()) {
+                        base
+                    } else {
+                        let mut name = format!("{}_{base}", device.name);
+                        let mut n = 2;
+                        while !dcs_names.insert(name.to_lowercase()) {
+                            name = format!("{}_{n}_{base}", device.name);
+                            n += 1;
+                        }
+                        name
+                    };
+                    write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
+                    count += 1;
                 }
             }
         }

@@ -421,13 +421,16 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
         // Stat every marker candidate, not only the probed target — an
         // mtime-preserving swap between slots would alias the tuple.
         extras.extend([served.clone(), outer.clone()]);
+        // When session_directory resolved the nested root, the nested tree
+        // is authoritative — a flat outer file is not what the reader serves.
+        let nested = root != storage;
         if served.is_file() {
             served
-        } else if outer.is_file() {
+        } else if !nested && outer.is_file() {
             outer
         } else if served_rows.is_file() {
             served_rows
-        } else if outer_rows.is_file() {
+        } else if !nested && outer_rows.is_file() {
             outer_rows
         } else {
             // Still capturing: the inner session dir changes, the outer does not.
@@ -1106,6 +1109,10 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
         let Ok(name) = entry.name().map(|name| name.into_owned()) else {
             continue;
         };
+        // Dedup and `want` must see the same normalized name the consumers
+        // do — raw-name dedup let "a" and "a/b" survive as two entries
+        // and served the stale first instead of the winning last.
+        let name = normalize_member(&name);
         if let Some(root) = member_root(&name) {
             roots.insert(root);
         }
@@ -1162,7 +1169,7 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
         let Ok(path) = entry.path() else {
             continue;
         };
-        let name = path.to_string_lossy().into_owned();
+        let name = normalize_member(&path.to_string_lossy());
         if let Some(root) = member_root(&name) {
             roots.insert(root);
         }
@@ -1176,7 +1183,7 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Members, String>
                 .link_name()
                 .ok()
                 .flatten()
-                .map(|t| t.to_string_lossy().into_owned())
+                .map(|t| normalize_member(&t.to_string_lossy()))
                 .unwrap_or_default();
             if let Some((_, bytes)) = out.iter().find(|(n, _)| *n == target) {
                 let bytes = bytes.clone();

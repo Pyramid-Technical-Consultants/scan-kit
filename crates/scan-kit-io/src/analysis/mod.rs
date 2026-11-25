@@ -127,6 +127,21 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
     }
 }
 
+/// Whether the series takes the next palette slot — alpha>0 marks and
+/// session-ramp heatmaps do; alpha-0 linked marks, guides, and raw clouds
+/// do not (apply_palette's rule).
+fn consumes_slot(series: &Series) -> bool {
+    match series {
+        Series::Polyline { color, .. }
+        | Series::Points { color, .. }
+        | Series::Bars { color, .. }
+        | Series::Rects { color, .. }
+        | Series::Triangles { color, .. } => color[3] > 0.0,
+        Series::Heatmap { ramp, .. } => scan_kit_core::is_session(*ramp),
+        _ => false,
+    }
+}
+
 fn stroke(xs: Vec<f32>, ys: Vec<f32>, linked: bool) -> Series {
     Series::Polyline {
         xs,

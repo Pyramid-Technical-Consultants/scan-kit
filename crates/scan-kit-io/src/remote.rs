@@ -51,6 +51,12 @@ const COPY_DEPTH: u32 = 32;
 /// already; without an aggregate bound a deep listing still fills the disk.
 const MAX_COPY_BYTES: u64 = 4 << 30;
 
+/// A remote name that cannot be spliced into a command path — separators
+/// escape the tree, and a control byte can split the command/reply stream.
+pub(crate) fn unsafe_remote_name(name: &str) -> bool {
+    name.contains(['/', '\\']) || name.bytes().any(|b| b.is_ascii_control())
+}
+
 /// A remote entry name that cannot become a Windows file or dir: illegal
 /// characters, DOS device stems, and trailing dots/spaces. Skipping mirrors
 /// the separator guard — the alternative is a create that can only fail.
@@ -316,7 +322,7 @@ mod net {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{copy_file_to, Fs, Item, Stat, COPY_DEPTH};
+    use super::{copy_file_to, unsafe_remote_name, Fs, Item, Stat, COPY_DEPTH};
     use crate::location::{self, Remote, Scheme};
 
     /// A session archive is at most gigabytes. Anything bigger is a hostile
@@ -625,7 +631,7 @@ mod net {
                 for item in self.list(path)? {
                     // A hostile or buggy server can return names holding path
                     // separators — splicing one in deletes outside the tree.
-                    if item.name.contains(['/', '\\']) {
+                    if unsafe_remote_name(&item.name) {
                         continue;
                     }
                     self.remove_depth(
@@ -814,6 +820,14 @@ mod net {
             let mut items = Vec::new();
             let mut failed = 0usize;
             for line in &lines {
+                // A unix LIST reply can open with a "total N" banner — not
+                // an entry, and not a parse failure either: strict copies
+                // and empty dirs ("total 0") must not error on it.
+                if line.starts_with("total ")
+                    && line[6..].trim().bytes().all(|b| b.is_ascii_digit())
+                {
+                    continue;
+                }
                 // File::try_from's mlsx fallback accepts almost any string as
                 // a name - a banner or "total N" line would become a phantom
                 // entry whose read then fails mid-copy. Only feed the parser
@@ -1000,7 +1014,7 @@ mod net {
                 for item in self.list(path)? {
                     // A hostile or buggy server can return names holding path
                     // separators — splicing one in deletes outside the tree.
-                    if item.name.contains(['/', '\\']) {
+                    if unsafe_remote_name(&item.name) {
                         continue;
                     }
                     self.remove_depth(
