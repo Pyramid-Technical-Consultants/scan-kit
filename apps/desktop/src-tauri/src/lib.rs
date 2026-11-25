@@ -378,10 +378,11 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // Root has no parent — `.` would open the app's cwd instead.
         let folder = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
+            .unwrap_or(std::path::Path::new("/"));
         vec![folder.as_os_str().to_os_string()]
     }
 }

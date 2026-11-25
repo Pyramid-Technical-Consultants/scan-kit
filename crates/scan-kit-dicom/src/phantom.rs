@@ -347,7 +347,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
     patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
     patient::sh(&mut bytes, 0x300A, 0x0002, "SYNTH")?;
-    patient::cs(&mut bytes, 0x300A, 0x000C, "PATIENT")?;
+    patient::cs(&mut bytes, 0x300A, 0x000C, "RESEARCH")?;
     let dose_ref = {
         let mut item = Vec::new();
         patient::is(&mut item, 0x300A, 0x0012, 1)?;

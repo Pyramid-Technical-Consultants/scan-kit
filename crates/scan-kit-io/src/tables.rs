@@ -1482,17 +1482,35 @@ fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
     )
 }
 
+/// Epoch-scale clocks (a datetime column, an unset-RTC epoch, a host
+/// uptime) must not leak the absolute clock into delivery times — rebase to
+/// the first finite reading like elapsed_seconds does.
+fn rebase_epoch_ms(times: &mut [f64]) {
+    let epoch_scale = times.iter().copied().fold(f64::NEG_INFINITY, f64::max) > 1e12;
+    if !epoch_scale {
+        return;
+    }
+    let Some(origin) = times.iter().copied().find(|value| value.is_finite()) else {
+        return;
+    };
+    for value in times.iter_mut() {
+        if value.is_finite() {
+            *value -= origin;
+        }
+    }
+}
+
 fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
     // Same fallback chain as wall_time so spot_time and time_s share a clock:
     // datetime (epoch seconds) covers files that log no ms timestamp at all.
     if let Some((time, scale)) = wide_clock(spot, "datetime", "s") {
         if time.len() >= n && time.iter().take(n).any(|value| value.is_finite()) {
-            return Some(
-                time[..n]
-                    .iter()
-                    .map(|value| value * scale * 1000.0)
-                    .collect(),
-            );
+            let mut ms: Vec<f64> = time[..n]
+                .iter()
+                .map(|value| value * scale * 1000.0)
+                .collect();
+            rebase_epoch_ms(&mut ms);
+            return Some(ms);
         }
     }
     if let Some((seconds, s_scale)) = wide_clock(spot, "time_s", "s") {
@@ -1510,13 +1528,17 @@ fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
                 })
                 .collect();
             if time.iter().any(|value| value.is_finite()) {
+                let mut time = time;
+                rebase_epoch_ms(&mut time);
                 return Some(time);
             }
         }
     }
     if let Some((time, scale)) = wide_clock(spot, "timestamp", "ms") {
         if time.len() >= n && time.iter().take(n).any(|value| value.is_finite()) {
-            return Some(time[..n].iter().map(|value| value * scale).collect());
+            let mut ms: Vec<f64> = time[..n].iter().map(|value| value * scale).collect();
+            rebase_epoch_ms(&mut ms);
+            return Some(ms);
         }
     }
     None
@@ -2854,7 +2876,9 @@ fn sheet_metric(
                     f32::NAN
                 }
             } else if let Some((slope, intercept)) = axes[index] {
-                if raw.is_finite() && raw >= 0.0 {
+                // Channels are 1-indexed — g3_strip_mm's contract: a 0 or a
+                // 200 is a missing reading, not a position.
+                if raw.is_finite() && (1.0..=128.0).contains(&raw) {
                     slope * raw + intercept
                 } else {
                     f32::NAN
@@ -3446,12 +3470,10 @@ fn header_columns(path: &Path) -> Vec<String> {
         if read == 0 {
             return Vec::new();
         }
-        if line
-            .bytes()
-            .find(|byte| !byte.is_ascii_whitespace())
-            .is_some_and(|byte| byte != b'#')
-        {
-            break;
+        if let Some(first) = line.bytes().find(|byte| !byte.is_ascii_whitespace()) {
+            if first != b'#' || crate::columns::hash_header_line(line.as_bytes()) {
+                break;
+            }
         }
     }
     let line = line.trim_end_matches(['\r', '\n']);
@@ -5362,7 +5384,10 @@ fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool + Sync) -> Sheet {
         loop {
             let (line, tail) = rest.split_once('\n').unwrap_or((rest, ""));
             let header = line.trim_end_matches('\r');
-            if header.trim().is_empty() || header.trim_start().starts_with('#') {
+            if header.trim().is_empty()
+                || (header.trim_start().starts_with('#')
+                    && !crate::columns::hash_header_line(header.trim_start().as_bytes()))
+            {
                 if tail.is_empty() {
                     return empty_sheet();
                 }

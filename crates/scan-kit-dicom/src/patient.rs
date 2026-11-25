@@ -122,6 +122,9 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut ct_positions: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut structures = Vec::new();
+    // First RTSTRUCT wins even when its SOP UID or ROI list comes back
+    // empty — the uid-empty gate used to let a second file overwrite it.
+    let mut structures_taken = false;
     let mut structures_frame = String::new();
     let mut patient_id = String::new();
     let mut patient_name = String::new();
@@ -201,7 +204,8 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
             plan_raw = Some((elems, frame, sop_uid, file.clone()));
         } else if class == "1.2.840.10008.5.1.4.1.1.481.3" {
-            if structures_uid.is_empty() {
+            if !structures_taken {
+                structures_taken = true;
                 structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
                 structures_frame = frame.clone();
                 structures =
@@ -771,9 +775,13 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // High Bit marks the sign bit of the stored value — a 12-bit signed
     // sample in a 16-bit slot reads as a large positive without extension.
     // bits - 1 underflows i32 on a corrupt Bits Allocated — clamp first.
+    // An absent High Bit defaults to Bits Stored - 1 — a sloppy writer
+    // omitting it on a 12-in-16 image would otherwise read the sign bit at
+    // 15 and never sign-extend.
+    let stored_bits = int_tag(elems, tag(0x0028, 0x0101)).unwrap_or(bits).max(1);
     let high_bit = i64::from(
         int_tag(elems, tag(0x0028, 0x0102))
-            .unwrap_or_else(|| bits.max(1) - 1)
+            .unwrap_or_else(|| stored_bits - 1)
             .clamp(0, 62),
     );
     let sample_bytes = if bits == 8 {
@@ -795,7 +803,8 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
                 let raw = if signed {
                     sign_extend(i64::from(*byte), high_bit.min(7)) as f32
                 } else {
-                    *byte as f32
+                    let mask = (1u16 << (high_bit.min(7) + 1)) - 1;
+                    (*byte as u16 & mask) as f32
                 };
                 (raw * slope + intercept) * scale
             })
@@ -810,7 +819,8 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
                 let raw = if signed {
                     sign_extend(i64::from(u32::from_le_bytes(*chunk)), high_bit) as f64
                 } else {
-                    u32::from_le_bytes(*chunk) as f64
+                    let mask = (1u64 << (high_bit.min(31) + 1)) - 1;
+                    (u32::from_le_bytes(*chunk) as u64 & mask) as f64
                 };
                 (raw * slope as f64 + intercept as f64) as f32 * scale
             })
@@ -825,7 +835,8 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
                 let raw = if signed {
                     sign_extend(i64::from(u16::from_le_bytes(*chunk)), high_bit) as f32
                 } else {
-                    u16::from_le_bytes(*chunk) as f32
+                    let mask = (1u32 << (high_bit.min(15) + 1)) - 1;
+                    (u16::from_le_bytes(*chunk) as u32 & mask) as f32
                 };
                 (raw * slope + intercept) * scale
             })
