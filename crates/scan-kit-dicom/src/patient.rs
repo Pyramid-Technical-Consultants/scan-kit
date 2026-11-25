@@ -3246,6 +3246,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
     fn rtdose_rejects_a_wrong_sized_dose() {
         let ct = CtVolume {
             frame: "1.2.3".into(),
