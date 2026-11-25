@@ -460,7 +460,7 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     }
     // Bare-name and suffix matches are only safe when the archive holds one
     // session tree — a stray root-level file can't stand in for a sibling's.
-    if roots.len() != 1 {
+    if roots.len() > 1 {
         return None;
     }
     if let Some((_, bytes)) = members
@@ -491,9 +491,16 @@ pub fn read_timeslices_for(storage: &Path, session_id: &str) -> Vec<Vec<u8>> {
     }
     let (mut members, roots) =
         archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default();
-    if !roots.is_empty() {
-        let prefix = format!("{session_id}/");
+    let prefix = format!("{session_id}/");
+    if members
+        .iter()
+        .any(|(name, _)| normalize_member(name).starts_with(&prefix))
+    {
         members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
+    } else if roots.len() > 1 {
+        // No member carries this session's prefix — a multi-tree archive
+        // can't tell which tree is this session's, a single flat tree can.
+        members.clear();
     }
     members.sort_by_key(|member| timeslice_key(&member.0));
     members.into_iter().map(|(_, bytes)| bytes).collect()
@@ -516,9 +523,14 @@ pub fn read_timeslice_frames(storage: &Path, session_id: &str) -> Vec<(i64, Vec<
         let (mut members, roots) =
             archive_members(storage, &|name| is_timeslice(&normalize_member(name)))
                 .unwrap_or_default();
-        if !roots.is_empty() {
-            let prefix = format!("{session_id}/");
+        let prefix = format!("{session_id}/");
+        if members
+            .iter()
+            .any(|(name, _)| normalize_member(name).starts_with(&prefix))
+        {
             members.retain(|(name, _)| normalize_member(name).starts_with(&prefix));
+        } else if roots.len() > 1 {
+            members.clear();
         }
         members
     };

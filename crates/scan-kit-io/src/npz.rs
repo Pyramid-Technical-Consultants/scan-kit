@@ -197,6 +197,11 @@ pub fn write_npz(path: &Path, entries: &[(String, Npy)]) -> Result<(), String> {
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     for (name, entry) in entries {
+        // The reader keys members on the basename — a separator in `name`
+        // would write `a/b.npy` and read it back as `b`.
+        if name.contains(['/', '\\']) {
+            return Err(format!("npz entry name holds a separator: {name}"));
+        }
         writer
             .start_file(format!("{name}.npy"), options)
             .map_err(|err| err.to_string())?;

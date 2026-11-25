@@ -896,10 +896,6 @@ pub fn crash_log_path() -> PathBuf {
     default_db_path().with_file_name("crash.log")
 }
 
-pub fn read_last_data_dir() -> Result<Option<String>, String> {
-    with_store(&default_db_path(), |conn| store::last_data_dir(conn))
-}
-
 pub fn read_window_geometry() -> Result<Value, String> {
     with_store(&default_db_path(), |conn| window_geometry(conn))
 }

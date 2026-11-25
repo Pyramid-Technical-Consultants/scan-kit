@@ -63,13 +63,6 @@ fn scan_kit_about() -> Result<Value, String> {
 // These look trivial but every one blocks on the store lock — which a
 // library index holds for seconds — so they must not run on the main thread.
 #[tauri::command]
-async fn scan_kit_last_data_dir() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(scan_kit_io::read_last_data_dir)
-        .await
-        .map_err(|err| err.to_string())?
-}
-
-#[tauri::command]
 async fn scan_kit_window_geometry() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(scan_kit_io::read_window_geometry)
         .await
@@ -441,7 +434,6 @@ pub fn run() {
             scan_kit_data_dirs,
             scan_kit_read_catalog,
             scan_kit_forget_data_dir,
-            scan_kit_last_data_dir,
             scan_kit_window_geometry,
             scan_kit_set_window_geometry,
             scan_kit_last_main_tab,

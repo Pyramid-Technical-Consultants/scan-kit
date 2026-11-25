@@ -526,6 +526,9 @@ export function ConfigTuning({
 
   async function toggleHide(next: boolean) {
     const seq = ++hideSeq.current;
+    // save() reads this ref for what the user last set — record the click
+    // now, not when the invoke lands.
+    hideUnusedRef.current = next;
     const run = hideChain.current.then(() =>
       invoke("scan_kit_config_hide", { hideUnused: next }),
     );

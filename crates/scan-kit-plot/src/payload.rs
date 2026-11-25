@@ -163,13 +163,13 @@ pub fn encode_plot_reusing(
     ) -> Vec<&'a scan_kit_core::SessionDose> {
         let mut kept = Vec::new();
         for dose in cubes {
-            let size = dose
-                .shape
-                .iter()
-                .fold(1usize, |acc, axis| acc.saturating_mul(*axis as usize));
-            if *count > 0 && size <= *voxels {
+            // The wire count is values.len() and read_cube refuses a cube
+            // past 1<<28 — charge the shared budget in the same units and
+            // keep only what the per-cube cap also admits.
+            let wire = dose.values.len();
+            if *count > 0 && wire <= (1usize << 28).min(*voxels) {
                 *count -= 1;
-                *voxels -= size;
+                *voxels -= wire;
                 kept.push(dose);
             }
         }

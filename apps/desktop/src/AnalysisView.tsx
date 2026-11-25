@@ -1,4 +1,4 @@
-import { createElement, useEffect, useRef, useState } from "react";
+import { createElement, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft } from "lucide-react";
@@ -422,6 +422,7 @@ export function AnalysisView({
   const liveRef = useRef(true);
   const openingRef = useRef(false);
   const scannerPickRef = useRef(false);
+  const scannerSeq = useRef(0);
   useEffect(() => {
     liveRef.current = true;
     return () => {
@@ -458,6 +459,9 @@ export function AnalysisView({
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [scanners, setScanners] = useState<{ label: string; folder: string }[]>([]);
+  // gridTheme() runs DOM probes — memoize it instead of re-probing on
+  // every poll-driven render.
+  const editorTheme = useMemo(gridTheme, []);
   const exportArgsRef = useRef({ studyPath, scanners, sessions, hidden, folder });
   useEffect(() => {
     exportArgsRef.current = { studyPath, scanners, sessions, hidden, folder };
@@ -483,11 +487,14 @@ export function AnalysisView({
       return;
     }
     let live = true;
+    const listed_at = scannerSeq.current;
     void invoke<{ scanners: { label: string; folder: string }[] }>("scan_kit_scanners", {
       action: "list",
     })
       .then((listed) => {
-        if (live) {
+        // A register-add that resolved first owns the registry — this
+        // list was issued before it and would restore the stale set.
+        if (live && scannerSeq.current === listed_at) {
           // A fresh array per resolve would restart the task effect below -
           // only adopt it when the content actually changed.
           setScanners((prev) =>
@@ -1057,7 +1064,7 @@ export function AnalysisView({
         // chain was polling, but only while it still owns the slot: the plot
         // slot reuses task ids on retarget, so a superseded ticket's cancel
         // would kill its successor's live task.
-        if (polledTask != null && openSeq.current === ticket) {
+        if (polledTask != null && polledGeneration != null && openSeq.current === ticket) {
           void invoke("scan_kit_cancel", {
             task: polledTask,
             generation: polledGeneration,
@@ -1493,7 +1500,7 @@ export function AnalysisView({
             columns={columns}
             rows={gridRows.length}
             getCellContent={getCellContent}
-            theme={gridTheme()}
+            theme={editorTheme}
             rowMarkers="none"
             onColumnResize={onColumnResize}
           />
@@ -1676,6 +1683,7 @@ export function AnalysisView({
                   )
                     .then((listed) => {
                       if (liveRef.current) {
+                        scannerSeq.current += 1;
                         setScanners(listed.scanners);
                       }
                     })

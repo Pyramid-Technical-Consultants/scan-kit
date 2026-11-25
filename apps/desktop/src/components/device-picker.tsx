@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LoaderCircle, Radar } from "lucide-react";
 
@@ -60,6 +60,14 @@ export function DevicePicker({
   const [scanning, setScanning] = useState(false);
   const [hits, setHits] = useState<{ subnet: string; devices: DiscoveredDevice[] } | null>(null);
 
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   async function scan() {
     setScanning(true);
     const scanned = subnet.trim();
@@ -67,14 +75,22 @@ export function DevicePicker({
       const result = await invoke<{ devices: DiscoveredDevice[] }>("scan_kit_discover_subnet", {
         subnet: scanned,
       });
+      if (!mounted.current) {
+        return;
+      }
       // Remember which subnet produced these — a scan resolving after the
       // field was edited must not list hits under the new range.
       setHits({ subnet: scanned, devices: result.devices });
     } catch (error) {
+      if (!mounted.current) {
+        return;
+      }
       setHits(null);
       notifyError(error);
     } finally {
-      setScanning(false);
+      if (mounted.current) {
+        setScanning(false);
+      }
     }
   }
 
