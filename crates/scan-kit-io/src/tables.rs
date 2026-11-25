@@ -264,31 +264,30 @@ pub(crate) fn timeslice_signals(root: &Path, session: &str) -> Table {
 
 fn produce_signals(root: &Path, session: &str) -> Table {
     cached_timeslice(root, session, "signals", false, Family::Signals, |frames| {
-        let mut out = current_from(
+        let mut parts = vec![current_from(
             &frames.sheets,
             &frames.map,
             &frames.energies,
             &frames.layers,
             frames.prior,
-        );
+        )];
         for metric in [
             "fit_confidence",
             "peak_amplitude",
             "amplifier_error",
             "probe_field",
         ] {
-            absorb(
-                &mut out,
-                &signal_from(
-                    &frames.sheets,
-                    &frames.map,
-                    &frames.energies,
-                    &frames.layers,
-                    metric,
-                    frames.prior,
-                ),
-            );
+            parts.push(signal_from(
+                &frames.sheets,
+                &frames.map,
+                &frames.energies,
+                &frames.layers,
+                metric,
+                frames.prior,
+            ));
         }
+        let mut out = BTreeMap::new();
+        absorb(&mut out, parts.iter());
         out
     })
 }
@@ -453,24 +452,29 @@ fn produce_fill(root: &Path, session: &str, grain: Grain, fill: u8, points: bool
     }
 }
 
-fn absorb(map: &mut BTreeMap<String, Vec<f32>>, part: &BTreeMap<String, Vec<f32>>) {
-    let width = map.get("energy").map(Vec::len);
-    for (key, values) in part {
-        if let Some(width) = width {
-            // A part that counted rows differently - a trigger-less file with
-            // geometry but no currents - pads its short tail like
-            // extend_columns instead of vanishing column by column. A part
-            // longer than the lead clock still cannot join.
-            if values.len() > width {
-                continue;
-            }
+fn absorb<'a>(
+    map: &mut BTreeMap<String, Vec<f32>>,
+    parts: impl IntoIterator<Item = &'a BTreeMap<String, Vec<f32>>>,
+) {
+    // The widest part sets the join width, not whichever part was asked for
+    // first — a shorter lead part used to drop every longer part's columns.
+    let parts: Vec<&BTreeMap<String, Vec<f32>>> = parts.into_iter().collect();
+    let width = parts
+        .iter()
+        .flat_map(|part| part.values().map(Vec::len))
+        .chain(map.values().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    for values in map.values_mut() {
+        values.resize(width, f32::NAN);
+    }
+    for part in parts {
+        for (key, values) in part {
             map.entry(key.clone()).or_insert_with(|| {
                 let mut padded = values.clone();
                 padded.resize(width, f32::NAN);
                 padded
             });
-        } else {
-            map.entry(key.clone()).or_insert_with(|| values.clone());
         }
     }
 }
@@ -557,9 +561,7 @@ pub(crate) fn session_columns(root: &Path, session: &str, grain: Grain, names: &
             held.merged = Arc::clone(&held.parts[0].1);
         } else {
             let mut map = BTreeMap::new();
-            for (_, part) in &held.parts {
-                absorb(&mut map, part);
-            }
+            absorb(&mut map, held.parts.iter().map(|(_, part)| part.as_ref()));
             held.merged = Arc::new(map);
         }
     }
@@ -1462,28 +1464,31 @@ fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
             );
         }
     }
+    if let Some((seconds, s_scale)) = wide_clock(spot, "time_s", "s") {
+        if seconds.len() >= n {
+            let nanos = wide_clock(spot, "time_ns", "ns");
+            let time: Vec<f64> = seconds
+                .iter()
+                .take(n)
+                .enumerate()
+                .map(|(index, seconds)| {
+                    let frac = nanos
+                        .and_then(|(values, scale)| values.get(index).map(|v| v * scale / 1e6))
+                        .unwrap_or(0.0);
+                    seconds * s_scale * 1000.0 + frac
+                })
+                .collect();
+            if time.iter().any(|value| value.is_finite()) {
+                return Some(time);
+            }
+        }
+    }
     if let Some((time, scale)) = wide_clock(spot, "timestamp", "ms") {
         if time.len() >= n && time.iter().take(n).any(|value| value.is_finite()) {
             return Some(time[..n].iter().map(|value| value * scale).collect());
         }
     }
-    let (seconds, s_scale) = wide_clock(spot, "time_s", "s")?;
-    if seconds.len() < n {
-        return None;
-    }
-    let nanos = wide_clock(spot, "time_ns", "ns");
-    let time: Vec<f64> = seconds
-        .iter()
-        .take(n)
-        .enumerate()
-        .map(|(index, seconds)| {
-            let frac = nanos
-                .and_then(|(values, scale)| values.get(index).map(|v| v * scale / 1e6))
-                .unwrap_or(0.0);
-            seconds * s_scale * 1000.0 + frac
-        })
-        .collect();
-    time.iter().any(|value| value.is_finite()).then_some(time)
+    None
 }
 
 /// Parenthesized unit a header carried before normalization dropped it:
@@ -3956,6 +3961,9 @@ fn current_ratio_from(
         let right = plateau(&b);
         let third = plateau(&c);
         let n = sample_len(sheet, &[a.as_slice(), b.as_slice(), c.as_slice()]);
+        if n == 0 {
+            continue;
+        }
         cursor += n as f32 * SAMPLE_S;
         clock.push(cursor);
         out_energy.push(tag);
@@ -4139,13 +4147,15 @@ pub(crate) fn percentile(sorted_or_not: &[f32], q: f64) -> f32 {
 }
 
 fn unique_seen(values: &[f32]) -> Vec<f32> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    // Consecutive-equal collapse only: a per-spot map column repeats the
+    // layer's energy, but a re-scanned layer is its own delivery and must
+    // keep its slot so layer-N picks the Nth delivered energy.
+    let mut out: Vec<f32> = Vec::new();
     for value in values {
-        if !value.is_finite() || !seen.insert(value.to_bits()) {
+        if !value.is_finite() {
             continue;
         }
-        if out.iter().any(|have: &f32| same(*have, *value)) {
+        if out.last().is_some_and(|have| same(*have, *value)) {
             continue;
         }
         out.push(*value);
@@ -7026,16 +7036,19 @@ b,2
     }
 
     #[test]
-    fn a_short_fill_pads_to_the_clock_instead_of_vanishing() {
+    fn a_short_fill_pads_to_the_union_width_instead_of_vanishing() {
         let mut map = BTreeMap::from([("energy".to_string(), vec![70.0, 90.0])]);
         let part = BTreeMap::from([("ic1".to_string(), vec![1.0])]);
-        absorb(&mut map, &part);
+        absorb(&mut map, std::iter::once(&part));
         assert_eq!(map["ic1"].len(), 2);
         assert!(map["ic1"][1].is_nan());
-        // A part longer than the clock still cannot join.
+        // A part longer than the clock widens the join — the other columns
+        // pad rather than the new columns vanishing.
         let part = BTreeMap::from([("ic2".to_string(), vec![1.0, 2.0, 3.0])]);
-        absorb(&mut map, &part);
-        assert!(!map.contains_key("ic2"));
+        absorb(&mut map, std::iter::once(&part));
+        assert_eq!(map["ic2"].len(), 3);
+        assert_eq!(map["energy"].len(), 3);
+        assert!(map["energy"][2].is_nan());
     }
 
     #[test]

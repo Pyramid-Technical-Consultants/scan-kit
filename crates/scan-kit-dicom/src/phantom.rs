@@ -549,6 +549,9 @@ fn parse(params: &Value) -> Result<Request, String> {
         None => vec![140.0, 130.0, 120.0],
     };
     energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Exact duplicates would write two control-point pairs at one nominal
+    // energy — a doubled layer, not a wider plan.
+    energies.dedup();
     let gantry = number(params, "gantry", 0.0)?;
     let couch = number(params, "couch", 0.0)?;
     if !(-360.0..=360.0).contains(&gantry) || !(-360.0..=360.0).contains(&couch) {
@@ -665,13 +668,11 @@ fn dim(span: f64, spacing: f64) -> usize {
 }
 
 fn spot_axis(pitch: f64) -> Vec<f32> {
-    let mut value = -12.0;
-    let mut axis = Vec::new();
-    while value < 12.01 && axis.len() < 10_000 {
-        axis.push(value as f32);
-        value += pitch;
-    }
-    axis
+    // Pitches that don't divide the 24 mm field used to anchor at -12 and
+    // drift the whole raster off the isocenter — center the lattice on 0.
+    let n = (24.0 / pitch).floor() as usize + 1;
+    let start = -(n as f64 - 1.0) / 2.0 * pitch;
+    (0..n).map(|i| (start + i as f64 * pitch) as f32).collect()
 }
 
 fn inserts(phantom: &str) -> Vec<&Box> {

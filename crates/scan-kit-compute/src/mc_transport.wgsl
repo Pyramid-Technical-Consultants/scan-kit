@@ -662,7 +662,7 @@ fn inelastic(e: i32, idx: i32, p: ptr<function, Particle>, pushed: ptr<function,
         let cb = cum_d(r0, r1, si + 1, E, Ek0, Ek1);
         let ea = F[F_SE + r0 + si];
         let eb = F[F_SE + r0 + si + 1];
-        var Ts = lerp(r, ca, cb, ea, eb);
+        var Ts = select(ea, lerp(r, ca, cb, ea, eb), cb > ca);
         Ts = (E / Ek0) * UMEV * Ts;
         if (!(Ts >= ECUT)) {
             dE += Ms * Ts / (*p).M;
@@ -674,7 +674,7 @@ fn inelastic(e: i32, idx: i32, p: ptr<function, Particle>, pushed: ptr<function,
             let d1 = lerp(E, Ek0, Ek1, F[F_SDD + 13 * (r0 + si) + j], F[F_SDD + 13 * (r1 + si) + j]);
             let d2 = lerp(E, Ek0, Ek1, F[F_SDD + 13 * (r0 + si + 1) + j], F[F_SDD + 13 * (r1 + si + 1) + j]);
             // Matches MCsquare: Ts is in eV here while the row energies are in MeV.
-            dd[j] = lerp(Ts, ea, eb, d1, d2);
+            dd[j] = select(d1, lerp(Ts, ea, eb, d1, d2), eb > ea);
         }
         let ra = urand() * dd[12];
         var alo = -1;
@@ -992,7 +992,7 @@ fn into_patient(pp: ptr<function, Particle>, b: i32) -> bool {
             g_leak += p.M * p.T;
             return false;
         }
-        let t = max(tn, 0.0) + 1e-4;
+        let t = min(max(tn, 0.0) + 1e-4, tf);
         let loss = air_stop(p.T, p.mass, p.charge) * t;
         p.x += t * p.d;
         if (p.T - loss < ECUT) {

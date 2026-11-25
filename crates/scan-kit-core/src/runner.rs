@@ -78,7 +78,7 @@ pub fn parse_host(host: &str) -> Result<String, String> {
         authority.rsplit('@').next().unwrap_or(authority)
     } else {
         // Strip userinfo the same way the :// branch does.
-        text.split('/')
+        text.split(['/', '?', '#'])
             .next()
             .unwrap_or(text)
             .rsplit('@')

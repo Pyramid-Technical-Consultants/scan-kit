@@ -229,7 +229,7 @@ pub fn layer_edges(time: &[f32], layer: &[f32]) -> Vec<f32> {
     let mut marks = Vec::new();
     let mut previous: Option<i64> = None;
     for (at, id) in time.iter().zip(layer) {
-        if !at.is_finite() || !id.is_finite() {
+        if !at.is_finite() || !id.is_finite() || id.abs() >= 9e18 {
             continue;
         }
         let id = *id as i64;

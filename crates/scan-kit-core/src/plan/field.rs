@@ -154,10 +154,12 @@ pub(super) fn serpentine_indices(x: &[f64], y: &[f64], axis: &str) -> Vec<usize>
 }
 
 pub(super) fn row_tolerance(slow: &[f64], order: &[usize]) -> f64 {
+    // `order` walks slow-sorted indices, so equal values arrive adjacent —
+    // a last-value compare dedupes in O(n) where `contains` was O(n^2).
     let mut unique = Vec::new();
     for &index in order {
         let value = slow[index];
-        if !unique.contains(&value) {
+        if unique.last() != Some(&value) {
             unique.push(value);
         }
     }

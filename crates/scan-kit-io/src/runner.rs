@@ -125,7 +125,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     // Each phase can stall on a trickling peer for a full read deadline —
     // a disconnect between phases must still be able to abort the connect.
     if DISCONNECTS.load(Ordering::Acquire) != generation {
-        return Err(connection_gone());
+        return Err(connection_gone(live()));
     }
     let version = http_json(&host, "admin/version").unwrap_or(Value::Null);
     let device_type = http_json(&host, "admin/device_type").unwrap_or(Value::Null);
@@ -134,7 +134,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         .unwrap_or_else(|| DEFAULT_SESSION_ROOT.into());
     let session_id = session_capture::live_session_id(&host).unwrap_or_default();
     if DISCONNECTS.load(Ordering::Acquire) != generation {
-        return Err(connection_gone());
+        return Err(connection_gone(live()));
     }
     let plan_path = with_store(db, |conn| store::runner_plan_path(conn))
         .ok()
@@ -146,7 +146,9 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         // A disconnect (or a queued connect's own disconnect) ran during the
         // open phase — it must not be overwritten by this install.
         if DISCONNECTS.load(Ordering::Acquire) != generation {
-            return Err(connection_gone());
+            let gone = connection_gone(guard.is_some());
+            drop(guard);
+            return Err(gone);
         }
         *guard = Some(Live {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
@@ -265,10 +267,14 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         drop(guard);
         thread::sleep(Duration::from_millis(200));
         let mut guard = lock();
-        let live = guard
-            .as_mut()
-            .filter(|live| live.epoch == epoch)
-            .ok_or_else(connection_gone)?;
+        let live = match guard.as_mut().filter(|live| live.epoch == epoch) {
+            Some(live) => live,
+            None => {
+                let gone = connection_gone(guard.is_some());
+                drop(guard);
+                return Err(gone);
+            }
+        };
         // Poll until the field echoes the value just sent — a stale
         // readback would PUT to one path while the device later loads
         // whatever file the late-landing set points at.
@@ -298,10 +304,14 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     // new device with the old one's session is worse than failing.
     {
         let mut guard = lock();
-        let live = guard
-            .as_mut()
-            .filter(|live| live.epoch == epoch)
-            .ok_or_else(connection_gone)?;
+        let live = match guard.as_mut().filter(|live| live.epoch == epoch) {
+            Some(live) => live,
+            None => {
+                let gone = connection_gone(guard.is_some());
+                drop(guard);
+                return Err(gone);
+            }
+        };
         set_field(&mut live.socket, POINTS_UPLOAD, &json!(true))?;
     }
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -312,10 +322,14 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     loop {
         let code = {
             let mut guard = lock();
-            let live = guard
-                .as_mut()
-                .filter(|live| live.epoch == epoch)
-                .ok_or_else(connection_gone)?;
+            let live = match guard.as_mut().filter(|live| live.epoch == epoch) {
+                Some(live) => live,
+                None => {
+                    let gone = connection_gone(guard.is_some());
+                    drop(guard);
+                    return Err(gone);
+                }
+            };
             let state = read_one(&mut live.socket, POINTS_LOAD_STATE, Duration::from_secs(2))?;
             // A fractional state is a mid-write marker, never a success.
             io_number(&state)
@@ -340,10 +354,14 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     }
     {
         let mut guard = lock();
-        let live = guard
-            .as_mut()
-            .filter(|live| live.epoch == epoch)
-            .ok_or_else(connection_gone)?;
+        let live = match guard.as_mut().filter(|live| live.epoch == epoch) {
+            Some(live) => live,
+            None => {
+                let gone = connection_gone(guard.is_some());
+                drop(guard);
+                return Err(gone);
+            }
+        };
         let valid = read_one(&mut live.socket, POINTS_VALID, Duration::from_secs(8))?;
         subscribe_status(&mut live.socket)?;
         if !io_bool(&valid) {
@@ -365,7 +383,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     // A reconnect during read_status would attach "Plan uploaded" to the new
     // device's view — the epoch check must run after the final HTTP window.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err(connection_gone());
+        return Err(connection_gone(live()));
     }
     body["target"] = json!(target);
     body["message"] = json!(format!("Plan uploaded to {target}."));
@@ -386,13 +404,13 @@ pub fn control(action: &str) -> Result<Value, String> {
     // and the status read would report a different connection's state as the
     // actuation's result.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err(connection_gone());
+        return Err(connection_gone(live()));
     }
     let view = read_status(true, "")?;
     // read_status re-locks across its HTTP call - a reconnect inside that
     // window would report the new device's state as the actuation's result.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err(connection_gone());
+        return Err(connection_gone(live()));
     }
     Ok(view)
 }
@@ -1484,8 +1502,8 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Live>> {
 
 /// Why an epoch check failed: the entry is gone (evicted/disconnected) or
 /// a different connection took its place.
-fn connection_gone() -> String {
-    if live() {
+fn connection_gone(still_live: bool) -> String {
+    if still_live {
         "The device reconnected during the action - please retry.".into()
     } else {
         "Lost contact with the device.".into()

@@ -119,9 +119,11 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
     }
     if difference {
         let reach = if percent {
-            base_hi.abs().max(1e-6) * level.unwrap_or(10.0).clamp(0.1, 100.0) / 100.0
+            base_hi.abs().max(1e-6) * level.unwrap_or(10.0).clamp(1.0, 100.0) / 100.0
         } else {
-            level.unwrap_or(0.2).abs().max(1e-6)
+            // Same rule as the gain branch: a level outside the Full Scale
+            // slider's range must not apply a window the control can't show.
+            level.unwrap_or(0.2).abs().clamp(0.01, 5.0)
         };
         let span = if percent {
             slider("Percent", 1.0, 100.0, 1.0, 10.0, level)

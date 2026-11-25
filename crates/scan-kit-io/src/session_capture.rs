@@ -618,6 +618,13 @@ pub fn capture(
     > = BTreeMap::new();
     let mut layer_of: HashMap<String, usize> = HashMap::new();
     for (device, sheet) in &spots {
+        if sheet.column("layer_id").is_none() {
+            warnings.push(format!(
+                "{}'s spot table has no layer_id column — skipped",
+                device.name
+            ));
+            continue;
+        }
         for block in blocks(sheet, &mut layer_of) {
             hits.entry((block.layer, block.run))
                 .or_default()
@@ -626,6 +633,13 @@ pub fn capture(
         }
     }
     for (device, sheet) in &slices {
+        if sheet.column("layer_id").is_none() {
+            warnings.push(format!(
+                "{}'s timeslice table has no layer_id column — skipped",
+                device.name
+            ));
+            continue;
+        }
         for block in blocks(sheet, &mut layer_of) {
             hits.entry((block.layer, block.run))
                 .or_default()
@@ -842,11 +856,20 @@ fn join_timeslices(
                 })
             })
             .unwrap_or_default();
-        let mut eff_spot = String::new();
+        let mut eff_spot = sheet
+            .rows
+            .iter()
+            .find_map(|row| {
+                spot_i.and_then(|i| row.get(i)).and_then(|cell| {
+                    let raw = clean(cell);
+                    (!raw.is_empty()).then(|| raw.to_owned())
+                })
+            })
+            .unwrap_or_default();
         for row in &sheet.rows {
             let Some(raw) = row.get(ts_i) else { continue };
             let key = clean(raw);
-            if key.is_empty() {
+            if key.is_empty() || key.eq_ignore_ascii_case("timeslicenumber") {
                 continue;
             }
             // Key on (layer, spot, timeslice): a counter scoped narrower
