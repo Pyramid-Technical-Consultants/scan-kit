@@ -1673,7 +1673,9 @@ fn blank_result(job: &McJob) -> McResult {
         McJob::Patient(request) => (
             request.origin_mm,
             request.shape,
-            request.spacing_mm.map(|mm| mm.max(0.25)),
+            // Mirror patient_launch exactly — a blank result must report the
+            // same geometry the transport would have used.
+            request.spacing_mm,
         ),
     };
     // Clamp like empty_result does so product(shape) == values.len() —
