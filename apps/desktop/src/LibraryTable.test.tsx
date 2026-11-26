@@ -132,9 +132,6 @@ it("orders every column and keeps nulls last", () => {
   expect(compareRows(row("b"), blank, { key: "mu", direction: "asc" })).toBeLessThan(0);
   expect(clickEditsNote(9)).toBe(true);
   expect(clickEditsNote(1)).toBe(false);
-  // getComputedStyle under happy-dom yields "" or a string — the resolved
-  // color itself is unverifiable here, only that the paint ran.
-  expect(checkPaint().mark.length).toBeGreaterThanOrEqual(0);
 });
 
 it("draws checks and forwards clicks, notes, and the menu", async () => {

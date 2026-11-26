@@ -481,16 +481,11 @@ pub fn download_with(
         if !keep(report.files as u64, report.files as u64) {
             return Err("cancelled".into());
         }
-        let dest_was = Path::new(&zip_path).exists();
         package_zip(&session_dir, Path::new(&zip_path), &report.session_id, keep)?;
-        if !keep(report.files as u64, report.files as u64) {
-            // A dest that predates this run may hold a replaced artifact the
-            // rename already swapped in — only remove what this run created.
-            if !dest_was {
-                let _ = std::fs::remove_file(&zip_path);
-            }
-            return Err("cancelled".into());
-        }
+        // The rename inside package_zip is the linearizable commit — a
+        // cancel landing after it cannot be rolled back coherently (the
+        // replaced artifact is already swapped on rename-replaces
+        // platforms), so the operation committed before the cancel.
         Ok::<(String, session_capture::CaptureResult), String>((zip_path.clone(), report))
     })();
     let _ = std::fs::remove_dir_all(&staging);
@@ -1459,7 +1454,12 @@ fn package_zip(
         let mut files = Vec::new();
         collect_files(dir, 0, &mut files)?;
         files.sort();
-        for path in files {
+        for (index, path) in files.iter().enumerate() {
+            // The copy worker is detached on cancellation — without a check
+            // inside the loop a cancelled task keeps compressing gigabytes.
+            if !keep(index as u64, 0) {
+                return Err("cancelled".into());
+            }
             let rel = path.strip_prefix(dir).map_err(|err| err.to_string())?;
             let name = format!("{session_id}/{}", rel.to_string_lossy().replace('\\', "/"));
             zip.start_file(name, options)
