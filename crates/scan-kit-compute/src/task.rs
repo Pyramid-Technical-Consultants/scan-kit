@@ -202,6 +202,15 @@ pub fn start_task(
                     return Ok(json!({ "task": id, "generation": task.generation }));
                 }
             }
+            // Adoption failed: the user cancelled (or replaced) the old
+            // generation while this start was off-lock in retarget. Falling
+            // through would build a fresh task for the work that was just
+            // cancelled — the cancellation must win.
+            return Ok(json!({
+                "task": 0,
+                "generation": 0,
+                "superseded": true,
+            }));
         }
     }
     let mut driver = lock();
