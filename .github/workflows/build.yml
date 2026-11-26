@@ -8,6 +8,15 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
+
+# A push to a pull request supersedes the run still in flight for the same
+# ref — cancel it instead of paying for both. Branch and tag pushes keep
+# their full runs (a merge's red/green signal must not be cancelled by the
+# next merge).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
