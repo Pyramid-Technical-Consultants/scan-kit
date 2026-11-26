@@ -4,7 +4,6 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { GridCell, GridSelection, Theme } from "@glideapps/glide-data-grid";
 
 import {
-  checkPaint,
   clickEditsNote,
   compareRows,
   LibraryTable,
