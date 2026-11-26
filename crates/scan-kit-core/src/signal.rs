@@ -348,14 +348,17 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
     for i in 0..=bins {
         edges.push((f64::from(lo) + span * i as f64 / bins as f64) as f32);
     }
-    let mut counts = vec![0.0f32; bins];
+    // f32 counters freeze at 2^24 — adding 1.0 rounds away. Count exactly
+    // in usize and convert once; large volumes cross that threshold.
+    let mut counts = vec![0usize; bins];
     for value in finite {
         let mut index = ((f64::from(value) - f64::from(lo)) / span * bins as f64) as usize;
         if index >= bins {
             index = bins - 1;
         }
-        counts[index] += 1.0;
+        counts[index] += 1;
     }
+    let counts = counts.into_iter().map(|count| count as f32).collect();
     (edges, counts)
 }
 
@@ -840,16 +843,20 @@ pub fn hv_step_window(time: &[f32], current: &[f32]) -> Option<(f32, f32)> {
         hi += 1;
     }
     // A NaN/inf edge timestamp silently erases a measurable capacitance -
-    // fall back to the row ends when the excursion edge is not finite.
+    // fall back when the excursion edge is not finite. The row end itself
+    // can be the non-finite edge, so fall back to the nearest finite
+    // timestamp, not the positional end.
+    let first_finite = time.iter().copied().find(|v| v.is_finite())?;
+    let last_finite = time.iter().copied().rev().find(|v| v.is_finite())?;
     let left = if time[lo].is_finite() {
         time[lo]
     } else {
-        time[0]
+        first_finite
     };
     let right = if time[hi].is_finite() {
         time[hi]
     } else {
-        time[n - 1]
+        last_finite
     };
     Some((left - 40.0, right + 40.0))
 }
@@ -1069,6 +1076,29 @@ pub fn resample_nearest(source: &[f32], shape: [usize; 3], out_shape: [usize; 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn histogram_counts_past_the_f32_exact_integer_ceiling() {
+        // 2^24 is where f32 accumulation freezes — a 20M-sample column
+        // must count exactly, not pin at 16,777,216.
+        let values = vec![1.0f32; 20_000_000];
+        let (_, counts) = histogram(&values, 2);
+        assert_eq!(counts[1], 20_000_000.0);
+    }
+
+    #[test]
+    fn hv_step_window_falls_back_to_the_nearest_finite_timestamp() {
+        // The excursion reaches the array end and the end itself is NaN —
+        // the positional fallback is the same NaN, erasing the measurement.
+        let time = [f32::NAN, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let current = [10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0];
+        let (left, _) = hv_step_window(&time, &current).unwrap();
+        assert!(left.is_finite(), "left fallback must be finite: {left}");
+        let time = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, f32::NAN];
+        let current = [0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0];
+        let (_, right) = hv_step_window(&time, &current).unwrap();
+        assert!(right.is_finite(), "right fallback must be finite: {right}");
+    }
 
     #[test]
     fn a_non_finite_edge_timestamp_falls_back_to_the_row_ends() {

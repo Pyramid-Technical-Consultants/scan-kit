@@ -407,13 +407,12 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
             let size = floats_tag(cp, tag(0x300A, 0x0398));
-            let limit = n.min(xy.len() / 2);
-            // A declared layer whose map holds fewer than two values is the
-            // same corrupt-map failure read_plan rejects — skipping it
-            // would silently drop the energy layer.
-            if limit == 0 {
-                return Err("scan spot position map is missing or corrupt".into());
+            // Same strict VM rule as read_plan — a short map must not
+            // silently drop the layer's tail spots.
+            if !xy.len().is_multiple_of(2) || xy.len() / 2 != n {
+                return Err("scan spot position map does not match the declared spot count".into());
             }
+            let limit = n;
             // The weights tag must hold one entry per spot position — a
             // short array would silently drop the tail of the beam.
             if has_weights && weights.len() < limit {
@@ -531,7 +530,7 @@ pub fn scanner_label(scanner: &str, hu: f32) -> i32 {
 }
 
 fn density_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> f32 {
-    if table.0.len() < 2 {
+    if table.0.len() < 2 || !hu.is_finite() {
         return hu_density(hu);
     }
     let i = below(&table.0, hu).clamp(0, table.0.len() - 2);
@@ -546,7 +545,7 @@ fn density_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> f32 {
 }
 
 fn label_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> i32 {
-    if table.0.is_empty() {
+    if table.0.is_empty() || !hu.is_finite() {
         return hu_label(hu);
     }
     let i = below(&table.0, hu).clamp(0, table.1.len() - 1);
@@ -1271,14 +1270,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                     "beam {number}: a treatment beam has no nominal energy"
                 ));
             }
-            let limit = n.min(xy.len() / 2);
-            if limit == 0 {
-                // n > 0 spots declared but no usable positions - a silent
-                // continue would drop the layer from the computed dose.
+            // The position map's VM is exactly 2n — a short map silently
+            // dropping the layer's tail spots is the same class of corrupt
+            // input the weights check below refuses, not a valid plan.
+            if !xy.len().is_multiple_of(2) || xy.len() / 2 != n {
                 return Err(format!(
-                    "beam {number}: scan spot position map is missing or corrupt"
+                    "beam {number}: scan spot position map does not match the declared spot count"
                 ));
             }
+            let limit = n;
             if has_weights && weights.len() < limit {
                 return Err(format!(
                     "beam {number}: meterset weights do not match the spot count"
@@ -1328,6 +1328,13 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                     match (cums.get(k), cums.get(k + 1)) {
                         (Some(&from), Some(&to)) if (to - from).is_finite() => {
                             let segment = to - from;
+                            if segment < 0.0 {
+                                // The cumulative weights went backwards —
+                                // corrupt input, not a non-delivering CP.
+                                return Err(format!(
+                                    "beam {number}: cumulative meterset weights are not monotonic"
+                                ));
+                            }
                             if segment > 0.0 {
                                 meterset * segment / final_weight / limit as f32
                             } else {
@@ -1898,6 +1905,12 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
     // Known binary VRs decode as little-endian floats on the VR, not on the
     // payload's byte shape — an "AAAA" OF would otherwise read as DS text.
     if matches!(&elem.vr, b"FL" | b"OF") {
+        // A length that is not a multiple of the element size is a truncated
+        // final value — the empty result routes into the loud
+        // missing-or-corrupt errors instead of decoding as if complete.
+        if elem.bytes.len() % 4 != 0 {
+            return Vec::new();
+        }
         return elem
             .bytes
             .as_chunks::<4>()
@@ -1909,6 +1922,9 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
     // FD/OD are the doubles — 300A spot position/meterset maps are spec'd
     // FD, so an explicit-VR plan reads f64s, not pairs of garbage f32s.
     if matches!(&elem.vr, b"FD" | b"OD") {
+        if elem.bytes.len() % 8 != 0 {
+            return Vec::new();
+        }
         return elem
             .bytes
             .as_chunks::<8>()
@@ -1940,6 +1956,9 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
             .iter()
             .any(|byte| !(byte.is_ascii_graphic() || *byte == b' '))
     {
+        if elem.bytes.len() % 4 != 0 {
+            return Vec::new();
+        }
         return elem
             .bytes
             .as_chunks::<4>()
@@ -3328,12 +3347,33 @@ mod tests {
     }
 
     #[test]
-    fn a_short_position_list_does_not_invent_spots_at_the_origin() {
-        let plan = read_plan(&plan_with_spot_count(3, 2), "f".into(), "HFS").unwrap();
-        let spots = &plan.beams[0].spots;
-        assert_eq!(spots.len(), 2);
-        assert!((spots[0].x - 1.0).abs() < 1e-4);
-        assert!((spots[1].x - 2.0).abs() < 1e-4);
+    fn a_partial_trailing_float_is_corrupt_not_dropped() {
+        // Five bytes of FL payload = one whole float plus a truncated one —
+        // decoding it as-if-complete would drop corruption silently.
+        let elems = vec![Elem {
+            tag: tag(0x300A, 0x0394),
+            vr: *b"FL",
+            items: Vec::new(),
+            bytes: vec![0u8; 5],
+        }];
+        assert!(floats_tag(&elems, tag(0x300A, 0x0394)).is_empty());
+        let elems = vec![Elem {
+            tag: tag(0x300A, 0x0394),
+            vr: *b"FD",
+            items: Vec::new(),
+            bytes: vec![0u8; 12],
+        }];
+        assert!(floats_tag(&elems, tag(0x300A, 0x0394)).is_empty());
+    }
+
+    #[test]
+    fn a_short_position_list_is_corrupt_not_a_smaller_beam() {
+        // The position map's VM is exactly 2n — truncating to the map length
+        // would deliver a beam missing its tail spots with no error anywhere.
+        let err = read_plan(&plan_with_spot_count(3, 2), "f".into(), "HFS")
+            .err()
+            .unwrap();
+        assert!(err.contains("spot count"), "{err}");
         // A negative count parses as zero spots instead of hanging the load.
         let plan = read_plan(&plan_with_spot_count(-4, 2), "f".into(), "HFS").unwrap();
         assert!(plan.beams[0].spots.is_empty());

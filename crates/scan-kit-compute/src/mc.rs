@@ -709,6 +709,13 @@ fn head_stuck(device: &wgpu::Device, gpu: &McGpu) -> bool {
             .is_ok()
         {
             subs.pop_front();
+            // The stamp is submission time — time spent queued behind
+            // healthy siblings is not time spent stuck at the head. Reset
+            // the newly exposed front's clock so only continuous time as
+            // the oldest pending submission counts toward the wedge bound.
+            if let Some((_, at)) = subs.front_mut() {
+                *at = Instant::now();
+            }
             continue;
         }
         return at.elapsed() > Duration::from_secs(30);
@@ -766,6 +773,18 @@ async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
         return Ok(gpu);
     }
     let gpu = Arc::new(open_gpu().await?);
+    // wgpu 30 PANICS out of Device::poll on device loss rather than
+    // returning a PollError — the wait loops' gpu_lost arm is unreachable
+    // on that path. The lost callback is the only eviction that always
+    // fires: drop the cache so the next open builds a fresh device instead
+    // of cloning the dead one.
+    let weak = Arc::downgrade(&gpu);
+    gpu.device.set_device_lost_callback(move |reason, message| {
+        eprintln!("scan-kit-mc: GPU device lost ({reason:?}): {message}");
+        if let Some(gpu) = weak.upgrade() {
+            gpu_lost(&gpu);
+        }
+    });
     *GPU.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&gpu));
     Ok(gpu)
 }

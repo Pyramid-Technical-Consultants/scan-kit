@@ -100,9 +100,10 @@ pub fn median_unstable(values: &mut [f32]) -> f32 {
         select_rank(values, mid)
     } else {
         let (low, high) = select_ranks(values, mid - 1, mid);
-        // Halve each rank before adding — `low + high` overflows to ±inf
-        // for finite pairs like [3e38, 3e38].
-        low * 0.5 + high * 0.5
+        // Interpolate in f64 — halve-before-add underflows the smallest
+        // subnormals to zero, and a straight sum overflows finite pairs
+        // like [3e38, 3e38].
+        (f64::from(low) * 0.5 + f64::from(high) * 0.5) as f32
     }
 }
 
@@ -120,7 +121,7 @@ pub fn percentile_linear(values: &mut [f32], q: f64) -> f32 {
     if lo == hi {
         return low;
     }
-    low * (1.0 - frac) + high * frac
+    (f64::from(low) * (1.0 - f64::from(frac)) + f64::from(high) * f64::from(frac)) as f32
 }
 
 /// Nearest rank. An empty slice returns 0, which is what distribution limits use.
@@ -165,7 +166,8 @@ pub fn quantiles_at(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
             if lo == hi {
                 return values[lo];
             }
-            values[lo] * (1.0 - frac) + values[hi] * frac
+            (f64::from(values[lo]) * (1.0 - f64::from(frac))
+                + f64::from(values[hi]) * f64::from(frac)) as f32
         })
         .collect()
 }
@@ -182,6 +184,15 @@ mod tests {
         let hi = pos.ceil().min((sorted.len() - 1) as f64) as usize;
         let frac = (pos - lo as f64) as f32;
         sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
+
+    #[test]
+    fn identical_subnormals_interpolate_to_themselves() {
+        let tiny = f32::from_bits(1);
+        let mut values = [tiny, tiny];
+        assert_eq!(median_unstable(&mut values), tiny);
+        let mut values = [tiny, tiny];
+        assert_eq!(percentile_linear(&mut values, 0.5), tiny);
     }
 
     #[test]
@@ -227,7 +238,8 @@ mod tests {
                 let lo = (pos.floor() as usize).min(last);
                 let hi = (pos.ceil() as usize).min(last);
                 let frac = (pos - lo as f64) as f32;
-                values[lo] * (1.0 - frac) + values[hi] * frac
+                (f64::from(values[lo]) * (1.0 - f64::from(frac))
+                    + f64::from(values[hi]) * f64::from(frac)) as f32
             })
             .collect()
     }

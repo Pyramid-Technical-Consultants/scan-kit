@@ -362,19 +362,16 @@ pub(crate) fn finish_patient_report(
         "provenance": report.provenance,
     });
     if !csv.is_empty() {
-        // A failed CSV must not leave the PDF looking like a successful
-        // export — the task reports Err either way.
+        // write_pdf already replaced any pre-existing PDF at dest, so
+        // deleting the new one is not a rollback — it compounds the failure
+        // by destroying the only artifact left. Leave it and name the
+        // incomplete pair; the export still reports Err.
         if let Err(err) = scan_kit_core::atomic_write(&csv_path, csv.as_bytes()) {
-            return Err(match std::fs::remove_file(&pdf) {
-                Ok(()) => format!("{}: {err}", csv_path.display()),
-                // The rollback failed too — a fresh PDF now sits beside an
-                // older CSV, so the error must name the mismatched pair.
-                Err(remove) => format!(
-                    "{}: {err}; {} could not be removed ({remove})",
-                    csv_path.display(),
-                    pdf.display()
-                ),
-            });
+            return Err(format!(
+                "{}: {err}; {} was written without its sidecar",
+                csv_path.display(),
+                pdf.display()
+            ));
         }
         out["dvh_csv"] = json!(csv_path.display().to_string());
     } else {
@@ -656,14 +653,48 @@ mod tests {
             180,
             [0.1, 0.1, 0.1, 1.0],
             [0.9, 0.9, 0.9, 1.0],
-            &[[0.8, 0.8, 0.8, 1.0], [0.4, 0.4, 0.4, 1.0]],
+            &[[0.8, 0.1, 0.1, 1.0], [0.1, 0.1, 0.8, 1.0]],
             &Cancel::new(),
         )
         .unwrap();
         assert!(frame["title"].as_str().unwrap().contains("vs"));
-        assert!(frame["rgba_base64"].as_str().unwrap().len() > 32);
         assert_eq!(frame["width"], 320);
+        // Positive control: decode the frame and demand series paint — a
+        // blank frame base64s to the same bulk, so length proves nothing.
+        let rgba = decode64(frame["rgba_base64"].as_str().unwrap());
+        assert_eq!(rgba.len(), 320 * 180 * 4);
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[0] > 150 && px[1] < 90 && px[2] < 90),
+            "no red series pixel — the frame painted nothing"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn decode64(text: &str) -> Vec<u8> {
+        fn value(byte: u8) -> u32 {
+            match byte {
+                b'A'..=b'Z' => (byte - b'A') as u32,
+                b'a'..=b'z' => (byte - b'a' + 26) as u32,
+                b'0'..=b'9' => (byte - b'0' + 52) as u32,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0,
+            }
+        }
+        let bytes: Vec<u8> = text.bytes().filter(|byte| *byte != b'=').collect();
+        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+        for quad in bytes.chunks(4) {
+            let acc: u32 = quad
+                .iter()
+                .fold(0u32, |acc, byte| (acc << 6) | value(*byte));
+            out.extend_from_slice(&acc.to_be_bytes()[1..]);
+        }
+        let padding = text.bytes().filter(|byte| *byte == b'=').count();
+        out.truncate((text.len() / 4) * 3 - padding);
+        out
     }
 
     #[test]
@@ -697,8 +728,21 @@ mod tests {
         assert!(header.title.contains("vs"));
         assert!(header.panels.iter().all(|panel| panel.series.is_empty()));
         let mut plot = Plot::from_payload(&opened).unwrap();
-        let frame = plot.draw(80, 60, &PlotInput::default()).unwrap();
-        assert_eq!(frame.rgba.len(), 80 * 60 * 4);
+        // 80x60 paints nothing at all — even chrome — so a size assertion
+        // alone is vacuous. Draw big enough that series paint, then demand it.
+        let frame = plot.draw(320, 180, &PlotInput::default()).unwrap();
+        assert_eq!(frame.rgba.len(), 320 * 180 * 4);
+        // Positive control: the series color is [0.8, 0.2, 0.2] — a blank
+        // frame (every mark dropped upstream) must fail, not pass on size.
+        assert!(
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[0] > 150 && px[1] < 100 && px[2] < 100),
+            "no red series pixel — the frame painted nothing"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
