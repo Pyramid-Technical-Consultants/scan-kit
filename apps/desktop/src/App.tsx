@@ -324,6 +324,7 @@ export default function App() {
   // written inside effects.
   const selectionPending = useRef<string[] | null>(null);
   const selectionSeq = useRef(0);
+  const trashRequestSeq = useRef(0);
   const loadDepth = useRef(0);
   const noteBusy = useRef(false);
   const trashing = useRef(false);
@@ -832,11 +833,18 @@ export default function App() {
       if (path == null) {
         return;
       }
+      const request = ++trashRequestSeq.current;
       try {
         const result = await invoke<{ paths: string[] }>("scan_kit_session_storage_paths", {
           path,
           sessionId: row?.folder_id ?? sessionId,
         });
+        // A newer trash request wins — a slow lookup resolving late must not
+        // retarget or resurrect the confirmation for a session the user has
+        // moved past.
+        if (request !== trashRequestSeq.current) {
+          return;
+        }
         if (result.paths.length === 0) {
           notify(`Nothing on disk for session ${sessionId}`);
           return;

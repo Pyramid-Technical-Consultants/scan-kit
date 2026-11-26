@@ -202,6 +202,15 @@ pub fn start_task(
                     return Ok(json!({ "task": id, "generation": task.generation }));
                 }
             }
+            // Adoption failed: the user cancelled (or replaced) the old
+            // generation while this start was off-lock in retarget. Falling
+            // through would build a fresh task for the work that was just
+            // cancelled — the cancellation must win.
+            return Ok(json!({
+                "task": 0,
+                "generation": 0,
+                "superseded": true,
+            }));
         }
     }
     let mut driver = lock();
@@ -1664,7 +1673,9 @@ fn blank_result(job: &McJob) -> McResult {
         McJob::Patient(request) => (
             request.origin_mm,
             request.shape,
-            request.spacing_mm.map(|mm| mm.max(0.25)),
+            // Mirror patient_launch exactly — a blank result must report the
+            // same geometry the transport would have used.
+            request.spacing_mm,
         ),
     };
     // Clamp like empty_result does so product(shape) == values.len() —

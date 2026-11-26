@@ -163,7 +163,18 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             // second-generation RT UIDs (...481.20-481.25), which this
             // reader deliberately rejects inside.
             if !wanted.contains(&class.as_str()) {
-                continue;
+                // The meta can disagree with the dataset — a mislabeled
+                // header must not silently drop real slices from the
+                // volume. Verify against the dataset's own class before
+                // skipping; a parse failure keeps the old skip, since
+                // those datasets can carry encodings this reader rejects.
+                let dataset_class = parse_file(&bytes)
+                    .ok()
+                    .map(|elems| text_tag(&elems, tag(0x0008, 0x0016)))
+                    .unwrap_or_default();
+                if !wanted.contains(&dataset_class.as_str()) {
+                    continue;
+                }
             }
         }
         let elems = parse_file(&bytes).map_err(|err| format!("{}: {err}", file.display()))?;

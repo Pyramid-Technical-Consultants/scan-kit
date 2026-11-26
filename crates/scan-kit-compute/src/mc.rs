@@ -469,6 +469,14 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
 }
 
 fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
+    // The shader bounds voxel_index against f32(dims) — an odd axis past
+    // 2^24 rounds up and admits the boundary index into the next row. Same
+    // contract slab_launch enforces.
+    if request.shape.iter().any(|dim| *dim > (1 << 23)) {
+        return Err(ComputeError::Message(
+            "a grid axis cannot exceed 8M voxels".into(),
+        ));
+    }
     // The shader clamps each axis to >=1 — the material/density check must
     // read the same shape or a zero axis validates 0-length buffers the GPU
     // then indexes out of bounds.
@@ -613,7 +621,11 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
         .iter()
         .map(|chunk| u32::from_le_bytes(*chunk))
         .collect();
-    let spacing = request.spacing_mm.map(|mm| mm.max(0.25) / 10.0);
+    // Patient spacing is measured CT geometry, not a scoring-resolution
+    // knob — clamping it would stretch the same tissue voxels over a larger
+    // physical volume and skew dose normalization. The validation above
+    // already enforces finite positive extents.
+    let spacing = request.spacing_mm.map(|mm| mm / 10.0);
     Ok(Launch {
         spots: kept_spots,
         protons,
@@ -2146,6 +2158,19 @@ mod tests {
                 let_water: false,
             }
         }
+        // Sub-clamp CT spacing is measured geometry — the launch must
+        // preserve it exactly rather than stretching the tissue volume.
+        let mut fine = request();
+        fine.spacing_mm = [0.1, 0.1, 0.1];
+        let launch = patient_launch(&fine).expect("launch");
+        assert_eq!(launch.spacing_cm, [0.01, 0.01, 0.01]);
+        // An axis past 2^23 rounds in the shader's f32 boundary compare —
+        // slab mode already rejects it, patient mode must too.
+        let mut huge = request();
+        huge.shape = [(1 << 23) + 1, 1, 1];
+        huge.material = vec![0; (1 << 23) + 1];
+        huge.density = vec![1.0; (1 << 23) + 1];
+        assert!(patient_launch(&huge).is_err());
         let mut bad = request();
         bad.material[0] = 250;
         assert!(patient_launch(&bad).is_err());

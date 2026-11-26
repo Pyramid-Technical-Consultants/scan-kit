@@ -678,6 +678,12 @@ export function AnalysisView({
         setLineEpoch((epoch) => epoch + 1);
         return { painted: "", stop: true };
       }
+      // A full-lines recalculation is already in flight — another cell
+      // hitting the same missing-lines payload is the expected retry path,
+      // not a new failure.
+      if (missing && askedLines.current) {
+        return { painted: "", stop: true };
+      }
       // Drop the bad bytes — each DoseCell's onReady retries this paint, and
       // keeping the payload would re-throw (and re-toast) per cell.
       payload.current = null;
