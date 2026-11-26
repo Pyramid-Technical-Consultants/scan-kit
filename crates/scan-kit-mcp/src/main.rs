@@ -317,7 +317,11 @@ impl ServerHandler for ScanKit {
                 // 16 MiB) parsed args behind the 8 live dispatches.
                 static DISPATCH_LIMIT: tokio::sync::Semaphore =
                     tokio::sync::Semaphore::const_new(8);
-                let _permit = tokio::select! {
+                // The permit must live as long as the work it admits — held
+                // here in the async scope it would drop on cancellation
+                // while the detached blocking task keeps running, leaking
+                // the in-flight cap. It moves into the closure below.
+                let permit = tokio::select! {
                     permit = DISPATCH_LIMIT.acquire() => permit.map_err(|_| {
                         McpError::internal_error("dispatch limiter closed", None)
                     })?,
@@ -376,8 +380,10 @@ impl ServerHandler for ScanKit {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let flag = cancel.clone();
                 let tool = name.clone();
-                let joined =
-                    tokio::task::spawn_blocking(move || dispatch(&name, &input, &cancel));
+                let joined = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    dispatch(&name, &input, &cancel)
+                });
                 // A blocking task cannot be aborted mid-run, but selecting
                 // frees this request now. The flag is set HERE, in the arm
                 // — a watcher task needs a separate scheduling slot and
