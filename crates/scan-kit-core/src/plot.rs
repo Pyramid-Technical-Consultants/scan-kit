@@ -614,7 +614,9 @@ pub fn apply_clip(matrix: [f32; 16], x: f32, y: f32, z: f32) -> [f32; 4] {
 /// Framebuffer pixel of a data point. `y` grows downward. Matches the vertex shader.
 pub fn project(matrix: [f32; 16], point: [f32; 3], width: f32, height: f32) -> [f32; 2] {
     let clip = apply_clip(matrix, point[0], point[1], point[2]);
-    let w = if clip[3].abs() < 1.0e-8 { 1.0 } else { clip[3] };
+    // Clamp like the shader's to_px (max(w, 1e-6)) — a negative or tiny w
+    // must diverge identically in hover/CPU-fallback projection and GPU paint.
+    let w = clip[3].max(1.0e-6);
     let ndc_x = clip[0] / w;
     let ndc_y = clip[1] / w;
     let width = width.max(1.0);
