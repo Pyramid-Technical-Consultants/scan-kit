@@ -779,13 +779,12 @@ async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
     // fires: drop the cache so the next open builds a fresh device instead
     // of cloning the dead one.
     let weak = Arc::downgrade(&gpu);
-    gpu.device
-        .set_device_lost_callback(move |reason, message| {
-            eprintln!("scan-kit-mc: GPU device lost ({reason:?}): {message}");
-            if let Some(gpu) = weak.upgrade() {
-                gpu_lost(&gpu);
-            }
-        });
+    gpu.device.set_device_lost_callback(move |reason, message| {
+        eprintln!("scan-kit-mc: GPU device lost ({reason:?}): {message}");
+        if let Some(gpu) = weak.upgrade() {
+            gpu_lost(&gpu);
+        }
+    });
     *GPU.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&gpu));
     Ok(gpu)
 }

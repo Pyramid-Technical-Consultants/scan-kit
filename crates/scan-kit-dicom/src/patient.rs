@@ -410,9 +410,7 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             // Same strict VM rule as read_plan — a short map must not
             // silently drop the layer's tail spots.
             if xy.len() % 2 != 0 || xy.len() / 2 != n {
-                return Err(
-                    "scan spot position map does not match the declared spot count".into(),
-                );
+                return Err("scan spot position map does not match the declared spot count".into());
             }
             let limit = n;
             // The weights tag must hold one entry per spot position — a

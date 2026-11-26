@@ -685,14 +685,15 @@ mod tests {
         let bytes: Vec<u8> = text.bytes().filter(|byte| *byte != b'=').collect();
         let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
         for quad in bytes.chunks(4) {
-            let acc: u32 = quad.iter().fold(0u32, |acc, byte| (acc << 6) | value(*byte));
+            let acc: u32 = quad
+                .iter()
+                .fold(0u32, |acc, byte| (acc << 6) | value(*byte));
             out.extend_from_slice(&acc.to_be_bytes()[1..]);
         }
         let padding = text.bytes().filter(|byte| *byte == b'=').count();
         out.truncate((text.len() / 4) * 3 - padding);
         out
     }
-
 
     #[test]
     fn open_plot_packs_a_header_and_marks_the_plot_can_draw() {
