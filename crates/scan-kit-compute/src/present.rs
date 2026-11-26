@@ -664,7 +664,9 @@ mod tests {
         let rgba = decode64(frame["rgba_base64"].as_str().unwrap());
         assert_eq!(rgba.len(), 320 * 180 * 4);
         assert!(
-            rgba.chunks_exact(4)
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
                 .any(|px| px[0] > 150 && px[1] < 90 && px[2] < 90),
             "no red series pixel — the frame painted nothing"
         );
@@ -735,7 +737,9 @@ mod tests {
         assert!(
             frame
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|px| px[0] > 150 && px[1] < 100 && px[2] < 100),
             "no red series pixel — the frame painted nothing"
         );

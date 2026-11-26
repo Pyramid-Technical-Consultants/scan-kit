@@ -1464,7 +1464,7 @@ fn package_zip(
             let name = format!("{session_id}/{}", rel.to_string_lossy().replace('\\', "/"));
             zip.start_file(name, options)
                 .map_err(|err| err.to_string())?;
-            let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+            let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
             std::io::Write::write_all(&mut zip, &bytes).map_err(|err| err.to_string())?;
         }
         zip.finish().map_err(|err| err.to_string())?;

@@ -409,7 +409,7 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             let size = floats_tag(cp, tag(0x300A, 0x0398));
             // Same strict VM rule as read_plan — a short map must not
             // silently drop the layer's tail spots.
-            if xy.len() % 2 != 0 || xy.len() / 2 != n {
+            if !xy.len().is_multiple_of(2) || xy.len() / 2 != n {
                 return Err("scan spot position map does not match the declared spot count".into());
             }
             let limit = n;
@@ -1273,7 +1273,7 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             // The position map's VM is exactly 2n — a short map silently
             // dropping the layer's tail spots is the same class of corrupt
             // input the weights check below refuses, not a valid plan.
-            if xy.len() % 2 != 0 || xy.len() / 2 != n {
+            if !xy.len().is_multiple_of(2) || xy.len() / 2 != n {
                 return Err(format!(
                     "beam {number}: scan spot position map does not match the declared spot count"
                 ));

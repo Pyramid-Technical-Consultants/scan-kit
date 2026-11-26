@@ -166,16 +166,18 @@ pub fn count_grid(
     cols: usize,
     rows: usize,
 ) -> Vec<f32> {
-    let mut counts = vec![0.0f32; cols.checked_mul(rows).unwrap_or(0)];
+    // usize counters — f32 accumulation freezes at 2^24, which dense
+    // cloud cells cross, pinning them all at the same wrong value.
+    let mut counts = vec![0usize; cols.checked_mul(rows).unwrap_or(0)];
     if counts.is_empty() {
-        return counts;
+        return Vec::new();
     }
     // f64 spans: a frame wider than f32::MAX (legitimately produced by
     // density_range on extreme finite data) must still grid, not zero out.
     let dx = f64::from(x1) - f64::from(x0);
     let dy = f64::from(y1) - f64::from(y0);
     if !dx.is_finite() || !dy.is_finite() {
-        return counts;
+        return counts.into_iter().map(|count| count as f32).collect();
     }
     let dx = if dx > 0.0 { dx } else { 1e-6 };
     let dy = if dy > 0.0 { dy } else { 1e-6 };
@@ -185,9 +187,9 @@ pub fn count_grid(
         }
         let ix = ((f64::from(*x) - f64::from(x0)) / dx * cols as f64) as usize;
         let iy = ((f64::from(*y) - f64::from(y0)) / dy * rows as f64) as usize;
-        counts[ix.min(cols - 1) + cols * iy.min(rows - 1)] += 1.0;
+        counts[ix.min(cols - 1) + cols * iy.min(rows - 1)] += 1;
     }
-    counts
+    counts.into_iter().map(|count| count as f32).collect()
 }
 
 fn timed_source(
@@ -285,9 +287,10 @@ fn density_range(values: &[f32]) -> (f32, f32) {
     if hi <= lo {
         (lo - 0.5, hi + 0.5)
     } else {
-        let mid = (lo + hi) / 2.0;
-        let half = (hi - lo) / 2.0;
-        (mid - half, mid + half)
+        // (mid - half, mid + half) reconstructs (lo, hi) exactly in real
+        // arithmetic — the detour can only overflow lo + hi for finite
+        // same-sign extremes and collapse the frame to (inf, inf).
+        (lo, hi)
     }
 }
 
@@ -525,6 +528,19 @@ mod tests {
             4,
         );
         assert_eq!(counts.iter().sum::<f32>(), 3.0, "{counts:?}");
+    }
+
+    #[test]
+    fn density_range_keeps_finite_same_sign_extremes() {
+        // lo + hi overflows for finite extremes — the midpoint detour
+        // collapsed the frame to (inf, inf) and no contour emitted at all.
+        let max = f32::from_bits(0x7f7f_ffff);
+        let below = f32::from_bits(0x7f7f_fffe);
+        let mut values = vec![max; 2001];
+        values[0] = below;
+        let (lo, hi) = density_range(&values);
+        assert!(lo.is_finite() && hi.is_finite(), "{lo} {hi}");
+        assert!(hi >= lo);
     }
 
     #[test]
