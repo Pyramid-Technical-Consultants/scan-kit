@@ -302,10 +302,12 @@ export function ConfigTuning({
       }
       setOpening(true);
       try {
-        const opened = await invoke<Opened>("scan_kit_config_open", {
-          dataDir: folder,
-          sessionId,
-        });
+        // Half-specifying the pair is a backend error — with no anchor
+        // session the remembered-config fallback is the honest open.
+        const opened = await invoke<Opened>(
+          "scan_kit_config_open",
+          sessionId ? { dataDir: folder, sessionId } : {},
+        );
         if (cancel || seq !== openSeq.current || opened.path == null) {
           return;
         }
@@ -620,13 +622,13 @@ export function ConfigTuning({
         nextXml = applied.xml;
         nextForm = applied.form;
       }
+      // hide_unused has its own writer — scan_kit_config_hide lands the
+      // toggle directly. Sending the snapshot captured when save started
+      // would overwrite a newer toggle that landed during the copy.
       await invoke("scan_kit_config_save", {
         source: configDir,
         dest: selected,
         files: [{ rel: file, xml: nextXml }],
-        // The toggle's own invoke can still be in flight — send what the
-        // user last set, not the render snapshot.
-        hideUnused: hideUnusedRef.current,
       });
       // Same guard after the awaits — an edit landing during apply/save must
       // not have its dirty flag cleared by the older snapshot.

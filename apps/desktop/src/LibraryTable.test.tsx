@@ -230,7 +230,9 @@ it("draws checks and forwards clicks, notes, and the menu", async () => {
   // toContain cannot catch a missing justToggled guard — the two dbl-clicks
   // would each append "s2" again. Pin the exact calls.
   expect(checks).toEqual(["s2"]);
-  expect(notes).toEqual(["next"]);
+  // The revert is itself a real write: "next" already committed, so
+  // dropping "other" would strand the backend at "next".
+  expect(notes).toEqual(["next", "other"]);
   expect(menus).toEqual([13]);
   expect(sorts).toEqual(["date"]);
   expect(header).toBe(1);

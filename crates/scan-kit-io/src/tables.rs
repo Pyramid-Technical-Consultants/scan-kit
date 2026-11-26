@@ -5081,7 +5081,28 @@ fn read_more(file: &mut std::fs::File, newlines: usize, bytes_per_row: usize) ->
     let mut tmp = vec![0u8; 8 * 1024 * 1024];
     loop {
         match file.read(&mut tmp) {
-            Ok(0) => return (buf, true),
+            Ok(0) => {
+                // The file clock can reach the write head mid-row: an
+                // unterminated final line is a fragment of a row still
+                // being written, not data. Parsing it publishes fabricated
+                // values, and the EOF mark would settle the file with the
+                // corrupt row cached. Rewind to the last full line like
+                // the error arm below; the next poll completes the row.
+                if !buf.is_empty() && !buf.ends_with(b"\n") {
+                    let cut = buf
+                        .iter()
+                        .rposition(|byte| *byte == b'\n')
+                        .map(|at| at + 1)
+                        .unwrap_or(0);
+                    let extra = buf.len() - cut;
+                    buf.truncate(cut);
+                    if extra > 0 {
+                        let _ = file.seek(SeekFrom::Current(-(extra as i64)));
+                    }
+                    return (buf, false);
+                }
+                return (buf, true);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
                 // A mid-line read error must not fold the partial tail in as
@@ -6049,6 +6070,33 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unterminated_final_row_is_not_folded_at_eof() {
+        // A live file read at the write head mid-row must not publish the
+        // fragment as a complete row or mark the file done.
+        let dir = std::env::temp_dir().join(format!("sk_tail_eof_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.csv");
+        std::fs::write(&path, "a,b\n1,2\n3,45").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let (buf, eof) = read_more(&mut file, 10, 64);
+        assert!(!eof, "an unterminated final row is not the end of the file");
+        assert_eq!(buf, b"a,b\n1,2\n");
+        // The writer completes the row — the next poll reads it whole.
+        use std::io::Write as _;
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        out.write_all(b"6\n").unwrap();
+        drop(out);
+        let (buf, eof) = read_more(&mut file, 10, 64);
+        assert!(eof);
+        assert_eq!(buf, b"3,456\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn banner_lines_before_the_schema_are_not_the_header() {

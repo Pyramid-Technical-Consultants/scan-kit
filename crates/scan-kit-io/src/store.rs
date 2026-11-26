@@ -309,24 +309,37 @@ pub fn set_note(
     let note = text.trim();
     // Upsert is deliberate — a user can note a session before a scan makes
     // its row (tests pin the row surviving trash/re-import).
-    conn.execute(
-        "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, ?2, ?3)
-         ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note",
-        params![lib_id, session_id, note],
-    )
-    .map_err(|err| err.to_string())?;
-    if note.is_empty() {
-        // A whitespace note on an unscanned session creates a row with no
-        // note and no storage — delete_missing keeps NULL-storage rows, so
-        // it would list forever. Only truly-empty ghosts go.
+    // Upsert and ghost cleanup commit together — a failure between them
+    // leaves an empty-note NULL-storage row delete_missing never collects,
+    // a phantom catalog entry nothing can remove. BEGIN IMMEDIATE, the
+    // same discipline delete_session uses.
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|err| err.to_string())?;
+    let result = (|| {
         conn.execute(
-            "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2
-             AND storage_path IS NULL AND note = ''",
-            params![lib_id, session_id],
+            "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, ?2, ?3)
+             ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note",
+            params![lib_id, session_id, note],
         )
         .map_err(|err| err.to_string())?;
+        if note.is_empty() {
+            // A whitespace note on an unscanned session creates a row with no
+            // note and no storage — delete_missing keeps NULL-storage rows, so
+            // it would list forever. Only truly-empty ghosts go.
+            conn.execute(
+                "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2
+                 AND storage_path IS NULL AND note = ''",
+                params![lib_id, session_id],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
     }
-    Ok(())
+    conn.execute_batch("COMMIT").map_err(|err| err.to_string())
 }
 
 pub fn set_selected(
@@ -962,7 +975,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     // absent — a mid-upgrade kill (or a foreign tool's partial migration)
     // used to leave a versioned-but-half-altered DB that bricked every
     // later open with duplicate-column errors.
-    if version < 2 {
+    {
         migrate_columns(
             conn,
             "libraries",
@@ -975,7 +988,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             ],
         )?;
     }
-    if version < 3 {
+    {
         migrate_columns(
             conn,
             "sessions",
@@ -986,7 +999,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             ],
         )?;
     }
-    if version < 4 {
+    {
         conn.execute_batch(EXAMS_TABLE)
             .map_err(|err| err.to_string())?;
         // An exams table that exists with a stale column set (partial
@@ -1775,8 +1788,41 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn a_version_stamped_db_missing_columns_heals_on_open() {
+        let path = temp_db("heal");
+        {
+            let conn = open_connection(&path).unwrap();
+            // The partial migration the header comment describes: the column
+            // is gone but the version stamp survived, so the versioned gates
+            // would never re-add it.
+            conn.execute_batch("ALTER TABLE libraries DROP COLUMN bg_subtract")
+                .unwrap();
+            conn.execute_batch("ALTER TABLE sessions DROP COLUMN map_extent_mm")
+                .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let conn = open_connection(&path).unwrap();
+        for (table, column) in [("libraries", "bg_subtract"), ("sessions", "map_extent_mm")] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}.{column} did not heal");
+        }
+    }
+
     fn temp_db(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sk_store_{tag}_{}", std::process::id()));
+        // Windows recycles pids fast enough that a fresh test binary can
+        // inherit a killed run's fixture dir — a stamped store.db or a
+        // leftover settings file then corrupts the first assertion.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("store.db")
     }

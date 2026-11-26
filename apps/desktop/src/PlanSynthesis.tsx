@@ -261,6 +261,9 @@ export function PlanSynthesis() {
 
   function setValue(key: string, value: unknown) {
     generateSeq.current += 1;
+    // The generated CSV is stale the moment a param moves — saving must not
+    // write the old artifact beside the newer visible values.
+    setPlan(null);
     setValues((current) => ({ ...current, [key]: value }));
   }
 

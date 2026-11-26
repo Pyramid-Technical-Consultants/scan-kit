@@ -537,24 +537,25 @@ impl Camera {
     }
 
     pub fn data_at(&self, px: f32, py: f32, plot: PlotRect, width: f32, height: f32) -> [f32; 2] {
-        let matrix = self.clip_from_data(plot, width, height);
-        let width = width.max(1.0);
-        let height = height.max(1.0);
-        let ndc_x = (px / width) * 2.0 - 1.0;
-        let ndc_y = 1.0 - (py / height) * 2.0;
-        let ax = matrix[0];
-        let ay = matrix[5];
+        // The render transform is exactly pixel-affine: xmin lands at
+        // plot.x, xmax at plot.x + plot.w. Inverting it directly never
+        // divides by the tiny coefficient a wide domain produces, and y
+        // flips because data grows up while pixels grow down.
+        let _ = (width, height);
+        let nonzero = |span: f32| {
+            if span == 0.0 || !span.is_finite() {
+                1.0
+            } else {
+                span
+            }
+        };
+        let xspan = nonzero(self.xmax - self.xmin);
+        let yspan = nonzero(self.ymax - self.ymin);
+        let w = plot.w.max(1.0e-3);
+        let h = plot.h.max(1.0e-3);
         [
-            if ax.abs() < 1.0e-12 {
-                self.xmin
-            } else {
-                (ndc_x - matrix[12]) / ax
-            },
-            if ay.abs() < 1.0e-12 {
-                self.ymin
-            } else {
-                (ndc_y - matrix[13]) / ay
-            },
+            self.xmin + ((px - plot.x) / w) * xspan,
+            self.ymin + ((plot.y + plot.h - py) / h) * yspan,
         ]
     }
 
@@ -564,8 +565,18 @@ impl Camera {
     pub fn clip_from_data(&self, plot: PlotRect, width: f32, height: f32) -> [f32; 16] {
         let width = width.max(1.0);
         let height = height.max(1.0);
-        let xspan = (self.xmax - self.xmin).max(1.0e-6);
-        let yspan = (self.ymax - self.ymin).max(1.0e-6);
+        // Only exact degeneracy substitutes — a real small span is valid
+        // data, and clamping it renders a different transform than the
+        // camera holds while pan_pixels keeps the real one.
+        let nonzero = |span: f32| {
+            if span == 0.0 || !span.is_finite() {
+                1.0
+            } else {
+                span
+            }
+        };
+        let xspan = nonzero(self.xmax - self.xmin);
+        let yspan = nonzero(self.ymax - self.ymin);
         let ax = (2.0 * plot.w / width) / xspan;
         let ay = (2.0 * plot.h / height) / yspan;
         let bx = (2.0 * plot.x / width) - 1.0 - ax * self.xmin;
@@ -580,7 +591,7 @@ fn span(min: f32, max: f32) -> (f32, f32) {
     if !min.is_finite() || !max.is_finite() {
         return (0.0, 1.0);
     }
-    if (max - min).abs() < 1.0e-6 {
+    if max == min {
         return (min - 0.5, min + 0.5);
     }
     if min <= max {
@@ -700,6 +711,48 @@ pub fn map_span(value: f32, vmin: f32, vmax: f32, start: f32, end: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_at_inverts_a_wide_domain_instead_of_returning_xmin() {
+        // ax falls below the old 1e-12 threshold past a span of ~2e12 —
+        // hover returned xmin for every pixel.
+        let camera = Camera::new(0.0, 1.0e13, 0.0, 1.0);
+        let plot = PlotRect {
+            x: 0.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 1000.0,
+        };
+        let [x, _] = camera.data_at(500.0, 500.0, plot, 1000.0, 1000.0);
+        assert!((x - 5.0e12).abs() / 5.0e12 < 1.0e-3, "{x}");
+    }
+
+    #[test]
+    fn data_at_round_trips_with_project() {
+        let camera = Camera::new(-3.0, 17.0, 2.0, 9.0);
+        let plot = PlotRect {
+            x: 40.0,
+            y: 30.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let matrix = camera.clip_from_data(plot, 640.0, 480.0);
+        for [x, y] in [[-3.0, 2.0], [17.0, 9.0], [7.0, 5.5]] {
+            let px = project(matrix, [x, y, 0.0], 640.0, 480.0);
+            let back = camera.data_at(px[0], px[1], plot, 640.0, 480.0);
+            assert!((back[0] - x).abs() < 1.0e-3, "x {} -> {}", x, back[0]);
+            assert!((back[1] - y).abs() < 1.0e-3, "y {} -> {}", y, back[1]);
+        }
+    }
+
+    #[test]
+    fn a_real_small_span_survives_construction() {
+        // The 1e-6 floors used to rewrite [0, 1e-9] into a width-one domain
+        // and render deep zooms with a span the camera does not hold.
+        let camera = Camera::new(0.0, 1.0e-9, 0.0, 1.0);
+        assert_eq!(camera.xmin, 0.0);
+        assert_eq!(camera.xmax, 1.0e-9);
+    }
 
     #[test]
     fn ticks_are_one_two_five_and_zoom_keeps_the_point() {

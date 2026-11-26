@@ -1546,6 +1546,7 @@ pub struct Plot {
     side: u32,
     /// Gap under the pointer while a divider is dragged. Cleared when the button lifts.
     split_grab: Option<SplitGrab>,
+    pan_panel: Option<usize>,
     /// Gap hit-test already ran for the current drag.
     split_probed: bool,
     /// Uploaded dose grid. Paging and orbit sample it; they do not replace it.
@@ -1671,6 +1672,7 @@ impl Plot {
             row_splits,
             side,
             split_grab: None,
+            pan_panel: None,
             split_probed: false,
             dose: None,
             dose_atlas: None,
@@ -3132,6 +3134,7 @@ impl Plot {
         }
         if !input.drag {
             self.split_grab = None;
+            self.pan_panel = None;
             self.split_probed = false;
         }
         if !input.drag && input.wheel == 0.0 {
@@ -3144,17 +3147,27 @@ impl Plot {
             return;
         }
         let layout = self.layout(width, height);
-        let Some(index) = hit_cell(&layout, input.x, input.y) else {
-            return;
-        };
-        let panel = layout[index].panel;
-        let plot = layout[index].plot;
+        let hit = hit_cell(&layout, input.x, input.y);
         if input.drag {
-            if let Some(camera) = self.cameras.get_mut(panel) {
-                camera.pan_pixels(input.dx, input.dy, plot);
+            // The panel a drag pans is captured where the drag starts —
+            // re-hit-testing per motion drops deltas in the gutter and
+            // hijacks the neighbor once the pointer crosses into it.
+            let panel = self
+                .pan_panel
+                .or_else(|| hit.map(|index| layout[index].panel));
+            if let Some(panel) = panel {
+                self.pan_panel = Some(panel);
+                if let Some(cell) = layout.iter().find(|cell| cell.panel == panel) {
+                    if let Some(camera) = self.cameras.get_mut(panel) {
+                        camera.pan_pixels(input.dx, input.dy, cell.plot);
+                    }
+                }
             }
         }
         if input.wheel != 0.0 {
+            let Some(index) = hit else { return };
+            let panel = layout[index].panel;
+            let plot = layout[index].plot;
             if let Some(camera) = self.cameras.get_mut(panel) {
                 let factor = (-input.wheel * 0.0015).exp();
                 camera.zoom_at_pixel(input.x, input.y, plot, width as f32, height as f32, factor);
@@ -4504,16 +4517,25 @@ impl Plot {
 
 /// Panel frames without their series. The marks carry the series.
 pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
+    // serde_json writes NaN/inf as null, which the payload decoder refuses —
+    // a non-finite extent would sink the whole frame.
+    let finite = |value: f32| {
+        if value.is_finite() {
+            value
+        } else {
+            0.0
+        }
+    };
     panels
         .iter()
         .map(|panel| Panel {
             title: panel.title.clone(),
             y_label: panel.y_label.clone(),
             x_label: panel.x_label.clone(),
-            xmin: panel.xmin,
-            xmax: panel.xmax,
-            ymin: panel.ymin,
-            ymax: panel.ymax,
+            xmin: finite(panel.xmin),
+            xmax: finite(panel.xmax),
+            ymin: finite(panel.ymin),
+            ymax: finite(panel.ymax),
             series: Vec::new(),
             x_labels: panel.x_labels.clone(),
             equal: panel.equal,
@@ -5242,7 +5264,17 @@ fn follow_span(
 /// Half-open segment range of a monotonic stroke whose x overlaps `[lo, hi]`.
 fn window_range(series: &[LineRec], lo: f32, hi: f32) -> (usize, usize) {
     let first = series.partition_point(|line| line.b[0] < lo);
-    let stop = series.partition_point(|line| line.a[0] <= hi);
+    // A duplicated vertex NaNs line.a — and NaN <= hi is false, which
+    // breaks the monotonic predicate partition_point requires. The
+    // duplicate shares its endpoint, so read that instead.
+    let stop = series.partition_point(|line| {
+        let ax = if line.a[0].is_nan() {
+            line.b[0]
+        } else {
+            line.a[0]
+        };
+        ax <= hi
+    });
     (first, stop)
 }
 
@@ -9845,6 +9877,91 @@ mod tests {
             "top {top_gap} bottom {bottom_gap}"
         );
         assert!(layout[0].cell.h > layout[4].cell.h);
+    }
+
+    #[test]
+    fn window_range_spans_a_duplicated_vertex() {
+        let line = |a: f32, b: f32| LineRec {
+            a: [a, 0.0, 0.0],
+            b: [b, 0.0, 0.0],
+            color: [0.0; 4],
+            thickness: 1.0,
+            id: 0,
+            pattern: LINE_SOLID,
+            phase: 0.0,
+        };
+        // xs = [0, 1, 1, 2]: the duplicate segment's `a` NaNs out — but the
+        // valid 1→2 segment must survive the window binary search.
+        let series = [line(0.0, 1.0), line(f32::NAN, 1.0), line(1.0, 2.0)];
+        assert_eq!(window_range(&series, 0.0, 2.0), (0, 3));
+    }
+
+    #[test]
+    fn header_panels_clamp_non_finite_extents() {
+        // serde_json writes NaN/inf as null, which the payload decoder
+        // refuses — one degenerate panel would sink the whole frame.
+        let scene = line_scene();
+        let mut panel = scene.panels[0].clone();
+        panel.xmin = f32::NAN;
+        panel.xmax = f32::INFINITY;
+        let headers = header_panels(&[panel]);
+        assert_eq!(headers[0].xmin, 0.0);
+        assert_eq!(headers[0].xmax, 0.0);
+    }
+
+    #[test]
+    fn a_drag_pans_the_panel_it_started_in() {
+        // Pointer capture keeps motion events flowing after the pointer
+        // leaves the start panel — re-hit-testing per event used to hijack
+        // the neighbor across the gutter.
+        let mut scene = line_scene();
+        let panel = scene.panels[0].clone();
+        scene.panels.push(panel);
+        scene.columns = 2;
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(600, 480);
+        let left = layout[0].plot;
+        let right = layout[1].plot;
+        let home_left = plot.cameras[layout[0].panel];
+        let home_right = plot.cameras[layout[1].panel];
+        plot.apply(
+            600,
+            480,
+            &PlotInput {
+                x: left.x + left.w * 0.5,
+                y: left.y + left.h * 0.5,
+                dx: 10.0,
+                drag: true,
+                ..PlotInput::default()
+            },
+        );
+        plot.apply(
+            600,
+            480,
+            &PlotInput {
+                x: right.x + right.w * 0.5,
+                y: right.y + right.h * 0.5,
+                dx: 10.0,
+                drag: true,
+                ..PlotInput::default()
+            },
+        );
+        assert_ne!(plot.cameras[layout[0].panel], home_left);
+        assert_eq!(plot.cameras[layout[1].panel], home_right);
+        // Releasing drops the capture — a new drag in the right panel pans it.
+        plot.apply(600, 480, &PlotInput::default());
+        plot.apply(
+            600,
+            480,
+            &PlotInput {
+                x: right.x + right.w * 0.5,
+                y: right.y + right.h * 0.5,
+                dx: 10.0,
+                drag: true,
+                ..PlotInput::default()
+            },
+        );
+        assert_ne!(plot.cameras[layout[1].panel], home_right);
     }
 
     #[test]

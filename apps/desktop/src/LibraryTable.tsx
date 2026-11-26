@@ -297,7 +297,13 @@ export function LibraryTable({
         noteEdit.current?.cell[0] === col && noteEdit.current.cell[1] === rowIndex
           ? noteEdit.current
           : null;
-      const before = edit?.note ?? row.note;
+      // A bulk paste skips activation — without the pending lookup a paste
+      // landing mid-write captures the stale row text as `before`, and undo
+      // reverts past the in-flight edit.
+      const before =
+        edit?.note ??
+        pendingNotes.current.get(noteKey(row.library ?? folder ?? "", row.session_id)) ??
+        row.note;
       if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
         const key = noteKey(
           edit?.library ?? row.library ?? folder ?? "",

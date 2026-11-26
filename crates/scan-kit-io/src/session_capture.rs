@@ -938,16 +938,18 @@ fn join_timeslices(
     parts_out.sort_by(|a, b| a.0.cmp(&b.0));
     let mut parts: Vec<Part> = parts_out.into_iter().map(|(_, part)| part).collect();
 
-    // A device that records no layer/spot metadata still measures the same
-    // delivery — its rows belong to whatever layer/spot the other devices
-    // recorded at that timeslice. Keying them ("", "", ts) separates them
-    // from their siblings, so re-key them by the unambiguous
-    // timeslice → (layer, spot) mapping the recording devices establish.
+    // A device that records only part of the layer/spot metadata still
+    // measures the same delivery — its rows belong to whatever layer/spot
+    // the fully-recording devices marked at that timeslice. Keying them
+    // with empty components separates them from their siblings, so fill the
+    // missing components from the unambiguous timeslice → (layer, spot)
+    // mapping the full keys establish. Rows in one join share the delivery
+    // block, so a filled key meets its siblings here.
     let mut infer: HashMap<String, (String, String)> = HashMap::new();
     let mut ambiguous: HashSet<String> = HashSet::new();
     for part in &parts {
         for key in &part.order {
-            if key.0.is_empty() && key.1.is_empty() {
+            if key.0.is_empty() || key.1.is_empty() {
                 continue;
             }
             let meta = (key.0.clone(), key.1.clone());
@@ -967,21 +969,27 @@ fn join_timeslices(
     }
     if !infer.is_empty() {
         for part in &mut parts {
-            if !part
-                .order
-                .iter()
-                .all(|key| key.0.is_empty() && key.1.is_empty())
-            {
-                continue;
-            }
             let order = std::mem::take(&mut part.order);
             for key in order {
                 let Some(row) = part.rows.remove(&key) else {
                     continue;
                 };
-                let key = match infer.get(&key.2) {
-                    Some((layer, spot)) => (layer.clone(), spot.clone(), key.2.clone()),
-                    None => key,
+                let inferred = infer.get(&key.2).cloned();
+                let key = match inferred {
+                    Some((layer, spot)) if key.0.is_empty() || key.1.is_empty() => {
+                        let l = if key.0.is_empty() {
+                            layer
+                        } else {
+                            key.0.clone()
+                        };
+                        let s = if key.1.is_empty() {
+                            spot
+                        } else {
+                            key.1.clone()
+                        };
+                        (l, s, key.2.clone())
+                    }
+                    _ => key,
                 };
                 if !part.rows.contains_key(&key) {
                     part.order.push(key.clone());
@@ -990,7 +998,6 @@ fn join_timeslices(
             }
         }
     }
-
     // Timeslice keys joined on numeric value; a row missing in one device
     // leaves that block empty.
     let mut keys: Vec<(String, String, String)> = Vec::new();
@@ -2082,6 +2089,25 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], "1,10,3.5,64.5,0,1,0,1,10,1,0");
         assert_eq!(rows[1], "2,20,4.0,62,0,1,0,2,20,0,0");
+    }
+
+    #[test]
+    fn timeslices_join_when_a_device_records_layer_but_not_spot() {
+        // The production case: the IX256 has layer_id but no spot_no column,
+        // so its rows key (L, "", ts) inside the correct block. They must
+        // adopt the spot the RCI recorded at that timeslice.
+        let rci = sheet(
+            "spot_no,layer_id,timesliceNumber,timestamp(ms),r_beamOk\n7,1,1,10,true\n8,1,2,20,false\n",
+        );
+        let ic = sheet(
+            "layer_id,timesliceNumber,timestamp(ms),ic1_total_dose_spot(nC),r_ic1_x(ch)\n1,1,10,3.5,64.5\n1,2,20,4.0,62\n",
+        );
+        let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
+        let text = join_timeslices(&refs(&parts), &mut Vec::new()).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "1,1,10,3.5,64.5,0,7,1,1,10,1,0");
+        assert_eq!(rows[1], "1,2,20,4.0,62,0,8,1,2,20,0,0");
     }
 
     #[test]
