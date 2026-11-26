@@ -232,7 +232,9 @@ pub fn layer_edges(time: &[f32], layer: &[f32]) -> Vec<f32> {
         if !at.is_finite() || !id.is_finite() || id.abs() >= 9e18 {
             continue;
         }
-        let id = *id as i64;
+        // Round like the sibling spot-id functions — a truncating cast reads
+        // fractional noise (2.7 vs 3.0) as a spurious layer edge.
+        let id = id.round() as i64;
         if previous.is_some_and(|seen| seen != id) && *at > 0.0 {
             marks.push(*at);
         }
