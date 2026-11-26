@@ -74,6 +74,13 @@ export async function driveTask(
       await invoke("scan_kit_cancel", { task: started.task, generation: started.generation }).catch(() => {});
       throw reason;
     }
+    // Supersession can land while the poll is in flight — the resolve then
+    // carries the old generation's frame and acceptReport throws a routine
+    // cancellation as a user-visible error. Check before accepting.
+    if (stop()) {
+      await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
+      return true;
+    }
     if (!acceptReport(parsed.report, started.task, started.generation)) {
       misses += 1;
       if (!parsed.report.finished && misses < 8) {

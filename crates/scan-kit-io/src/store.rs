@@ -503,7 +503,8 @@ pub fn record_meta(
         conn.execute(
             "UPDATE sessions SET storage_path = ?3, kind = ?4, map_geom_checked = 0
              WHERE library_id = ?1 AND session_id = ?2
-               AND size IS ?5 AND mtime_ns IS ?6",
+               AND size IS ?5 AND mtime_ns IS ?6
+               AND storage_path IS NOT NULL",
             params![
                 lib_id,
                 entry.session_id,
@@ -529,7 +530,8 @@ pub fn record_meta(
             layer_count = ?11,
             map_geom_checked = ?12
          WHERE library_id = ?1 AND session_id = ?2
-           AND size IS ?13 AND mtime_ns IS ?14",
+           AND size IS ?13 AND mtime_ns IS ?14
+           AND storage_path IS NOT NULL",
         params![
             lib_id,
             entry.session_id,

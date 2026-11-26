@@ -343,12 +343,19 @@ export function PlanSynthesis() {
     busyRef.current = true;
     setBusy(true);
     try {
+      const generatedAt = generateSeq.current;
       const selected = await save({
         title: "Save Input Map",
         defaultPath: joinPath(saveDir, plan.filename),
         filters: [{ name: "Input map", extensions: ["csv"] }],
       });
       if (typeof selected !== "string") {
+        return;
+      }
+      // The dialog is non-modal — a param edit while it was open invalidated
+      // this CSV. Writing it now would save the pre-edit artifact.
+      if (generateSeq.current !== generatedAt) {
+        notifyError("Parameters changed while the save dialog was open — review and save again.");
         return;
       }
       await invoke("scan_kit_synthesize_plan", {
@@ -393,6 +400,9 @@ export function PlanSynthesis() {
 
   const applyQuick = (next: Record<string, number>) => {
     generateSeq.current += 1;
+    // Same invariant as setValue — the generated CSV is stale the moment a
+    // param moves, quick-set or not.
+    setPlan(null);
     setValues((current) => ({ ...current, ...next }));
   };
   return (

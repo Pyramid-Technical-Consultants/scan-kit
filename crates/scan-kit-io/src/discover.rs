@@ -449,8 +449,11 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
     extras.sort();
     extras.dedup();
     for probe in extras {
-        // Xor rather than max: a rewrite that does not take the newest mtime
-        // still moves the fingerprint.
+        // Mix rather than max: a rewrite that does not take the newest mtime
+        // still moves the fingerprint. The combine must not be commutative
+        // or self-cancelling — xor lets two same-stamp probes cancel out and
+        // a later pair of equal rewrites cancel identically, hiding the
+        // change. Multiply-add is order-dependent and never cancels.
         if probe != target {
             if let Ok(meta) = fs::metadata(&probe) {
                 if let Some(extra) = meta
@@ -458,13 +461,21 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
                     .ok()
                     .and_then(|stamp| stamp.duration_since(std::time::UNIX_EPOCH).ok())
                 {
-                    nanos ^= extra.as_nanos();
-                    size ^= meta.len();
+                    nanos = nanos
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(extra.as_nanos());
+                    size = size
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(meta.len());
                 }
             }
         }
     }
-    Some((i64::try_from(nanos).ok()?, i64::try_from(size).ok()?))
+    // Mixed probes are opaque equality tokens, not real timestamps — xor or
+    // multiply-add combinations carry no magnitude meaning. Truncate rather
+    // than range-check: try_from would read a high-bit mix as "no
+    // fingerprint" and leave the row permanently retryable.
+    Some((nanos as u64 as i64, size as i64))
 }
 
 pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Option<Vec<u8>> {

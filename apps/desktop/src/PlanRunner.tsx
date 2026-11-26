@@ -212,7 +212,9 @@ export function PlanRunner() {
       statusFailures.current = 0;
       setView(next);
       if (next.host) {
-        setHost(next.host);
+        // Canonicalize only when the user left the field untouched during the
+        // connect — overwriting an in-flight edit erases their correction.
+        setHost((current) => (current === text ? next.host! : current));
       }
     });
   }
