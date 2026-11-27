@@ -6,6 +6,9 @@
 //! `mode="constant"` behaviour the Python analysis used.
 
 /// `values` (x-fastest on `src_shape`) sampled at `dst`'s voxel centers.
+// Origins are the CENTER of voxel 0 (DICOM ImagePosition convention),
+// not dose::Volume's corner-of-voxel-0 — a corner-origin Volume passed
+// directly misregisters by half a spacing step on any grid change.
 pub fn resample_linear(
     values: &[f32],
     src_origin: [f32; 3],

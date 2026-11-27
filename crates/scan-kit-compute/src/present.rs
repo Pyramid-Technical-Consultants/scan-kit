@@ -100,6 +100,12 @@ pub fn invoke_flag(name: &str, input: &Value, cancel: &Cancel) -> Result<Value, 
             let options = object_arg(input, "options")?;
             let width = dim(input, "width", 960)?;
             let height = dim(input, "height", 640)?;
+            // The frame returns base64 RGBA — 16/3 bytes per pixel before
+            // JSON framing. Past this product the answer cannot fit the MCP
+            // transport anyway, so the render cost must not be paid.
+            if u64::from(width) * u64::from(height) > 983_040 {
+                return Err("width x height exceeds the transportable frame budget".into());
+            }
             let background = color4(
                 input.get("background"),
                 "background",

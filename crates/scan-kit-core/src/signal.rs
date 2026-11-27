@@ -514,6 +514,9 @@ fn rfft_power(samples: &[f32]) -> Vec<f32> {
         .collect()
 }
 /// Deposit isotropic Gaussians onto a regular grid. `spots` are `(x, y, z, weight, sigma)`.
+// Lattice contract: voxel `i` is centered at `origin + i*spacing` — the
+// DICOM ImagePosition convention, NOT the corner-origin convention of
+// dose::Volume. Mixing the two misregisters every deposit by half a voxel.
 pub fn splat_gaussians(
     spots: &[[f32; 5]],
     origin: [f32; 3],

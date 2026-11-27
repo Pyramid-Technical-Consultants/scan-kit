@@ -3015,7 +3015,7 @@ impl Plot {
             let Some(points) = self
                 .marks
                 .points
-                .get(start as usize..(start + count) as usize)
+                .get(start as usize..start as usize + count as usize)
             else {
                 continue;
             };
@@ -3113,7 +3113,7 @@ impl Plot {
         // Same stale-batch clamp as the line path — a reuse payload can
         // carry quad ranges past the suffix buffer.
         let qstart = (batch.quad_start as usize).min(self.marks.quads.len());
-        let qend = (batch.quad_start + batch.quad_count) as usize;
+        let qend = batch.quad_start as usize + batch.quad_count as usize;
         let quads = &self.marks.quads[qstart..qend.min(self.marks.quads.len())];
         quads
             .iter()
@@ -3580,7 +3580,8 @@ impl Plot {
                 }
             }
             let qstart = (batch.quad_start as usize).min(self.marks.quads.len());
-            let qend = ((batch.quad_start + batch.quad_count) as usize).min(self.marks.quads.len());
+            let qend =
+                (batch.quad_start as usize + batch.quad_count as usize).min(self.marks.quads.len());
             let solid: Vec<QuadRec> = self.marks.quads[qstart..qend].to_vec();
             let heated: Vec<QuadRec> = batch
                 .heats
@@ -3651,7 +3652,7 @@ impl Plot {
                 let Some(points) = self
                     .marks
                     .points
-                    .get(start as usize..(start + count) as usize)
+                    .get(start as usize..start as usize + count as usize)
                 else {
                     continue;
                 };
@@ -5511,7 +5512,8 @@ fn visible_draws(
         } else {
             (0usize, run.count)
         };
-        let start = (run.start + offset as u32).min(total);
+        // Saturate — a wrapping sum can alias small and pass the clamp.
+        let start = run.start.saturating_add(offset as u32).min(total);
         let shown = shown.min(total - start);
         if shown > 0 {
             draws.push((start, shown));

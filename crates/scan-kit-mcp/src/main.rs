@@ -110,16 +110,31 @@ impl ScanKit {
     /// scheme, a UNC share, or a file://host URI (file:/// is local).
     fn remote_spec(spec: &str) -> bool {
         let spec = spec.trim();
-        // `\\?\` verbatim and `\\.\` device paths are local — except
-        // `\\?\UNC\`, which is a verbatim spelling of a share.
-        if spec.get(..4).is_some_and(|head| {
-            head.eq_ignore_ascii_case(r"\\.\") || head.eq_ignore_ascii_case(r"\\?\")
-        }) {
-            // Both prefixes spell the object-manager root — a UNC tail
-            // under either one reaches the same redirector.
-            return spec
+        // `\\?\` verbatim paths are local only in the ordinary drive form
+        // (`\\?\C:\...`). Every other object-manager spelling —
+        // `\\?\UNC\` shares, `GLOBALROOT` device paths reaching the
+        // network redirectors, anything unrecognized — fails closed.
+        if spec
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\?\"))
+        {
+            if spec
                 .get(4..8)
-                .is_some_and(|rest| rest.eq_ignore_ascii_case("UNC\\"));
+                .is_some_and(|rest| rest.eq_ignore_ascii_case("UNC\\"))
+            {
+                return true;
+            }
+            let drive = spec.as_bytes().get(4).is_some_and(u8::is_ascii_alphabetic)
+                && spec.as_bytes().get(5) == Some(&b':');
+            return !drive;
+        }
+        // `\\.\` is the device namespace — pipes, serial ports, raw volumes.
+        // None of it is an ordinary local file for the effects gate.
+        if spec
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case(r"\\.\"))
+        {
+            return true;
         }
         if scan_kit_io::is_remote_location(spec) || spec.starts_with('\\') || Self::unc(spec) {
             return true;
@@ -297,7 +312,7 @@ impl ServerHandler for ScanKit {
             None => Value::Null,
             Some(arguments) => Value::Object(arguments),
         };
-        let name = request.name.clone();
+        let name: String = request.name.chars().take(256).collect();
         let result = match self.blocked(&name, &input) {
             Some(name) => Err(format!(
                 "{name} writes files/devices/configuration or reaches the network; start the server with --allow-effects to use it"
@@ -442,7 +457,13 @@ impl ServerHandler for ScanKit {
                 }
                 Ok(CallToolResult::structured(value).into())
             }
-            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
+            Err(error) => {
+                // Error text is outside the success-path size guard — a
+                // reflected oversized input must not cross the transport's
+                // frame cap and turn a deliverable error into a dropped one.
+                let capped: String = error.chars().take(4096).collect();
+                Ok(CallToolResult::error(vec![ContentBlock::text(capped)]).into())
+            }
         }
     }
 }
@@ -487,10 +508,22 @@ mod tests {
             r"\/nas/share",
             "file:////nas/share/dose.dcm",
             "file:///%2f%2fnas%2fshare",
+            r"\\?\UNC\nas\share",
+            r"\\?\GLOBALROOT\Device\Mup\nas\share",
+            r"\\.\GLOBALROOT\Device\WebDavRedirector\nas\share",
+            r"\\?\GLOBALROOT\??\UNC\nas\share",
+            r"\\.\pipe\somepipe",
+            r"\\.\COM1",
+            r"\\.\PhysicalDrive0",
         ] {
             assert!(ScanKit::remote_spec(spec), "{spec}");
         }
-        for local in ["C:/data/dose.dcm", "file:///C:/data/dose.dcm", "./rel/path"] {
+        for local in [
+            "C:/data/dose.dcm",
+            "file:///C:/data/dose.dcm",
+            "./rel/path",
+            r"\\?\C:\data\dose.dcm",
+        ] {
             assert!(!ScanKit::remote_spec(local), "{local}");
         }
     }

@@ -104,8 +104,22 @@ pub fn read_form(path: &Path) -> Result<Value, String> {
     // Stat and read the same open handle: a stat-then-read races a growing
     // file, and special files (pipes) report len 0 then block the read —
     // all while FILE_IO is held.
+    // Reject non-regular files BEFORE opening — opening a FIFO blocks, and
+    // devices/pipes report len 0 then block or consume the read. symlink_metadata
+    // classifies without following the final link, then the open handle is
+    // re-checked so a swap in between cannot smuggle a device through.
+    let kind = fs::symlink_metadata(path)
+        .map_err(|err| err.to_string())?
+        .file_type();
+    if !(kind.is_file() || kind.is_symlink()) {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
     let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
-    if file.metadata().map_err(|err| err.to_string())?.len() > MAX_FILE_BYTES {
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.len() > MAX_FILE_BYTES {
         return Err(format!("Config file is too large: {}", path.display()));
     }
     let mut bytes = Vec::new();
