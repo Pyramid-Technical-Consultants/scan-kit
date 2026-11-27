@@ -369,14 +369,18 @@ pub fn peek_study(bytes: &[u8]) -> StudyPeek {
         if group == 0x7FE0 && element == 0x0010 {
             break;
         }
-        let Some((start, end)) = element_span(bytes, cursor, implicit) else {
-            match skip_undefined(bytes, cursor, implicit) {
+        let (start, end) = match element_span(bytes, cursor, implicit) {
+            Span::Defined(start, end) => (start, end),
+            // Only a genuinely undefined-length element may be skipped —
+            // a truncated header ends the walk instead of misaligning it.
+            Span::Undefined => match skip_undefined(bytes, cursor, implicit) {
                 Some(next) => {
                     cursor = next;
                     continue;
                 }
                 None => break,
-            }
+            },
+            Span::Truncated => break,
         };
         if end > limit {
             break;
@@ -463,14 +467,16 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
         if group == 0x7FE0 && element == 0x0010 {
             break;
         }
-        let Some((start, end)) = element_span(&bytes, cursor, implicit) else {
-            match skip_undefined(&bytes, cursor, implicit) {
+        let (start, end) = match element_span(&bytes, cursor, implicit) {
+            Span::Defined(start, end) => (start, end),
+            Span::Undefined => match skip_undefined(&bytes, cursor, implicit) {
                 Some(next) => {
                     cursor = next;
                     continue;
                 }
                 None => break,
-            }
+            },
+            Span::Truncated => break,
         };
         if end > bytes.len() {
             break;
@@ -499,10 +505,18 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
 
 /// Value span of the element at `cursor`, in the file's VR mode. `None` on a
 /// truncated header or an undefined length (not read).
-fn element_span(bytes: &[u8], cursor: usize, implicit: bool) -> Option<(usize, usize)> {
+enum Span {
+    Defined(usize, usize),
+    Undefined,
+    // A truncated header or overflowing length — NOT an undefined-length
+    // element. Skipping it as one misaligns the walk onto garbage.
+    Truncated,
+}
+
+fn element_span(bytes: &[u8], cursor: usize, implicit: bool) -> Span {
     if implicit {
         if cursor + 8 > bytes.len() {
-            return None;
+            return Span::Truncated;
         }
         let length = u32::from_le_bytes([
             bytes[cursor + 4],
@@ -511,18 +525,31 @@ fn element_span(bytes: &[u8], cursor: usize, implicit: bool) -> Option<(usize, u
             bytes[cursor + 7],
         ]) as usize;
         if length == u32::MAX as usize {
-            return None;
+            return Span::Undefined;
         }
         let start = cursor + 8;
-        return Some((start, start.checked_add(length)?));
+        return match start.checked_add(length) {
+            Some(end) => Span::Defined(start, end),
+            None => Span::Truncated,
+        };
     }
-    let vr = bytes.get(cursor + 4..cursor + 6)?;
-    let (length, header) = value_length(vr, bytes.get(cursor + 6..)?)?;
+    let Some(vr) = bytes.get(cursor + 4..cursor + 6) else {
+        return Span::Truncated;
+    };
+    let Some((length, header)) = bytes
+        .get(cursor + 6..)
+        .and_then(|rest| value_length(vr, rest))
+    else {
+        return Span::Truncated;
+    };
     if length == u32::MAX as usize {
-        return None;
+        return Span::Undefined;
     }
     let start = cursor + 6 + header;
-    Some((start, start.checked_add(length)?))
+    match start.checked_add(length) {
+        Some(end) => Span::Defined(start, end),
+        None => Span::Truncated,
+    }
 }
 
 /// Skip an element whose declared length is undefined (0xFFFFFFFF) — the

@@ -68,17 +68,25 @@ pub fn load_columns(
     }
 }
 
-pub fn map_geom_from_spots(entry: &Discovered) -> (Option<f64>, Option<i32>) {
+/// Geometry from the input/spot maps, plus whether any read failed
+/// transiently — a failure means the absence of geometry certifies nothing.
+pub fn map_geom_from_spots(entry: &Discovered) -> (Option<f64>, Option<i32>, bool) {
     let mut extent = None;
     let mut layers = None;
+    let mut reads_failed = false;
     for name in ["input_map.csv", "spot_data.csv"] {
         if extent.is_some() && layers.is_some() {
             break;
         }
-        let Some(bytes) = discover::read_session_file(&entry.storage_path, &entry.session_id, name)
-        else {
-            continue;
-        };
+        let bytes =
+            match discover::try_read_session_file(&entry.storage_path, &entry.session_id, name) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(_) => {
+                    reads_failed = true;
+                    continue;
+                }
+            };
         let (file_extent, file_layers) = geom_from_csv(&bytes);
         if extent.is_none() {
             extent = file_extent;
@@ -87,7 +95,7 @@ pub fn map_geom_from_spots(entry: &Discovered) -> (Option<f64>, Option<i32>) {
             layers = file_layers;
         }
     }
-    (extent, layers)
+    (extent, layers, reads_failed)
 }
 
 fn geom_from_csv(bytes: &[u8]) -> (Option<f64>, Option<i32>) {

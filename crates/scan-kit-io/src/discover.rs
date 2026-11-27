@@ -478,18 +478,42 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
     Some((nanos as u64 as i64, size as i64))
 }
 
+/// Lossy wrapper — callers that cannot act on read failure treat it as absence.
+/// Hydrate uses the tri-state form so a transient failure never seals.
 pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Option<Vec<u8>> {
+    try_read_session_file(storage, session_id, filename)
+        .ok()
+        .flatten()
+}
+
+/// Tri-state read: `Ok(None)` is definitively absent (or deliberately refused),
+/// `Ok(Some)` is read, `Err` is present-but-unreadable or a corrupt store.
+/// Callers that certify metadata must not treat `Err` as absence.
+pub fn try_read_session_file(
+    storage: &Path,
+    session_id: &str,
+    filename: &str,
+) -> Result<Option<Vec<u8>>, String> {
     let text = storage.to_string_lossy();
     if crate::location::is_remote_location(&text) {
-        return crate::location::read_remote_session_file(&text, session_id, filename);
+        return crate::location::try_read_remote_session_file(&text, session_id, filename);
     }
     if storage.is_dir() {
         let root = directory_session_root(storage, session_id);
         // Links are refused the same way the walk refuses them — a planted
         // spot_data.csv symlink must not read outside the session dir.
         let path = root.join(filename);
-        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
-            return None;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Absent is definitive; anything else (permissions, transient
+            // filesystem faults) is present-but-unclassifiable — not absence.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
+        // A non-regular leaf (including the refused symlink) is deliberately
+        // not session data — that is a structural absence, not a failure.
+        if !meta.file_type().is_file() {
+            return Ok(None);
         }
         // symlink_metadata only inspects the leaf — a symlinked `config/` or
         // `ic_hv_toggle/` component reads outside the session dir too.
@@ -499,45 +523,45 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
             .take_while(|ancestor| *ancestor != root)
             .any(|ancestor| ancestor.is_symlink())
         {
-            return None;
+            return Ok(None);
         }
-        return fs::File::open(path)
-            .ok()
-            .and_then(|mut file| read_capped(&mut file, filename, MAX_MEMBER_BYTES).ok());
+        // The leaf is a present regular file — open/read failure is a
+        // transient or permission fault, never absence.
+        let mut file = fs::File::open(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+        return read_capped(&mut file, filename, MAX_MEMBER_BYTES).map(Some);
     }
     let primary = format!("{session_id}/{filename}");
     let suffix = format!("/{filename}");
+    // An archive that cannot be read at all is corrupt/unreadable storage —
+    // every member is present-but-unreadable, not absent.
     let (members, roots) = archive_members(storage, &|name| {
         let name = normalize_member(name);
         name == primary || name == filename || name.ends_with(&suffix)
     })
-    .ok()?;
+    .map_err(|err| format!("{}: {err}", storage.display()))?;
     if let Some((_, bytes)) = members
         .iter()
         .find(|(name, _)| normalize_member(name) == primary)
     {
-        return Some(bytes.clone());
+        return Ok(Some(bytes.clone()));
     }
     // Bare-name and suffix matches are only safe when the archive holds one
     // session tree — a stray root-level file can't stand in for a sibling's.
     if roots.len() > 1 {
-        return None;
+        return Ok(None);
     }
     if let Some((_, bytes)) = members
         .iter()
         .find(|(name, _)| normalize_member(name) == filename)
     {
-        return Some(bytes.clone());
+        return Ok(Some(bytes.clone()));
     }
-    members
-        .into_iter()
-        .find(|(name, _)| {
-            let name = normalize_member(name);
-            // The fallback exists for the nested `sess/sess/` layout —
-            // deeper paths are per-run files, not the session marker.
-            name.ends_with(&suffix) && name.split('/').count() <= 3
-        })
-        .map(|(_, bytes)| bytes)
+    Ok(members.into_iter().find_map(|(name, bytes)| {
+        let name = normalize_member(&name);
+        // The fallback exists for the nested `sess/sess/` layout —
+        // deeper paths are per-run files, not the session marker.
+        (name.ends_with(&suffix) && name.split('/').count() <= 3).then_some(bytes)
+    }))
 }
 
 /// Timeslice files scoped to `session_id`. A directory storage walks only
@@ -1400,6 +1424,44 @@ mod tests {
             foreign != library,
             "foreign id resolved to the root session"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn try_read_distinguishes_absent_present_and_corrupt() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-tristate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("sess");
+        fs::create_dir_all(&session).unwrap();
+        // Absent is definitive — Ok(None), not an error.
+        assert_eq!(
+            try_read_session_file(&session, "sess", "input_map.csv").unwrap(),
+            None
+        );
+        // Present and readable — Ok(Some).
+        fs::write(
+            session.join("input_map.csv"),
+            "energy
+70
+",
+        )
+        .unwrap();
+        assert!(matches!(
+            try_read_session_file(&session, "sess", "input_map.csv"),
+            Ok(Some(_))
+        ));
+        // A corrupt archive is present-but-unreadable — Err, never absence.
+        let zip = root.join("bad.zip");
+        fs::write(&zip, b"not a zip archive at all").unwrap();
+        assert!(try_read_session_file(&zip, "bad", "input_map.csv").is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

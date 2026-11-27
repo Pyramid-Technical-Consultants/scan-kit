@@ -199,17 +199,31 @@ pub(crate) fn discover_remote(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn read_remote_session_file(
     session_url: &str,
     session_id: &str,
     filename: &str,
 ) -> Option<Vec<u8>> {
-    let remote = require_remote(session_url).ok()?;
+    try_read_remote_session_file(session_url, session_id, filename)
+        .ok()
+        .flatten()
+}
+
+/// Tri-state remote read — a connect/download failure is transient storage
+/// trouble, not absence. Only a definitive miss on the resolved candidates
+/// is `Ok(None)`.
+pub(crate) fn try_read_remote_session_file(
+    session_url: &str,
+    session_id: &str,
+    filename: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let remote = require_remote(session_url)?;
     if archive_name(&remote.path) {
-        let local = materialize(session_url, session_url).ok()?;
-        return discover::read_session_file(&local, session_id, filename);
+        let local = materialize(session_url, session_url)?;
+        return discover::try_read_session_file(&local, session_id, filename);
     }
-    let mut fs = crate::remote::connect(&remote, &password_of(&remote)).ok()?;
+    let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
     let base = remote.path.trim_end_matches('/');
     // Nested first — resolve_container prefers the inner dir when both
     // layouts exist; a flat-first remote read would diverge from local.
@@ -232,11 +246,13 @@ pub(crate) fn read_remote_session_file(
         candidates.push(format!("{base}/{filename}"));
     }
     for path in candidates {
-        if let Ok(Some(bytes)) = fs.read(&path) {
-            return Some(bytes);
+        // A read error on the resolved candidate is transient storage
+        // trouble — trying the other layout would serve the wrong file.
+        if let Some(bytes) = fs.read(&path)? {
+            return Ok(Some(bytes));
         }
     }
-    None
+    Ok(None)
 }
 
 pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<(i64, i64)> {

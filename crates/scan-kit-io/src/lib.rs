@@ -1251,17 +1251,22 @@ pub fn remember_password(spec: &str, password: &str) {
 }
 
 fn hydrate(entry: &Discovered, stamped: Option<(i64, i64)>) -> (Option<SessionMeta>, bool) {
-    let mut meta = discover::read_session_file(
+    // Tri-state reads: a transient failure is not absence — sealing NULL or
+    // partial metadata under the fingerprint would never heal, because a
+    // permissions fix does not move the probed mtimes.
+    let summary = discover::try_read_session_file(
         &entry.storage_path,
         &entry.session_id,
         "termination_summary.txt",
-    )
-    .map(|bytes| {
+    );
+    let mut reads_failed = summary.is_err();
+    let mut meta = summary.ok().flatten().map(|bytes| {
         let text = String::from_utf8_lossy(&bytes);
         parse_termination_summary_text(&text)
     });
     if geom_incomplete(meta.as_ref()) {
-        let (extent, layers) = map_geom_from_spots(entry);
+        let (extent, layers, geom_failed) = map_geom_from_spots(entry);
+        reads_failed |= geom_failed;
         meta = merge_session_geom(meta, extent, layers);
     }
     // A None meta is ambiguous: a reachable storage path without a summary is
@@ -1273,20 +1278,11 @@ fn hydrate(entry: &Discovered, stamped: Option<(i64, i64)>) -> (Option<SessionMe
     // stale meta under the old fingerprint.
     // A NULL-stamped row sealing on another failed stat (None == None)
     // certifies no bytes at all — only a real fingerprint may seal.
-    let readable = stamped.is_some()
-        && fresh == stamped
-        // Stat-ok is not read-ok (locked zip, remote auth flap): a session
-        // whose reads all failed must stay retryable instead of sealing
-        // NULL meta under a reachable fingerprint. A meta hit already
-        // proves reads work; the marker probe covers the absent-summary
-        // case.
-        && (meta.is_some()
-            || discover::read_session_file(
-                &entry.storage_path,
-                &entry.session_id,
-                "input_map.csv",
-            )
-            .is_some());
+    // Stat-ok is not read-ok (locked zip, remote auth flap): any transient
+    // read failure keeps the row retryable instead of sealing partial or
+    // NULL meta. Files definitively absent need no proof — their later
+    // appearance moves the fingerprint's probes and reopens the row.
+    let readable = stamped.is_some() && fresh == stamped && !reads_failed;
     (meta, readable)
 }
 
@@ -1410,6 +1406,58 @@ Spot extent width: 118.75 mm
 Spot extent height: 110.592 mm
 Layer delivery: 27/27
 ";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_transiently_unreadable_summary_never_seals_and_heals() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = workspace("unreadable");
+        let db = root.join("test.sqlite");
+        write_session(
+            &root,
+            "kept",
+            KEPT_SUMMARY,
+            "energy,X_POSITION,Y_POSITION
+1,0,0
+",
+        );
+        let summary = root.join("kept").join("termination_summary.txt");
+        std::fs::set_permissions(&summary, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let root_arg = root.to_string_lossy().into_owned();
+        let db_arg = db.to_string_lossy().into_owned();
+        let opened = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": &root_arg, "db_path": &db_arg }),
+        )
+        .unwrap();
+        let row = opened["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "kept")
+            .unwrap()
+            .clone();
+        // The read failure must not seal — no certifying metadata yet.
+        assert_eq!(row["date"], "?");
+
+        // Fixing permissions does not move the probed mtimes — only the
+        // retryable seal lets the rescan heal.
+        std::fs::set_permissions(&summary, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let reopened = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": &root_arg, "db_path": &db_arg }),
+        )
+        .unwrap();
+        let row = reopened["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "kept")
+            .unwrap()
+            .clone();
+        assert_eq!(row["date"], "09/10/26");
+    }
 
     #[test]
     fn sk_req_004_open_library_reuses_fingerprint() {

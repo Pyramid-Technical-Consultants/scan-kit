@@ -969,14 +969,34 @@ fn join_timeslices(
     }
     if !infer.is_empty() {
         for part in &mut parts {
+            // Inference fixes the join key, but downstream plan lookup reads
+            // the emitted layer/spot CELLS — an empty cell there is not
+            // finite, so the rescued row still loses its planned position.
+            // Write the inferred values into the empty cells they belong to.
+            let layer_cell = part.header.iter().position(|name| name == "layer_id");
+            let spot_cell = part.header.iter().position(|name| name == "spot_no");
             let order = std::mem::take(&mut part.order);
             for key in order {
-                let Some(row) = part.rows.remove(&key) else {
+                let Some(mut row) = part.rows.remove(&key) else {
                     continue;
                 };
                 let inferred = infer.get(&key.2).cloned();
                 let key = match inferred {
                     Some((layer, spot)) if key.0.is_empty() || key.1.is_empty() => {
+                        if key.0.is_empty() {
+                            if let Some(index) = layer_cell {
+                                if row.get(index).is_some_and(|cell| cell.is_empty()) {
+                                    row[index] = layer.clone();
+                                }
+                            }
+                        }
+                        if key.1.is_empty() {
+                            if let Some(index) = spot_cell {
+                                if row.get(index).is_some_and(|cell| cell.is_empty()) {
+                                    row[index] = spot.clone();
+                                }
+                            }
+                        }
                         let l = if key.0.is_empty() {
                             layer
                         } else {
@@ -2108,6 +2128,32 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], "1,1,10,3.5,64.5,0,7,1,1,10,1,0");
         assert_eq!(rows[1], "1,2,20,4.0,62,0,8,1,2,20,0,0");
+    }
+
+    #[test]
+    fn inference_writes_the_rescued_values_into_empty_cells() {
+        // The IX256 HAS a spot_no column but leaves its cells empty — the
+        // re-keyed row must carry the inferred spot in the emitted cell, or
+        // downstream plan lookup (which requires finite cells) drops it.
+        let rci = sheet(
+            "spot_no,layer_id,timesliceNumber,timestamp(ms),r_beamOk
+7,1,1,10,true
+8,1,2,20,false
+",
+        );
+        let ic = sheet(
+            "spot_no,layer_id,timesliceNumber,timestamp(ms),ic1_total_dose_spot(nC)
+,1,1,10,3.5
+,1,2,20,4.0
+",
+        );
+        let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
+        let text = join_timeslices(&refs(&parts), &mut Vec::new()).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2);
+        // The IC block's spot_no cell carries the inferred 7/8, not empty.
+        assert_eq!(rows[0], "7,1,1,10,3.5,0,7,1,1,10,1,0");
+        assert_eq!(rows[1], "8,1,2,20,4.0,0,8,1,2,20,0,0");
     }
 
     #[test]
