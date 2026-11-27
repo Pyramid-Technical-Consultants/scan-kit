@@ -1407,7 +1407,6 @@ Spot extent height: 110.592 mm
 Layer delivery: 27/27
 ";
 
-    #[test]
     #[cfg(unix)]
     #[test]
     fn a_transiently_unreadable_summary_never_seals_and_heals() {
