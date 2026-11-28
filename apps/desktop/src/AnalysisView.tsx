@@ -431,6 +431,8 @@ export function AnalysisView({
   const openingRef = useRef(false);
   const scannerPickRef = useRef(false);
   const scannerSeq = useRef(0);
+  const bdlPickRef = useRef(false);
+  const bdlSeq = useRef(0);
   useEffect(() => {
     liveRef.current = true;
     return () => {
@@ -467,12 +469,13 @@ export function AnalysisView({
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [scanners, setScanners] = useState<{ label: string; folder: string }[]>([]);
+  const [bdls, setBdls] = useState<{ label: string; file: string }[]>([]);
   // gridTheme() runs DOM probes — memoize it instead of re-probing on
   // every poll-driven render.
   const editorTheme = useMemo(() => gridTheme(), []);
-  const exportArgsRef = useRef({ studyPath, scanners, sessions, hidden, folder });
+  const exportArgsRef = useRef({ studyPath, scanners, bdls, sessions, hidden, folder });
   useEffect(() => {
-    exportArgsRef.current = { studyPath, scanners, sessions, hidden, folder };
+    exportArgsRef.current = { studyPath, scanners, bdls, sessions, hidden, folder };
   });
   const [size, setSize] = useState({ width: 960, height: 640 });
   const shown = (meta?.panels.length ?? 0) > 0;
@@ -514,6 +517,32 @@ export function AnalysisView({
         if (live) {
           // A store failure is not an empty registry - keep the loaded list
           // and log the error instead of silently dropping custom scanners.
+          logError(reason);
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [viewId]);
+
+  useEffect(() => {
+    if (viewId !== "volumetric") {
+      return;
+    }
+    let live = true;
+    const listed_at = bdlSeq.current;
+    void invoke<{ bdls: { label: string; file: string }[] }>("scan_kit_bdls", {
+      action: "list",
+    })
+      .then((listed) => {
+        if (live && bdlSeq.current === listed_at) {
+          setBdls((prev) =>
+            JSON.stringify(prev) === JSON.stringify(listed.bdls) ? prev : listed.bdls,
+          );
+        }
+      })
+      .catch((reason: unknown) => {
+        if (live) {
           logError(reason);
         }
       });
@@ -807,6 +836,7 @@ export function AnalysisView({
   // The scanner list is only sent with a study — outside the volumetric
   // view a registry load must not restart the task or shift the request key.
   const scannerKey = studyPath != null ? JSON.stringify(scanners) : "";
+  const bdlKey = studyPath != null ? JSON.stringify(bdls) : "";
   const pictureKey = JSON.stringify([
     viewId,
     folder,
@@ -815,6 +845,7 @@ export function AnalysisView({
     sceneKey,
     studyPath ?? "",
     scannerKey,
+    bdlKey,
     plotHost,
   ]);
   const requestKey = JSON.stringify([pictureKey, lineEpoch]);
@@ -849,6 +880,7 @@ export function AnalysisView({
           ...optionsRef.current,
           study: exportArgsRef.current.studyPath,
           scanners: JSON.stringify(exportArgsRef.current.scanners),
+          bdls: JSON.stringify(exportArgsRef.current.bdls),
           dest,
           ...extra,
         },
@@ -912,6 +944,7 @@ export function AnalysisView({
       if (viewId === "volumetric" && studyPath != null) {
         plotOptions.study = studyPath;
         plotOptions.scanners = scannerKey;
+        plotOptions.bdls = bdlKey;
       }
       if (lineToken.current !== "") {
         plotOptions._lines = lineToken.current;
@@ -1716,6 +1749,41 @@ export function AnalysisView({
             }}
           >
             Register scanner
+          </Button>
+        ) : null}
+        {viewId === "volumetric" && studyPath != null ? (
+          <Button
+            variant="outline"
+            disabled={bdlPickRef.current}
+            onClick={() => {
+              bdlPickRef.current = true;
+              void open({
+                title: "Beam model (BDL) file",
+                filters: [{ name: "Beam model", extensions: ["txt"] }],
+              })
+                .then((selected) => {
+                  if (typeof selected !== "string") {
+                    return;
+                  }
+                  void invoke<{ bdls: { label: string; file: string }[] }>(
+                    "scan_kit_bdls",
+                    { action: "add", file: selected },
+                  )
+                    .then((listed) => {
+                      if (liveRef.current) {
+                        bdlSeq.current += 1;
+                        setBdls(listed.bdls);
+                      }
+                    })
+                    .catch((reason: unknown) => notifyError(reason));
+                })
+                .catch((reason: unknown) => notifyError(reason))
+                .finally(() => {
+                  bdlPickRef.current = false;
+                });
+            }}
+          >
+            Register beam model
           </Button>
         ) : null}
         {viewId === "volumetric" && studyPath != null ? (
