@@ -464,6 +464,9 @@ pub fn provenance(
         "beam_model": {
             "name": inputs.bdl_label,
             "digest": inputs.bdl_digest,
+            // Energies outside the measured table extrapolate with the edge
+            // slope — physical approximation, disclosed rather than hidden.
+            "extrapolated": extrapolated_energies(inputs),
         },
         "histories": result.histories,
         "seed": SEED,
@@ -477,6 +480,26 @@ pub fn provenance(
         "dose": "dose-to-water, Gy per fraction",
         "rbe": inputs.rbe_key,
     })
+}
+
+/// Plan energies outside the beam model's measured table, for provenance.
+fn extrapolated_energies(inputs: &PatientInputs) -> Vec<f32> {
+    let (Some(first), Some(last)) = (
+        inputs.beam_model.rows.first(),
+        inputs.beam_model.rows.last(),
+    ) else {
+        return Vec::new();
+    };
+    let mut outside: Vec<f32> = inputs
+        .study
+        .beams
+        .iter()
+        .flat_map(|beam| beam.spots.iter().map(|spot| spot.energy))
+        .filter(|energy| *energy < first[0] || *energy > last[0])
+        .collect();
+    outside.sort_by(f32::total_cmp);
+    outside.dedup();
+    outside
 }
 
 pub(crate) fn digest16(bytes: &[u8]) -> String {

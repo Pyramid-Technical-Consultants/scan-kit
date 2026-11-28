@@ -1143,7 +1143,7 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scannerKey, lineEpoch, plotHost, requestKey]);
+  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scannerKey, bdlKey, lineEpoch, plotHost, requestKey]);
 
   useEffect(() => {
     if (viewId === "volumetric") {
@@ -1754,8 +1754,10 @@ export function AnalysisView({
         {viewId === "volumetric" && studyPath != null ? (
           <Button
             variant="outline"
-            disabled={bdlPickRef.current}
             onClick={() => {
+              if (bdlPickRef.current) {
+                return;
+              }
               bdlPickRef.current = true;
               void open({
                 title: "Beam model (BDL) file",
