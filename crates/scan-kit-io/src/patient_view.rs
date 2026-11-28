@@ -10,7 +10,7 @@ use scan_kit_dicom::{inside_structure, load_study, write_rtdose, PatientStudy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::beam::{beam_record_bdl, protons_per_mu_bdl, spot_record_bdl};
+use super::beam::{beam_record_model, protons_per_mu_model, spot_record_model, BeamModel};
 use super::calibration::CtCalibration;
 use super::marks::{pick, pick_in, text};
 use super::tables::spot_table;
@@ -33,6 +33,11 @@ pub struct PatientInputs {
     pub names: Vec<String>,
     pub beam_filter: Option<usize>,
     pub bdl: &'static str,
+    /// The resolved model — parsed once here instead of per spot. Label and
+    /// digest feed provenance: bundled name or the registered file's label.
+    pub beam_model: BeamModel,
+    pub bdl_label: String,
+    pub bdl_digest: String,
     pub histories: u32,
     pub calibration: CtCalibration,
     pub rbe_model: Option<RbeModel>,
@@ -146,6 +151,62 @@ pub fn patient_inputs(
             ("dn", "DN"),
         ],
     );
+    // Beam model resolution: the pick covers bundled ids; a `bdl` value
+    // matching a registered label or a bare BDL file path reads that file
+    // instead. Registered entries arrive as the caller's [{label, file}]
+    // list in `bdls`, mirroring scanner registration.
+    let bdl_entries = match options.get("bdls") {
+        Some(Value::String(raw)) => serde_json::from_str::<Vec<Value>>(raw).unwrap_or_default(),
+        Some(Value::Array(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+    let registered_bdls: Vec<(String, String)> = bdl_entries
+        .iter()
+        .filter_map(|entry| {
+            let label = entry.get("label").and_then(Value::as_str)?;
+            let file = entry.get("file").and_then(Value::as_str)?;
+            Some((label.to_owned(), file.to_owned()))
+        })
+        .collect();
+    let shown = text(options, "bdl", "");
+    let registered_hit = registered_bdls
+        .iter()
+        .find(|(label, file)| label == &shown || file == &shown);
+    let custom_file = if !shown.is_empty() && !matches!(shown, "un_rs" | "un" | "dn_rs" | "dn") {
+        Some(
+            registered_hit
+                .map(|(_, file)| file.clone())
+                .unwrap_or_else(|| shown.to_owned()),
+        )
+    } else {
+        None
+    };
+    let (beam_model, bdl_label, bdl_digest) = match custom_file {
+        None => {
+            let text_src = super::beam::bdl_text(bdl);
+            (
+                BeamModel::parse(text_src).expect("bundled BDL text parses"),
+                super::beam::bdl_name(bdl).to_owned(),
+                digest16(text_src.as_bytes()),
+            )
+        }
+        Some(file) => {
+            let text_src = std::fs::read_to_string(&file)
+                .map_err(|err| format!("the beam model {shown:?}: {err}"))?;
+            let model = BeamModel::parse(&text_src)
+                .map_err(|err| format!("the beam model {shown:?}: {err}"))?;
+            if model.rows.len() < 2 {
+                return Err(format!(
+                    "the beam model {shown:?} has fewer than 2 energy rows"
+                ));
+            }
+            let label = registered_hit
+                .filter(|(_, f)| *f == file)
+                .map(|(label, _)| label.clone())
+                .unwrap_or_else(|| file.clone());
+            (model, label, digest16(text_src.as_bytes()))
+        }
+    };
     // `scanners` is the caller's list of user-registered MCsquare scanner
     // folders: [{label, folder}]. A `scanner` value matching a label resolves
     // to that folder; a builtin id/label or a bare folder path work too.
@@ -206,6 +267,9 @@ pub fn patient_inputs(
         names,
         beam_filter,
         bdl,
+        beam_model,
+        bdl_label,
+        bdl_digest,
         histories,
         calibration,
         rbe_model,
@@ -240,7 +304,7 @@ pub fn patient_request(inputs: &PatientInputs) -> Result<PatientRequest, String>
         &inputs.deliveries,
         &inputs.groups,
         inputs.beam_filter,
-        inputs.bdl,
+        &inputs.beam_model,
     )?;
     let (material, density) = inputs.calibration.voxels(&inputs.study.ct.hu);
     // Image position is the center of the first voxel. The kernel bins with
@@ -398,8 +462,8 @@ pub fn provenance(
             "digest": inputs.calibration.digest(),
         },
         "beam_model": {
-            "name": super::beam::bdl_name(inputs.bdl),
-            "digest": digest16(super::beam::bdl_text(inputs.bdl).as_bytes()),
+            "name": inputs.bdl_label,
+            "digest": inputs.bdl_digest,
         },
         "histories": result.histories,
         "seed": SEED,
@@ -415,7 +479,7 @@ pub fn provenance(
     })
 }
 
-fn digest16(bytes: &[u8]) -> String {
+pub(crate) fn digest16(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(bytes);
     hash.finalize()
@@ -735,6 +799,7 @@ pub(crate) fn scene(
         names,
         beam_filter,
         bdl,
+        bdl_label,
         histories,
         rbe_model,
         rbe_key,
@@ -968,6 +1033,13 @@ pub(crate) fn scene(
                 "un" => "UN",
                 "dn" => "DN",
                 "dn_rs" => "DN + shifter",
+                // A registered or bare-path model shows its resolved label;
+                // the dropdown only carries the bundled four.
+                _ if !text(options, "bdl", "").is_empty()
+                    && !matches!(text(options, "bdl", ""), "un_rs") =>
+                {
+                    bdl_label.as_str()
+                }
                 _ => "UN + shifter",
             },
         )
@@ -1297,7 +1369,7 @@ fn records(
     deliveries: &[Delivery],
     groups: &[Vec<usize>],
     beam_filter: Option<usize>,
-    bdl: &str,
+    model: &BeamModel,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
     let mut spots = Vec::new();
     let mut protons = Vec::new();
@@ -1305,7 +1377,13 @@ fn records(
     for (index, beam) in study.beams.iter().enumerate() {
         // Spots index this array by study position — a skipped record would
         // shift every later beam's rotation lookup.
-        let record = beam_record_bdl(beam.gantry, beam.couch, &beam.position, beam.isocenter, bdl)?;
+        let record = beam_record_model(
+            model,
+            beam.gantry,
+            beam.couch,
+            &beam.position,
+            beam.isocenter,
+        )?;
         beams.extend_from_slice(&record);
         if fraction == "Plan" {
             if beam_filter.is_some_and(|chosen| chosen != index) {
@@ -1322,7 +1400,7 @@ fn records(
                     index,
                     spot.wet_mm,
                     spot.shifter_distance_mm,
-                    bdl,
+                    model,
                 )?;
             }
         }
@@ -1350,7 +1428,7 @@ fn records(
                     delivery.matched.beam,
                     spot.wet,
                     spot.distance,
-                    bdl,
+                    model,
                 )?;
             }
         }
@@ -1368,11 +1446,11 @@ fn push_spot(
     beam: usize,
     wet: f32,
     distance: f32,
-    bdl: &str,
+    model: &BeamModel,
 ) -> Result<(), String> {
-    let record = spot_record_bdl(energy, x, y, beam as f32, wet, distance, bdl)?;
+    let record = spot_record_model(model, energy, x, y, beam as f32, wet, distance)?;
     spots.extend_from_slice(&record);
-    protons.push(mu * protons_per_mu_bdl(energy, bdl)?);
+    protons.push(mu * protons_per_mu_model(model, energy)?);
     Ok(())
 }
 

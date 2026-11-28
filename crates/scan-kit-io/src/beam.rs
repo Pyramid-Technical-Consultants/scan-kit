@@ -36,7 +36,7 @@ pub struct BeamModel {
     pub nozzle: f32,
     pub smx: f32,
     pub smy: f32,
-    rows: Vec<[f32; 18]>,
+    pub(crate) rows: Vec<[f32; 18]>,
     shifter_material: i32,
     shifter_density: f32,
     shifter_wet: f32,
@@ -80,7 +80,7 @@ impl BeamModel {
         Ok(model)
     }
 
-    fn parse(text: &str) -> Result<BeamModel, String> {
+    pub(crate) fn parse(text: &str) -> Result<BeamModel, String> {
         let mut nozzle = 0.0;
         let mut smx = 0.0;
         let mut smy = 0.0;
@@ -348,6 +348,44 @@ pub fn protons_per_mu(energy: f32) -> Result<f32, String> {
     protons_per_mu_bdl(energy, "un_rs")
 }
 
+/// Beam record from a parsed model — the parse-once path. Registered and
+/// bundled models share it.
+pub(crate) fn beam_record_model(
+    model: &BeamModel,
+    gantry: f32,
+    couch: f32,
+    position: &str,
+    isocenter_mm: [f32; 3],
+) -> Result<[f32; 16], String> {
+    let rotation = gantry_to_patient(gantry, couch, position)?;
+    let mut rec = [0.0; 16];
+    rec[..9].copy_from_slice(&rotation);
+    rec[9] = isocenter_mm[0] / 10.0;
+    rec[10] = isocenter_mm[1] / 10.0;
+    rec[11] = isocenter_mm[2] / 10.0;
+    rec[12] = model.nozzle;
+    rec[13] = model.smx;
+    rec[14] = model.smy;
+    Ok(rec)
+}
+
+pub(crate) fn spot_record_model(
+    model: &BeamModel,
+    energy: f32,
+    x: f32,
+    y: f32,
+    beam: f32,
+    wet_mm: f32,
+    distance_mm: f32,
+) -> Result<[f32; 40], String> {
+    fill_spot(model, energy, x, y, beam, wet_mm, distance_mm)
+}
+
+pub(crate) fn protons_per_mu_model(model: &BeamModel, energy: f32) -> Result<f32, String> {
+    check_energy(&model.rows, energy)?;
+    Ok(column(&model.rows, 3, energy))
+}
+
 pub(crate) fn beam_record_bdl(
     gantry: f32,
     couch: f32,
@@ -386,10 +424,11 @@ pub(crate) fn protons_per_mu_bdl(energy: f32, bdl: &str) -> Result<f32, String> 
     Ok(column(&model.rows, 3, energy))
 }
 
-/// `column` extrapolates with the edge slope outside the table — a plan
-/// authored for another machine, or a corrupt energy field, must fail here
-/// instead of producing physics the model never promised. A half-MeV
-/// tolerance covers float-representation fuzz on the discrete energies.
+/// Outside the measured table `column` extrapolates with the edge slope.
+/// The delivery logs already carry the machine-specific optics this table
+/// would approximate, and the energy spectrum — the one unmeasurable term —
+/// varies slowly enough that edge extrapolation is the smallest error
+/// available. Non-finite or non-positive energies stay corruption.
 fn check_energy(rows: &[[f32; 18]], energy: f32) -> Result<(), String> {
     if rows.is_empty() {
         return Err("the beam model has no energy rows".into());
