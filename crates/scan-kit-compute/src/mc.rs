@@ -1774,16 +1774,6 @@ mod tests {
             let options = serde_json::json!({ "study": study_path.to_string_lossy(), "histories": "1000000" });
             let mut inputs = scan_kit_io::patient_view::patient_inputs(&study_path, &[], &options)
                 .expect("inputs");
-            // Harness-only adaptation: the generic beam model floors at
-            // 100 MeV but this machine delivers down to 94 — the three
-            // low layers are nudged to the floor. Their dose share is
-            // small and a mirrored geometry collapses gamma globally,
-            // so the orientation discrimination survives.
-            for beam in &mut inputs.study.beams {
-                for spot in &mut beam.spots {
-                    spot.energy = spot.energy.max(100.0);
-                }
-            }
             let run = scan_kit_io::patient_view::transport(
                 &inputs,
                 Some(&mut |job| crate::mc::run_mc(job).map_err(|err| err.to_string())),

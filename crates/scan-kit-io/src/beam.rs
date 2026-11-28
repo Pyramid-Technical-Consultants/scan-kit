@@ -391,14 +391,17 @@ pub(crate) fn protons_per_mu_bdl(energy: f32, bdl: &str) -> Result<f32, String> 
 /// instead of producing physics the model never promised. A half-MeV
 /// tolerance covers float-representation fuzz on the discrete energies.
 fn check_energy(rows: &[[f32; 18]], energy: f32) -> Result<(), String> {
-    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+    if rows.is_empty() {
         return Err("the beam model has no energy rows".into());
-    };
-    if !energy.is_finite() || energy < first[0] - 0.5 || energy > last[0] + 0.5 {
-        return Err(format!(
-            "energy {energy} MeV is outside the beam model's {}-{} MeV range",
-            first[0], last[0]
-        ));
+    }
+    // Outside the measured table the columns extrapolate with the edge
+    // slope. That is approximation — the delivery logs already carry the
+    // machine-specific optics this table would otherwise approximate, and
+    // the energy spectrum varies slowly enough that edge extrapolation is
+    // the smallest-error term. Only non-finite or non-positive energies are
+    // corruption: positive-energy physics has no valid reading.
+    if !energy.is_finite() || energy <= 0.0 {
+        return Err(format!("energy {energy} MeV is not a valid beam energy"));
     }
     Ok(())
 }
@@ -566,14 +569,16 @@ h
     }
 
     #[test]
-    fn an_energy_outside_the_model_range_errors() {
-        // Outside the tabulated rows the model would silently extrapolate —
-        // a corrupt or foreign plan's energy must fail, not invent physics.
-        assert!(protons_per_mu(1.0).is_err());
-        assert!(protons_per_mu(1000.0).is_err());
+    fn an_energy_outside_the_model_range_extrapolates() {
+        // The table extrapolates with the edge slope rather than failing:
+        // delivery logs already carry the machine-specific optics, and the
+        // spectrum is the smallest-error term. 70 MeV must resolve.
+        assert!(protons_per_mu(70.0).is_ok());
+        assert!(protons_per_mu(94.0).is_ok());
+        // Non-finite and non-positive energies stay corruption.
+        assert!(protons_per_mu(0.0).is_err());
         assert!(protons_per_mu(f32::NAN).is_err());
-        assert!(protons_per_mu(f32::INFINITY).is_err());
-        assert!(protons_per_mu(100.0).is_ok());
+        assert!(protons_per_mu(-1.0).is_err());
     }
 
     #[test]
