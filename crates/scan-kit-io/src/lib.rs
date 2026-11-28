@@ -231,6 +231,11 @@ const TOOLS: &[ToolSpec] = &[
         summary: "List, register, or remove MCsquare CT-calibration scanner folders.",
         kind: ToolKind::Granular,
     },
+    ToolSpec {
+        name: "scan_kit_bdls",
+        summary: "List, register, or remove machine beam model (BDL) files.",
+        kind: ToolKind::Granular,
+    },
 ];
 
 pub fn tools() -> &'static [ToolSpec] {
@@ -504,6 +509,16 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "db_path": { "type": "string" },
                 "action": { "type": "string", "enum": ["list", "add", "remove"] },
                 "folder": { "type": "string" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+        "scan_kit_bdls" => json!({
+            "type": "object",
+            "properties": {
+                "db_path": { "type": "string" },
+                "action": { "type": "string", "enum": ["list", "add", "remove"] },
+                "file": { "type": "string" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -827,6 +842,11 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let action = required_str(input, "action")?;
             scanners(&db, action, optional_str(input, "folder")?).map_err(InvokeError::Message)
         }
+        "scan_kit_bdls" => {
+            let db = database_path(input)?;
+            let action = required_str(input, "action")?;
+            bdls(&db, action, optional_str(input, "file")?).map_err(InvokeError::Message)
+        }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),
         }),
@@ -915,6 +935,92 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
         entries.push(json!({ "label": label, "folder": folder, "digest": digest }));
     }
     Ok(json!({ "scanners": entries }))
+}
+
+fn bdls(db: &Path, action: &str, file: Option<&str>) -> Result<Value, String> {
+    let stored: Vec<(String, String)> = match action {
+        "add" => {
+            let file = file.ok_or("beam model file required")?;
+            if file.trim().is_empty() {
+                return Err("beam model file required".into());
+            }
+            // Validation reads the file outside STORE_LOCK — an unparseable
+            // or physics-empty BDL never reaches the list.
+            let model = beam::BeamModel::read(Path::new(file))?;
+            let _ = model;
+            let label = Path::new(file)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .filter(|stem| !stem.is_empty())
+                .ok_or("beam model file required")?;
+            store::with_store(db, |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|err| err.to_string())?;
+                let result = (|| {
+                    let mut list = store::bdls(conn)?;
+                    if !list.iter().any(|(_, existing)| existing == file) {
+                        list.push((label, file.to_owned()));
+                        store::set_bdls(conn, &list)?;
+                    }
+                    Ok::<_, String>(list)
+                })();
+                match result {
+                    Err(err) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(err)
+                    }
+                    Ok(list) => {
+                        conn.execute_batch("COMMIT")
+                            .map_err(|err| err.to_string())?;
+                        Ok(list)
+                    }
+                }
+            })?
+        }
+        "remove" => {
+            let file = file.ok_or("beam model file required")?;
+            if file.trim().is_empty() {
+                return Err("beam model file required".into());
+            }
+            store::with_store(db, |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|err| err.to_string())?;
+                let result = (|| {
+                    let list: Vec<(String, String)> = store::bdls(conn)?
+                        .into_iter()
+                        .filter(|(_, existing)| existing != file)
+                        .collect();
+                    store::set_bdls(conn, &list)?;
+                    Ok::<_, String>(list)
+                })();
+                match result {
+                    Err(err) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(err)
+                    }
+                    Ok(list) => {
+                        conn.execute_batch("COMMIT")
+                            .map_err(|err| err.to_string())?;
+                        Ok(list)
+                    }
+                }
+            })?
+        }
+        "list" => store::with_store(db, |conn| store::bdls(conn))?,
+        other => return Err(format!("unknown bdls action {other}")),
+    };
+    let mut entries = Vec::new();
+    for (label, file) in stored {
+        // A file that no longer parses reads as a null digest rather than
+        // masquerading as valid downstream.
+        let digest = std::fs::read_to_string(&file)
+            .ok()
+            .filter(|text| beam::BeamModel::parse(text).is_ok())
+            .map(|text| Value::String(patient_view::digest16(text.as_bytes())))
+            .unwrap_or(Value::Null);
+        entries.push(json!({ "label": label, "file": file, "digest": digest }));
+    }
+    Ok(json!({ "bdls": entries }))
 }
 
 /// Copy the connected session into `dest`, calling `keep` after each file.
@@ -2294,5 +2400,58 @@ Layer delivery: 27/27
             assert!(result.is_err(), "{tool} reported success on a bad session");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn bdls_register_list_remove_roundtrip() {
+        let root = workspace("bdls");
+        let db = root.join("store.db");
+        // A copy of the bundled model is a valid registration; garbage is not.
+        let valid = root.join("machine_a.txt");
+        fs::write(
+            &valid,
+            include_str!("../../../assets/mcsquare/BDL/BDL_default_UN_RangeShifter.txt"),
+        )
+        .unwrap();
+        let garbage = root.join("not_a_bdl.txt");
+        fs::write(&garbage, "certainly not a beam model").unwrap();
+
+        let added = bdls(&db, "add", Some(valid.to_str().unwrap())).unwrap();
+        let entries = added.get("bdls").and_then(Value::as_array).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].get("label").unwrap(), "machine_a");
+        assert!(entries[0].get("digest").unwrap().is_string());
+
+        // Adding the same file twice does not duplicate.
+        let again = bdls(&db, "add", Some(valid.to_str().unwrap())).unwrap();
+        assert_eq!(
+            again.get("bdls").and_then(Value::as_array).unwrap().len(),
+            1
+        );
+
+        // Garbage never reaches the list.
+        assert!(bdls(&db, "add", Some(garbage.to_str().unwrap())).is_err());
+        let list = bdls(&db, "list", None).unwrap();
+        assert_eq!(list.get("bdls").and_then(Value::as_array).unwrap().len(), 1);
+
+        let removed = bdls(&db, "remove", Some(valid.to_str().unwrap())).unwrap();
+        assert!(removed
+            .get("bdls")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
+
+        // A registered file deleted from disk reads as a null digest, not a
+        // valid one.
+        let added = bdls(&db, "add", Some(valid.to_str().unwrap())).unwrap();
+        assert_eq!(
+            added.get("bdls").and_then(Value::as_array).unwrap().len(),
+            1
+        );
+        fs::remove_file(&valid).unwrap();
+        let list = bdls(&db, "list", None).unwrap();
+        assert!(list.get("bdls").unwrap()[0]
+            .get("digest")
+            .unwrap()
+            .is_null());
     }
 }

@@ -1757,6 +1757,42 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
+    /// Real-world upright validation: LEO cases are seated-position RayStation
+    /// exports. The MC recalculation is gamma'd against the TPS dose in the
+    /// same frame — a wrong SITTING support matrix scatters the dose away
+    /// from the reference and gamma collapses. Ignored: needs a GPU and the
+    /// local test_data folder.
+    #[test]
+    #[ignore]
+    fn upright_real_world_gamma() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/dicom");
+        for case in ["LEO-32", "LEO-42"] {
+            let study_path = base.join(case);
+            if !study_path.is_dir() {
+                continue;
+            }
+            let options = serde_json::json!({ "study": study_path.to_string_lossy(), "histories": "1000000" });
+            let mut inputs = scan_kit_io::patient_view::patient_inputs(&study_path, &[], &options)
+                .expect("inputs");
+            let run = scan_kit_io::patient_view::transport(
+                &inputs,
+                Some(&mut |job| crate::mc::run_mc(job).map_err(|err| err.to_string())),
+            )
+            .expect("transport");
+            let metrics = scan_kit_io::patient_view::metrics(&inputs, &run, &serde_json::json!({}));
+            let gamma = metrics.gamma.expect("production gamma");
+            eprintln!(
+                "{case}: production gamma {}/{}mm = {:.2}% ({}/{})",
+                gamma.dose_pct, gamma.dta_mm, gamma.rate, gamma.passed, gamma.scored
+            );
+            assert!(
+                gamma.rate > 90.0,
+                "{case} gamma {:.2}% — orientation wrong?",
+                gamma.rate
+            );
+        }
+    }
+
     use super::*;
 
     fn validate(source: &str) {

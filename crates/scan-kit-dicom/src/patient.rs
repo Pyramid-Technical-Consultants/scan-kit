@@ -502,9 +502,15 @@ pub fn gantry_to_patient(
         "HFP" => [-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
         "FFS" => [-1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, -1.0, 0.0],
         "FFP" => [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0],
+        // Seated upright: the supine posture pitched up about the patient's
+        // left-right axis until superior points vertically up. At zero couch
+        // angle the posterior faces the gantry — the same zero reference the
+        // supine support rotation uses, so chair angles read like couch
+        // angles. The composition works out to the identity rotation.
+        "SITTING" => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         other => {
             return Err(format!(
-                "patient position {other} is not HFS, HFP, FFS, or FFP"
+                "patient position {other} is not HFS, HFP, FFS, FFP, or SITTING"
             ))
         }
     };
@@ -772,12 +778,12 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // not a silent 1.0.
     let slope = match float_tag(elems, tag(0x0028, 0x1053)) {
         Some(value) => value,
-        None if elem(elems, tag(0x0028, 0x1053)).is_none() => 1.0,
+        None if valued(elems, tag(0x0028, 0x1053)).is_none() => 1.0,
         None => return Err("corrupt rescale slope".into()),
     };
     let intercept = match float_tag(elems, tag(0x0028, 0x1052)) {
         Some(value) => value,
-        None if elem(elems, tag(0x0028, 0x1052)).is_none() => 0.0,
+        None if valued(elems, tag(0x0028, 0x1052)).is_none() => 0.0,
         None => return Err("corrupt rescale intercept".into()),
     };
     let pixels = elem(elems, tag(0x7FE0, 0x0010)).ok_or("missing pixels")?;
@@ -921,7 +927,7 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // Same absent-vs-corrupt split for Slice Thickness.
     let thickness = match float_tag(elems, tag(0x0018, 0x0050)) {
         Some(value) if value.is_finite() && value > 0.0 => value,
-        None if elem(elems, tag(0x0018, 0x0050)).is_none() => 1.0,
+        None if valued(elems, tag(0x0018, 0x0050)).is_none() => 1.0,
         _ => return Err("corrupt slice thickness".into()),
     };
     // Grid Frame Offsets have two legal encodings: relative to the image
@@ -1138,7 +1144,17 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         };
         // A beam position that disagrees with the CT's mirrors the support
         // matrix against the volume — fail like the frame-of-reference rule.
-        if !ct_position.is_empty() && !position.eq_ignore_ascii_case(ct_position) {
+        // Exception: upright CT scanners write the conventional HFS label
+        // even though the patient was scanned seated — the voxel grid's
+        // orientation cosines describe the anatomy in the patient frame
+        // either way, and the beam's SITTING position is the treatment
+        // truth. Every other mismatch still fails.
+        let upright_pairing =
+            position.eq_ignore_ascii_case("SITTING") && ct_position.eq_ignore_ascii_case("HFS");
+        if !ct_position.is_empty()
+            && !position.eq_ignore_ascii_case(ct_position)
+            && !upright_pairing
+        {
             return Err(format!(
                 "beam {number} is {position} but the CT is {ct_position}"
             ));
@@ -1909,6 +1925,14 @@ fn text_tag(elems: &[Elem], tag: u32) -> String {
         .unwrap_or_default()
 }
 
+/// The element only when it carries a value — a zero-length element is
+/// present-but-empty, which DICOM reads as "unknown", the same as absent.
+/// The absent-vs-corrupt splits key on this so an empty optional element
+/// takes the default instead of erroring as corrupt.
+fn valued<'a>(elems: &'a [Elem], tag: u32) -> Option<&'a Elem> {
+    elem(elems, tag).filter(|item| !item.bytes.is_empty())
+}
+
 fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
     let Some(elem) = elem(elems, tag) else {
         return Vec::new();
@@ -2572,6 +2596,25 @@ pub fn write_rtdose(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_real_tps_exports() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/dicom");
+        if !base.is_dir() {
+            return;
+        }
+        for case in ["LEO-42", "LEO-32", "MPTSGR1"] {
+            let case_dir = base.join(case);
+            if !case_dir.is_dir() {
+                continue;
+            }
+            let study = crate::patient::load_study(&case_dir);
+            match &study {
+                Ok(loaded) => eprintln!("{case}: OK beams={}", loaded.beams.len()),
+                Err(err) => eprintln!("{case}: ERR {err}"),
+            }
+        }
+    }
+
     use super::*;
 
     fn slice(z: f32) -> Slice {
@@ -2819,6 +2862,15 @@ mod tests {
     fn hfs_gantry_zero_is_the_support_matrix() {
         let got = gantry_to_patient(0.0, 0.0, "HFS").unwrap();
         assert_eq!(got, [1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn sitting_support_is_upright() {
+        // Seated at zero angles: superior is room-vertical, posterior faces
+        // the gantry — the composition reduces to the identity. The matrix
+        // must stay a proper rotation so beam geometry is never mirrored.
+        let got = gantry_to_patient(0.0, 0.0, "SITTING").unwrap();
+        assert_eq!(got, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]

@@ -290,6 +290,30 @@ pub fn set_scanners(conn: &Connection, scanners: &[(String, String)]) -> Result<
     prefs_patch(conn, PREF_APP_SETTINGS, &json!({ "scanners": list }))
 }
 
+/// User-registered beam model (BDL) files, `[{label, file}]`.
+pub fn bdls(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+    let settings = prefs_get(conn, PREF_APP_SETTINGS)?.unwrap_or_else(|| json!({}));
+    Ok(settings
+        .get("bdls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let label = entry.get("label").and_then(Value::as_str)?;
+            let file = entry.get("file").and_then(Value::as_str)?;
+            Some((label.to_owned(), file.to_owned()))
+        })
+        .collect())
+}
+
+pub fn set_bdls(conn: &Connection, bdls: &[(String, String)]) -> Result<(), String> {
+    let list: Vec<Value> = bdls
+        .iter()
+        .map(|(label, file)| json!({ "label": label, "file": file }))
+        .collect();
+    prefs_patch(conn, PREF_APP_SETTINGS, &json!({ "bdls": list }))
+}
+
 pub fn set_note(
     conn: &Connection,
     root: &str,
